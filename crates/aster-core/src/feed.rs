@@ -1,8 +1,8 @@
 //! Aster's market data on its own threads: static `aggTrade` sessions over
 //! the whole catalog, one `!markPrice@arr` session, chunked dynamic sessions
-//! for the books and candles the terminal follows (`subs`), and a serial
-//! worker for the on-demand REST calls (chart history, the tape of the last
-//! hour), and the startup warm-up of the screener's 5m candles on threads of
+//! for the books and candles the terminal follows (`subs`), a serial worker
+//! for the on-demand REST calls (chart history, the tape of the last hour),
+//! another for the books' snapshots (`depth_worker`), and the startup warm-up of the screener's 5m candles on threads of
 //! its own (`spawn_warmup`). Talks to the UDP loop only through channels;
 //! knows symbols, not market indexes.
 //!
@@ -14,17 +14,19 @@
 //! group is gone, and so is the MOEX history thread: deep history is the
 //! exchange's own `klines`.
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use moonproto::server::codec::market_data::{delphi_days, Candle, HistoryTrade, Level};
+use moonproto::server::codec::market_data::{delphi_days, Candle, HistoryTrade};
 
 use crate::aster::json::{AggTrade, Dec, Kline, PremiumIndex, StreamData, StreamEvent};
 use crate::aster::rest::{self, AggFrom, Rest};
 use crate::aster::ws::{self, Beat, MAX_STREAMS};
+use crate::book;
 use crate::load::Load;
 use crate::stream_health::{Scope, StreamHealth};
 use crate::subs::{Change, Plan};
@@ -38,8 +40,11 @@ const MARKS_STREAM: &str = "!markPrice@arr";
 /// [`ws::IDLE_LIMIT`]: five missed pushes, and the core reopens it rather
 /// than serving cleared funding for a minute.
 const MARKS_IDLE: Duration = Duration::from_secs(15);
-/// The whole top 20 of each side every 100 ms — a snapshot, not a delta.
-const BOOK_STREAM: &str = "depth20@100ms";
+/// The levels that changed, every 100 ms, stitched to a [`BOOK_LEVELS`]
+/// snapshot by `book.rs` — MoonBot's own pair (`@depth@100ms`, `limit=1000`).
+const BOOK_STREAM: &str = "depth@100ms";
+/// The deepest `/fapi/v1/depth` answers (measured 01.10; 5000 is refused).
+const BOOK_LEVELS: u32 = 1000;
 /// Pause before a failed session reopens, doubling up to the cap; reset once a
 /// session has lived [`HEALTHY_SESSION`].
 const RECONNECT_MIN: Duration = Duration::from_secs(3);
@@ -121,6 +126,8 @@ pub enum FeedCommand {
         client_id: u64,
         request_uid: u64,
     },
+    /// A book's REST snapshot -> `FeedEvent::BookSnapshot`.
+    BookSnapshot(String),
 }
 
 pub enum FeedEvent {
@@ -131,11 +138,12 @@ pub enum FeedEvent {
         qty: f64,
         time_ms: i64,
     },
-    /// The top 20 of each side, whole.
-    Book {
+    /// One `depthUpdate` of a book the terminal shows.
+    BookDiff { symbol: String, diff: book::Diff },
+    /// The answer to `FeedCommand::BookSnapshot`.
+    BookSnapshot {
         symbol: String,
-        bids: Vec<Level>,
-        asks: Vec<Level>,
+        result: Result<book::Snapshot, String>,
     },
     /// A book session ended; these books must not stay live across it.
     BooksUnavailable(Vec<String>),
@@ -224,9 +232,17 @@ pub fn start(
             move || unary_worker(unary_rx, ev_tx)
         })
         .expect("spawn");
+    let (depth_tx, depth_rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("aster-depth".into())
+        .spawn({
+            let ev_tx = ev_tx.clone();
+            move || depth_worker(depth_rx, ev_tx)
+        })
+        .expect("spawn");
     thread::Builder::new()
         .name("aster-feed".into())
-        .spawn(move || coordinator(cmd_rx, unary_tx, ev_tx, load))
+        .spawn(move || coordinator(cmd_rx, unary_tx, depth_tx, ev_tx, load))
         .expect("spawn");
     cmd_tx
 }
@@ -297,13 +313,16 @@ impl<K: Clone + Eq + std::hash::Hash> Group<K> {
 
 /// Routes commands: subscription sets go to their `subs::Plan`, which reopens
 /// only the chunk sessions whose membership changed; REST work goes to the
-/// unary worker. Books and candles are planned apart, so a candle chart opened
-/// in the terminal never reopens a book session. A book leaving the
-/// subscription is reported as `BooksUnavailable` here; a chunk reopened for
-/// its other members keeps their quotes (the new session sends whole books).
+/// unary worker, book snapshots to the depth worker. Books and candles are
+/// planned apart, so a candle chart opened in the terminal never reopens a
+/// book session. A book leaving the subscription is reported as
+/// `BooksUnavailable` here; a chunk reopened for its other members keeps their
+/// books on screen, and one that missed an event across the reopen is stitched
+/// again (its `pu` chain breaks and `book.rs` asks for a snapshot).
 fn coordinator(
     cmd_rx: Receiver<FeedCommand>,
     unary_tx: Sender<FeedCommand>,
+    depth_tx: Sender<FeedCommand>,
     ev_tx: Sender<FeedEvent>,
     load: Arc<Load>,
 ) {
@@ -347,9 +366,20 @@ fn coordinator(
                 }
             }
         };
-        let (mut set_books, mut set_candles, mut worker_gone) = (false, false, false);
+        let (mut set_books, mut set_candles) = (false, false);
+        let mut worker_gone: Option<&'static str> = None;
         let mut take = |cmd: FeedCommand| match cmd {
             FeedCommand::SetBooks(symbols) => {
+                // The snapshot worker learns the set at once, in the order the
+                // UDP loop sent it: a snapshot asked after this set must be
+                // judged by it, not by the one before (a book re-subscribed
+                // while its old session lingers asks within the coalesce).
+                if depth_tx
+                    .send(FeedCommand::SetBooks(symbols.clone()))
+                    .is_err()
+                {
+                    worker_gone = Some("the book snapshot worker");
+                }
                 books.wanted = symbols;
                 set_books = true;
             }
@@ -358,12 +388,16 @@ fn coordinator(
                 set_candles = true;
             }
             other => {
-                // The worker is gone only by panicking. The request in hand is
+                // A worker is gone only by panicking. The request in hand is
                 // refused rather than dropped — dropped, the terminal would
                 // wait out its timeout — and the core is told at once.
-                if let Err(mpsc::SendError(cmd)) = unary_tx.send(other) {
+                let (tx, name) = match other {
+                    FeedCommand::BookSnapshot(_) => (&depth_tx, "the book snapshot worker"),
+                    _ => (&unary_tx, "the REST worker"),
+                };
+                if let Err(mpsc::SendError(cmd)) = tx.send(other) {
                     refuse(cmd, &ev_tx);
-                    worker_gone = true;
+                    worker_gone = Some(name);
                 }
             }
         };
@@ -374,8 +408,8 @@ fn coordinator(
                 take(cmd);
             }
         }
-        if worker_gone {
-            let _ = ev_tx.send(FeedEvent::Lost("the REST worker"));
+        if let Some(name) = worker_gone {
+            let _ = ev_tx.send(FeedEvent::Lost(name));
             return;
         }
         let t = now();
@@ -413,6 +447,10 @@ fn refuse(cmd: FeedCommand, tx: &Sender<FeedEvent>) {
         } => FeedEvent::HistoryReply {
             client_id,
             request_uid,
+            result: Err(WHY.into()),
+        },
+        FeedCommand::BookSnapshot(symbol) => FeedEvent::BookSnapshot {
+            symbol,
             result: Err(WHY.into()),
         },
         FeedCommand::SetBooks(_) | FeedCommand::SetCandles(_) => return,
@@ -453,9 +491,11 @@ fn spawn_stream(
                     })
                 });
                 // A chunk replaced by the coordinator hands its books to the
-                // new session, and so does a planned rotation (`Ok`): the next
-                // session's first frame is a whole book ~1 s later. Only a
-                // session that FAILED loses them for a backoff.
+                // new session, and so does a planned rotation (`Ok`): if an
+                // event fell between the two sessions, the next one breaks the
+                // book's `pu` chain and a snapshot re-stitches it within a
+                // second (an event comes about every 150 ms even on a quiet
+                // market). Only a session that FAILED loses them for a backoff.
                 if res.is_err() && !books.is_empty() && !stop.load(Ordering::Relaxed) {
                     let _ = ev_tx.send(FeedEvent::BooksUnavailable(books.clone()));
                 }
@@ -508,10 +548,15 @@ fn forward(frame: StreamData, tx: &Sender<FeedEvent>) -> bool {
             Some(ev) => ev,
             None => return true,
         },
-        StreamData::One(StreamEvent::Depth(d)) => FeedEvent::Book {
+        StreamData::One(StreamEvent::Depth(d)) => FeedEvent::BookDiff {
+            diff: book::Diff {
+                first_id: d.first_id,
+                last_id: d.last_id,
+                prev_id: d.prev_id,
+                bids: rows(&d.bids),
+                asks: rows(&d.asks),
+            },
             symbol: d.symbol,
-            bids: levels(&d.bids),
-            asks: levels(&d.asks),
         },
         StreamData::One(StreamEvent::Kline(k)) => {
             let Some(minutes) = minutes_of(&k.kline.interval) else {
@@ -544,13 +589,8 @@ fn trade_of(t: AggTrade) -> Option<FeedEvent> {
     })
 }
 
-fn levels(rows: &[[Dec; 2]]) -> Vec<Level> {
-    rows.iter()
-        .map(|[p, q]| Level {
-            price: p.0 as f32,
-            qty: q.0 as f32,
-        })
-        .collect()
+fn rows(rows: &[[Dec; 2]]) -> Vec<(f64, f64)> {
+    rows.iter().map(|[p, q]| (p.0, q.0)).collect()
 }
 
 fn candle_of(k: &Kline) -> Candle {
@@ -587,12 +627,86 @@ fn unary_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
                 request_uid,
                 result: last_hour(&mut rest, &symbol, rest::now_ms()).map_err(|e| e.to_string()),
             },
-            FeedCommand::SetBooks(_) | FeedCommand::SetCandles(_) => continue,
+            FeedCommand::SetBooks(_)
+            | FeedCommand::SetCandles(_)
+            | FeedCommand::BookSnapshot(_) => continue,
         };
         if tx.send(ev).is_err() {
             return;
         }
         thread::sleep(UNARY_PACE);
+    }
+}
+
+/// Book snapshots, one at a time: each is `limit=1000` at weight ~20, and the
+/// UDP loop asks for one per book only when its chain breaks. Kept off the
+/// unary worker so a burst of them (a chunk reopened) never queues a chart
+/// behind it. The weight rules are the warm-up's: an answer past
+/// [`WARMUP_WEIGHT_CEILING`] or a 429 waits for the next minute; a ban (418)
+/// refuses every snapshot for five minutes, since each call made under it
+/// extends it. While it waits, requests pile up: a book is queued once
+/// however often it is asked, and one nobody shows any more by the time its
+/// turn comes (`SetBooks`, forwarded by the coordinator) is refused rather
+/// than fetched.
+fn depth_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
+    const BAN_PAUSE: Duration = Duration::from_secs(300);
+    let mut rest = Rest::new();
+    let mut banned_until: Option<Instant> = None;
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut wanted: HashSet<String> = HashSet::new();
+    let take =
+        |cmd: FeedCommand, queue: &mut VecDeque<String>, wanted: &mut HashSet<String>| match cmd {
+            FeedCommand::SetBooks(s) => *wanted = s.into_iter().collect(),
+            FeedCommand::BookSnapshot(s) if !queue.contains(&s) => queue.push_back(s),
+            _ => {}
+        };
+    loop {
+        if queue.is_empty() {
+            match rx.recv() {
+                Ok(cmd) => take(cmd, &mut queue, &mut wanted),
+                Err(_) => return,
+            }
+        }
+        while let Ok(cmd) = rx.try_recv() {
+            take(cmd, &mut queue, &mut wanted);
+        }
+        let Some(symbol) = queue.pop_front() else {
+            continue;
+        };
+        // Every request is answered, even one not fetched: the book that asked
+        // waits for exactly one answer and asks again only after one.
+        let result = if !wanted.contains(&symbol) {
+            Err("no longer shown".to_string())
+        } else if banned_until.is_some_and(|t| Instant::now() < t) {
+            Err("banned (418): snapshots paused".to_string())
+        } else {
+            match rest.depth(&symbol, BOOK_LEVELS) {
+                Ok(d) => {
+                    if rest.usage().weight_1m.unwrap_or(0) >= WARMUP_WEIGHT_CEILING {
+                        to_next_minute();
+                    }
+                    Ok(book::Snapshot {
+                        last_id: d.last_id,
+                        bids: rows(&d.bids),
+                        asks: rows(&d.asks),
+                    })
+                }
+                Err(e) => {
+                    log::warn!("book {symbol}: snapshot failed: {e}");
+                    match e {
+                        rest::Error::Api { status: 418, .. } => {
+                            banned_until = Some(Instant::now() + BAN_PAUSE);
+                        }
+                        rest::Error::Api { status: 429, .. } => to_next_minute(),
+                        _ => {}
+                    }
+                    Err(e.to_string())
+                }
+            }
+        };
+        if tx.send(FeedEvent::BookSnapshot { symbol, result }).is_err() {
+            return;
+        }
     }
 }
 

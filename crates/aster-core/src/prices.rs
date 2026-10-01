@@ -6,7 +6,8 @@
 //! for ALL 596 markets, and the stream that carries that (`!bookTicker`) was
 //! measured on 01.10 at 23 503 frames in 5 s — 4 MB of traffic to learn what one
 //! weight-2 call answers every two seconds. The books the terminal actually
-//! shows come live from `depth20` (`feed.rs`); the mark price and the funding,
+//! shows come live from `@depth@100ms` stitched to a snapshot (`book.rs`); the
+//! mark price and the funding,
 //! which this module also used to poll, come from `!markPrice@arr`.
 //!
 //! The call cannot be made from the loop that receives UDP: `ureq` is

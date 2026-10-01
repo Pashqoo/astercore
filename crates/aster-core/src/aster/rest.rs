@@ -16,8 +16,8 @@ use ureq::http::Response;
 use ureq::{Agent, Body};
 
 use super::json::{
-    kline_row, AggTrade, ApiError, BookTicker, ExchangeInfo, Kline, PremiumIndex, ServerTime,
-    Ticker24h,
+    kline_row, AggTrade, ApiError, BookTicker, DepthSnapshot, ExchangeInfo, Kline, PremiumIndex,
+    ServerTime, Ticker24h,
 };
 
 pub const BASE: &str = "https://fapi.asterdex.com";
@@ -201,6 +201,17 @@ impl Rest {
             ],
         )?;
         Ok(rows.iter().filter_map(|r| kline_row(r)).collect())
+    }
+
+    /// `GET /fapi/v1/depth`: one market's book, `limit` levels a side.
+    ///
+    /// Measured 01.10: 1000 is the most it returns (5000 is refused with
+    /// -1130), at a weight of about 20 — the minute's header moved 51 → 73 on
+    /// it; 500 cost about 10. A thin market answers with what it has (DOGEUSDT
+    /// 408 / 355 levels).
+    pub fn depth(&mut self, symbol: &str, limit: u32) -> Result<DepthSnapshot, Error> {
+        let limit = limit.to_string();
+        self.get("/fapi/v1/depth", &[("symbol", symbol), ("limit", &limit)])
     }
 
     /// `GET /fapi/v1/aggTrades`: the newest `limit` aggregate trades, or

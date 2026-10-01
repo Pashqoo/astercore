@@ -419,18 +419,36 @@ impl AggTrade {
     }
 }
 
-/// `<symbol>@depth20@100ms`: the top twenty levels of each side, WHOLE.
+/// `<symbol>@depth@100ms`: the levels that changed, a zero quantity removing
+/// one, chained by update ids (`book.rs` stitches them to a [`DepthSnapshot`]).
 ///
-/// Measured 01.10: 55 messages in 6 s, every one exactly (20, 20) levels and
-/// none with a zero quantity — a snapshot, not a delta, so the core keeps no
-/// local book (`PLAN.md`, "Стакан").
+/// Measured 01.10: `U`/`u` are one sequence across all symbols, `pu` is the
+/// previous event's `u` (0 breaks in 72 events), and even a quiet market sends
+/// an event about every 150 ms; BTCUSDT carries 24 levels an event on average.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Depth {
     #[serde(default, rename = "s")]
     pub symbol: String,
+    #[serde(default, rename = "U")]
+    pub first_id: i64,
+    #[serde(default, rename = "u")]
+    pub last_id: i64,
+    #[serde(default, rename = "pu")]
+    pub prev_id: i64,
     #[serde(default, rename = "b")]
     pub bids: Vec<[Dec; 2]>,
     #[serde(default, rename = "a")]
+    pub asks: Vec<[Dec; 2]>,
+}
+
+/// `GET /fapi/v1/depth`: the book as of `lastUpdateId`, bids best first.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DepthSnapshot {
+    #[serde(rename = "lastUpdateId")]
+    pub last_id: i64,
+    #[serde(default)]
+    pub bids: Vec<[Dec; 2]>,
+    #[serde(default)]
     pub asks: Vec<[Dec; 2]>,
 }
 
@@ -580,7 +598,7 @@ mod stream_tests {
         );
         assert_eq!(t.signed_qty(), -0.016, "buyer the maker: a sell");
 
-        let depth = r#"{"stream":"btcusdt@depth20@100ms","data":{"e":"depthUpdate","E":1,"T":1,"s":"BTCUSDT","U":1,"u":2,"pu":0,"b":[["84249.3","0.492"],["84248.5","0.083"]],"a":[["84249.4","1.154"]]}}"#;
+        let depth = r#"{"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","E":1,"T":1,"s":"BTCUSDT","U":577800763009,"u":577800765321,"pu":577800762691,"b":[["84249.3","0.492"],["84248.5","0.083"]],"a":[["84249.4","1.154"]]}}"#;
         let Envelope {
             data: StreamData::One(StreamEvent::Depth(d)),
             ..
@@ -590,6 +608,19 @@ mod stream_tests {
         };
         assert_eq!(d.bids.len(), 2);
         assert_eq!((d.asks[0][0].0, d.asks[0][1].0), (84249.4, 1.154));
+        assert_eq!(
+            (d.first_id, d.last_id, d.prev_id),
+            (577800763009, 577800765321, 577800762691)
+        );
+
+        let snap: DepthSnapshot = serde_json::from_str(
+            r#"{"lastUpdateId":577800763983,"E":1790875796240,"T":1790875796200,"bids":[["84249.3","0.492"]],"asks":[["84249.4","1.154"],["84250.0","0"]]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (snap.last_id, snap.bids.len(), snap.asks.len()),
+            (577800763983, 1, 2)
+        );
 
         let kline = r#"{"stream":"btcusdt@kline_1m","data":{"e":"kline","E":1,"s":"BTCUSDT","k":{"t":1790870820000,"T":1790870879999,"s":"BTCUSDT","i":"1m","f":1,"L":2,"o":"84259.8","c":"84249.3","h":"84259.8","l":"84242.3","v":"3.502","n":10,"x":false,"q":"295045.4887","V":"2.903","Q":"244579.6424","B":"0"}}}"#;
         let Envelope {

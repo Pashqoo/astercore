@@ -24,11 +24,12 @@ use std::time::Instant;
 
 use moonproto::server::codec::engine::{self, EngineMethod, EngineRequest, ServerInfo};
 use moonproto::server::codec::log::log_msg;
-use moonproto::server::codec::market_data::{self, DeepHistoryKind, Level, BOOK_KIND_FUTURES};
+use moonproto::server::codec::market_data::{self, DeepHistoryKind, BOOK_KIND_FUTURES};
 use moonproto::server::codec::{balance, strat, trade, ui, BaseHeader, BASE_HEADER_SIZE};
 use moonproto::server::{Command, Handler, Session};
 
 use crate::aster::ws::Stamp;
+use crate::book::{LocalBook, Out};
 use crate::candles5m::Candles5m;
 use crate::feed::{FeedCommand, FeedEvent};
 use crate::load::Load;
@@ -77,13 +78,21 @@ const PUMP_BATCH: usize = 256;
 /// How often stream liveness is judged.
 const HEALTH_EVERY_MS: i64 = 1_000;
 
-/// The last book a market's session sent, whole: what `RequestOrderBookFull`
-/// is answered from. A `depth20` frame is a complete top 20, so the last one
-/// IS the book — there is nothing to rebuild and no REST snapshot to stitch.
+/// A book the terminal shows, kept from the diff stream (`book.rs`), and the
+/// seq of the last packet sent for it: what `RequestOrderBookFull` answers.
+#[derive(Default)]
 struct Book {
     seq: u16,
-    bids: Vec<Level>,
-    asks: Vec<Level>,
+    local: LocalBook,
+}
+
+impl Book {
+    /// The next packet's seq. Zero is skipped: the client reads a last
+    /// applied seq of 0 as "no book yet".
+    fn next_seq(&mut self) -> u16 {
+        self.seq = self.seq.wrapping_add(1).max(1);
+        self.seq
+    }
 }
 
 /// What ties the handler to the market feed. Absent in the contract test that
@@ -129,6 +138,9 @@ pub struct CoreHandler {
     book_subs: HashMap<u64, BTreeSet<u16>>,
     feed_books: BTreeSet<u16>,
     books: HashMap<u16, Book>,
+    /// Whole books owed to a client that just subscribed (client, market),
+    /// sent by the next `pump` — after the subscription's reply.
+    book_fulls_due: Vec<(u64, u16)>,
     /// Live candles each client follows (one timeframe per market), and their
     /// union as last sent to the feed.
     candle_subs: HashMap<u64, HashMap<u16, DeepHistoryKind>>,
@@ -166,6 +178,7 @@ impl CoreHandler {
             book_subs: HashMap::new(),
             feed_books: BTreeSet::new(),
             books: HashMap::new(),
+            book_fulls_due: Vec::new(),
             candle_subs: HashMap::new(),
             feed_candles: BTreeSet::new(),
             candles: Candles5m::default(),
@@ -206,6 +219,52 @@ impl CoreHandler {
     /// is what brings the core back.
     pub fn feed_lost(&self) -> bool {
         self.feed_lost
+    }
+
+    /// Act on a book's step: ask the feed for a snapshot, or send the clients
+    /// showing it the whole book or the diff, under the book's next seq.
+    fn book_out(&mut self, idx: u16, symbol: String, out: Out, sessions: &mut [&mut Session]) {
+        let (full, bids, asks) = match out {
+            Out::Nothing => return,
+            Out::AskSnapshot { gap } => {
+                if let Some(f) = &self.feed {
+                    f.load.book_snapshot(gap);
+                }
+                if gap {
+                    log::debug!("book {symbol}: the update chain broke, asking a snapshot");
+                }
+                self.feed_send(FeedCommand::BookSnapshot(symbol));
+                return;
+            }
+            Out::Full => {
+                let Some(b) = self.books.get(&idx) else {
+                    return;
+                };
+                let (bids, asks) = b.local.levels();
+                (true, bids, asks)
+            }
+            Out::Diff { bids, asks } => (false, bids, asks),
+        };
+        let Some(book) = self.books.get_mut(&idx) else {
+            return;
+        };
+        let seq = book.next_seq();
+        let shown = |subs: &HashMap<u64, BTreeSet<u16>>, id: u64| {
+            subs.get(&id).is_some_and(|set| set.contains(&idx))
+        };
+        if !sessions
+            .iter()
+            .any(|s| shown(&self.book_subs, s.client_id()))
+        {
+            return;
+        }
+        let packet =
+            market_data::order_book_packet(idx, seq, full, BOOK_KIND_FUTURES, &bids, &asks);
+        for s in sessions.iter_mut() {
+            if shown(&self.book_subs, s.client_id()) {
+                s.send(ORDER_BOOK, &packet);
+            }
+        }
     }
 
     fn indexes(&self, names: &[String]) -> Vec<u16> {
@@ -260,6 +319,27 @@ impl CoreHandler {
         rx: &Receiver<FeedEvent>,
     ) {
         let mut sessions: Vec<&mut Session> = sessions.collect();
+        for (client, idx) in std::mem::take(&mut self.book_fulls_due) {
+            // Unsubscribed again before this pump: owed nothing.
+            if !self
+                .book_subs
+                .get(&client)
+                .is_some_and(|set| set.contains(&idx))
+            {
+                continue;
+            }
+            let Some(b) = self.books.get(&idx).filter(|b| b.local.has_book()) else {
+                // Not stitched yet: the stitch sends it to every client showing it.
+                continue;
+            };
+            let Some(s) = sessions.iter_mut().find(|s| s.client_id() == client) else {
+                continue;
+            };
+            let (bids, asks) = b.local.levels();
+            let packet =
+                market_data::order_book_packet(idx, b.seq, true, BOOK_KIND_FUTURES, &bids, &asks);
+            s.send(ORDER_BOOK, &packet);
+        }
         let mut applied = 0;
         for ev in rx.try_iter().take(PUMP_BATCH) {
             self.apply_feed(ev, &mut sessions);
@@ -345,42 +425,34 @@ impl CoreHandler {
                 let funded = self.catalog.apply_premium_index(&rows);
                 log::trace!("marks: funding on {funded} markets ({} rows)", rows.len());
             }
-            FeedEvent::Book { symbol, bids, asks } => {
+            FeedEvent::BookDiff { symbol, diff } => {
                 let Some(idx) = self.catalog.index_of_symbol(&symbol) else {
                     return;
                 };
-                // A late frame of a book nobody shows any more: its session
-                // is closing, and caching it would revive what the unsubscribe
+                // A late event of a book nobody shows any more: its session
+                // is closing, and keeping it would revive what the unsubscribe
                 // just dropped.
                 if !self.feed_books.contains(&idx) {
                     return;
                 }
-                let seq = self
+                let out = self
                     .books
-                    .get(&idx)
-                    .map_or(1, |b| b.seq.wrapping_add(1).max(1));
-                let shown = |subs: &HashMap<u64, BTreeSet<u16>>, id: u64| {
-                    subs.get(&id).is_some_and(|set| set.contains(&idx))
+                    .entry(idx)
+                    .or_default()
+                    .local
+                    .on_diff(diff, now_ms());
+                self.book_out(idx, symbol, out, sessions);
+            }
+            FeedEvent::BookSnapshot { symbol, result } => {
+                let Some(idx) = self.catalog.index_of_symbol(&symbol) else {
+                    return;
                 };
-                if sessions
-                    .iter()
-                    .any(|s| shown(&self.book_subs, s.client_id()))
-                {
-                    let packet = market_data::order_book_packet(
-                        idx,
-                        seq,
-                        true,
-                        BOOK_KIND_FUTURES,
-                        &bids,
-                        &asks,
-                    );
-                    for s in sessions.iter_mut() {
-                        if shown(&self.book_subs, s.client_id()) {
-                            s.send(ORDER_BOOK, &packet);
-                        }
-                    }
-                }
-                self.books.insert(idx, Book { seq, bids, asks });
+                let Some(book) = self.books.get_mut(&idx) else {
+                    // Asked for a book that has since been dropped.
+                    return;
+                };
+                let out = book.local.on_snapshot(result, now_ms());
+                self.book_out(idx, symbol, out, sessions);
             }
             // The session carrying these books ended on its own (or they left
             // the subscription). A client still showing one is sent an EMPTY
@@ -597,8 +669,14 @@ impl CoreHandler {
                 }
                 Vec::new()
             }
+            // A book another client already keeps live goes to this one whole,
+            // but not from here: the client drops every book packet until the
+            // reply to this request confirms the subscription (Delphi
+            // `FSubscribedBookServerToken`), and the reply leaves after this
+            // returns. `pump` sends it next (`book_fulls_due`).
             EngineMethod::SubscribeOrderBook => {
                 let idx = self.indexes(&req.market_names);
+                self.book_fulls_due.extend(idx.iter().map(|&i| (client, i)));
                 self.book_subs.entry(client).or_default().extend(idx);
                 self.sync_feed_subscriptions();
                 Vec::new()
@@ -611,10 +689,9 @@ impl CoreHandler {
                 self.sync_feed_subscriptions();
                 Vec::new()
             }
-            // Answered from the last frame of the market's session, which is a
-            // whole book. A market whose session has not sent one yet gets
-            // nothing here, and needs nothing: its first frame is a full book
-            // and goes to every client showing it within ~100 ms.
+            // Answered from the local book. One not stitched yet gets nothing
+            // here, and needs nothing: the stitch sends every client showing
+            // it a full book (`book_out`).
             EngineMethod::RequestOrderBookFull | EngineMethod::ReloadOrderBook => {
                 let wanted: Vec<u16> = match market_data::parse_order_book_full_params(&req.params)
                 {
@@ -628,14 +705,15 @@ impl CoreHandler {
                         .collect(),
                 };
                 for idx in wanted {
-                    if let Some(b) = self.books.get(&idx) {
+                    if let Some(b) = self.books.get(&idx).filter(|b| b.local.has_book()) {
+                        let (bids, asks) = b.local.levels();
                         let packet = market_data::order_book_packet(
                             idx,
                             b.seq,
                             true,
                             BOOK_KIND_FUTURES,
-                            &b.bids,
-                            &b.asks,
+                            &bids,
+                            &asks,
                         );
                         session.send(ORDER_BOOK, &packet);
                     }

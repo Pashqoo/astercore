@@ -3,7 +3,7 @@
 //!
 //! The shape is TInvestCore's `tinvest/stream.rs` without the grpc-web: a
 //! session is opened for a FIXED set of streams named in the URL
-//! (`/stream?streams=a@aggTrade/b@depth20@100ms`), read until it ends, and the
+//! (`/stream?streams=a@aggTrade/b@depth@100ms`), read until it ends, and the
 //! owner reopens it. Naming the set in the URL rather than sending `SUBSCRIBE`
 //! keeps the exchange's "10 incoming messages a second" limit out of the
 //! picture entirely, and a changed set is a new session — the same rule the

@@ -22,6 +22,8 @@ pub struct Load {
     candle_chunks: AtomicU64,
     books_off: AtomicU64,
     books_off_markets: AtomicU64,
+    book_snapshots: AtomicU64,
+    book_gaps: AtomicU64,
 }
 
 impl Load {
@@ -49,12 +51,21 @@ impl Load {
             .fetch_add(markets as u64, Ordering::Relaxed);
     }
 
+    /// A book asked for a REST snapshot (`gap`: its update chain broke).
+    pub fn book_snapshot(&self, gap: bool) {
+        self.book_snapshots.fetch_add(1, Ordering::Relaxed);
+        if gap {
+            self.book_gaps.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// The line for the period; zeroes the counters.
     pub fn summary(&self) -> String {
         let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
         format!(
             "load: batch full {} · books {} sets / {} chunks · \
-             candles {} sets / {} chunks · books off {} sessions / {} markets",
+             candles {} sets / {} chunks · books off {} sessions / {} markets · \
+             book snapshots {} ({} gaps)",
             take(&self.batches_full),
             take(&self.book_sets),
             take(&self.book_chunks),
@@ -62,6 +73,8 @@ impl Load {
             take(&self.candle_chunks),
             take(&self.books_off),
             take(&self.books_off_markets),
+            take(&self.book_snapshots),
+            take(&self.book_gaps),
         )
     }
 }
@@ -78,15 +91,19 @@ mod tests {
         load.books_reopened(3);
         load.candles_reopened(1);
         load.books_off(4);
+        load.book_snapshot(false);
+        load.book_snapshot(true);
         assert_eq!(
             load.summary(),
             "load: batch full 1 · books 2 sets / 5 chunks · \
-             candles 1 sets / 1 chunks · books off 1 sessions / 4 markets"
+             candles 1 sets / 1 chunks · books off 1 sessions / 4 markets · \
+             book snapshots 2 (1 gaps)"
         );
         assert_eq!(
             load.summary(),
             "load: batch full 0 · books 0 sets / 0 chunks · \
-             candles 0 sets / 0 chunks · books off 0 sessions / 0 markets"
+             candles 0 sets / 0 chunks · books off 0 sessions / 0 markets · \
+             book snapshots 0 (0 gaps)"
         );
     }
 }

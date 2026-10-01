@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aster_core::aster::json::{BookTicker, ExchangeInfo, Kline, PremiumIndex};
+use aster_core::book::{Diff, Snapshot};
 use aster_core::engine::{
     CoreHandler, FeedLink, ACCOUNT_PLACEHOLDER, EXCHANGE_CODE, EXCHANGE_NAME, SERVER_NAME,
 };
@@ -28,7 +29,7 @@ use aster_core::load::Load;
 use aster_core::model::Catalog;
 use aster_core::strategies::Strategies;
 use aster_core::stream_health::StreamHealth;
-use moonproto::server::codec::market_data::{delphi_days, Candle, Level};
+use moonproto::server::codec::market_data::{delphi_days, Candle};
 use moonproto::server::key_export::ServerKey;
 use moonproto::server::Server;
 use moonproto::state::AccountEvent;
@@ -442,9 +443,38 @@ fn now_ms() -> i64 {
     aster_core::engine::now_ms()
 }
 
+fn diff(u0: i64, u1: i64, pu: i64, bids: &[(f64, f64)], asks: &[(f64, f64)]) -> Diff {
+    Diff {
+        first_id: u0,
+        last_id: u1,
+        prev_id: pu,
+        bids: bids.to_vec(),
+        asks: asks.to_vec(),
+    }
+}
+
+/// The client's applied BTCUSDT book is exactly these levels, best first.
+fn book_is(
+    snap: &moonproto::events::MoonStateSnapshot,
+    bids: &[(f64, f64)],
+    asks: &[(f64, f64)],
+) -> bool {
+    let Some(book) = snap.order_book("BTCUSDT", moonproto::state::OrderBookKind::Futures) else {
+        return false;
+    };
+    let same = |side: &[moonproto::state::OrderBookLevel], want: &[(f64, f64)]| {
+        side.len() == want.len()
+            && side
+                .iter()
+                .zip(want)
+                .all(|(l, (p, q))| (l.rate - p).abs() < 0.01 && (l.quantity - q).abs() < 1e-6)
+    };
+    same(&book.buys, bids) && same(&book.sells, asks)
+}
+
 /// M1 in one test: the terminal's subscriptions reach the feed as commands,
-/// and what the feed says — a trade, a whole book, a CoinCard history, a new
-/// funding pair — reaches the client's own state.
+/// and what the feed says — a trade, a book stitched from its snapshot, a
+/// CoinCard history, a new funding pair — reaches the client's own state.
 #[test]
 fn the_tape_the_book_the_chart_and_live_funding_reach_the_client() {
     let core = FedCore::start();
@@ -475,6 +505,28 @@ fn the_tape_the_book_the_chart_and_live_funding_reach_the_client() {
         }
         _ => None,
     });
+    // The book's first event asks for its snapshot; it is older than the
+    // snapshot and is dropped by the stitch.
+    core.ev_tx
+        .send(FeedEvent::BookDiff {
+            symbol: "BTCUSDT".into(),
+            diff: diff(90, 95, 89, &[(83_700.0, 9.0)], &[]),
+        })
+        .unwrap();
+    core.expect_cmd("the book snapshot", |c| match c {
+        FeedCommand::BookSnapshot(s) if s == "BTCUSDT" => Some(()),
+        _ => None,
+    });
+    core.ev_tx
+        .send(FeedEvent::BookSnapshot {
+            symbol: "BTCUSDT".into(),
+            result: Ok(Snapshot {
+                last_id: 100,
+                bids: vec![(83_771.9, 0.5), (83_771.0, 2.0)],
+                asks: vec![(83_772.1, 1.25), (83_773.0, 3.0)],
+            }),
+        })
+        .unwrap();
     let bar_ms = now_ms() / 300_000 * 300_000 - 300_000;
     core.ev_tx
         .send(FeedEvent::CandlesReply {
@@ -505,19 +557,6 @@ fn the_tape_the_book_the_chart_and_live_funding_reach_the_client() {
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        core.ev_tx
-            .send(FeedEvent::Book {
-                symbol: "BTCUSDT".into(),
-                bids: vec![Level {
-                    price: 83_771.9,
-                    qty: 0.5,
-                }],
-                asks: vec![Level {
-                    price: 83_772.1,
-                    qty: 1.25,
-                }],
-            })
-            .unwrap();
         // Trades are applied only once the client's indexes are synchronized;
         // keep sending until one lands.
         core.ev_tx
@@ -537,12 +576,11 @@ fn the_tape_the_book_the_chart_and_live_funding_reach_the_client() {
             .get("BTCUSDT")
             .map_or(0.0, |m| m.trade_state().last_trade_price);
         let top = snap.top_of_book("BTCUSDT", moonproto::state::OrderBookKind::Futures);
-        let book_ok = top.as_ref().is_some_and(|t| {
-            t.bid
-                .is_some_and(|b| (b.rate - 83_771.9).abs() < 0.01 && b.quantity == 0.5)
-                && t.ask
-                    .is_some_and(|a| (a.rate - 83_772.1).abs() < 0.01 && a.quantity == 1.25)
-        });
+        let book_ok = book_is(
+            &snap,
+            &[(83_771.9, 0.5), (83_771.0, 2.0)],
+            &[(83_772.1, 1.25), (83_773.0, 3.0)],
+        );
         let bars = snap
             .markets()
             .get("BTCUSDT")
@@ -558,6 +596,91 @@ fn the_tape_the_book_the_chart_and_live_funding_reach_the_client() {
             "not applied: last={last} top={top:?} bars={bars:?} funding={funding:?}"
         );
     }
+
+    // The price runs up through the asks: the ask at 83772.1 is taken and bids
+    // appear at and above it. The exchange's diff, sent as it is, would cut
+    // the client's new bids at the removed ask; the client must end up with
+    // exactly the book the core holds.
+    core.ev_tx
+        .send(FeedEvent::BookDiff {
+            symbol: "BTCUSDT".into(),
+            diff: diff(
+                99,
+                101,
+                98,
+                &[(83_772.1, 0.7), (83_772.5, 0.1)],
+                &[(83_772.1, 0.0), (83_774.0, 1.0)],
+            ),
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        thread::sleep(Duration::from_millis(20));
+        let crossed = client.snapshot().is_some_and(|snap| {
+            book_is(
+                &snap,
+                &[
+                    (83_772.5, 0.1),
+                    (83_772.1, 0.7),
+                    (83_771.9, 0.5),
+                    (83_771.0, 2.0),
+                ],
+                &[(83_773.0, 3.0), (83_774.0, 1.0)],
+            )
+        });
+        if crossed {
+            break;
+        }
+        let book = client.snapshot().and_then(|snap| {
+            snap.order_book("BTCUSDT", moonproto::state::OrderBookKind::Futures)
+                .map(|b| format!("{:?} / {:?}", b.buys, b.sells))
+        });
+        assert!(
+            Instant::now() < deadline,
+            "crossing diff not mirrored: {book:?}"
+        );
+    }
+
+    // A second terminal opens the same book: the core already keeps it live,
+    // so no stitch will send it whole — the subscription itself must, or this
+    // client builds its book from changed levels alone.
+    let late = core.connect();
+    late.streams().subscribe_orderbook("BTCUSDT").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        thread::sleep(Duration::from_millis(20));
+        let whole = late.snapshot().is_some_and(|snap| {
+            book_is(
+                &snap,
+                &[
+                    (83_772.5, 0.1),
+                    (83_772.1, 0.7),
+                    (83_771.9, 0.5),
+                    (83_771.0, 2.0),
+                ],
+                &[(83_773.0, 3.0), (83_774.0, 1.0)],
+            )
+        });
+        if whole {
+            break;
+        }
+        let book = late.snapshot().and_then(|snap| {
+            snap.order_book("BTCUSDT", moonproto::state::OrderBookKind::Futures)
+                .map(|b| format!("{:?} / {:?}", b.buys, b.sells))
+        });
+        assert!(
+            Instant::now() < deadline,
+            "a late subscriber got no whole book: {book:?} snapshot={}",
+            late.snapshot().is_some()
+        );
+    }
+    // Released explicitly: a client that only disconnects keeps its books
+    // subscribed until the server times its session out, a minute later.
+    // The request is queued, not sent: give the client a moment to send it
+    // before the disconnect tears the session down.
+    late.streams().unsubscribe_orderbook("BTCUSDT").unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let _ = late.disconnect();
 
     // Closing the book releases its session: one the feed would otherwise
     // keep open for nobody. (A client that just goes away is released too,
