@@ -2,8 +2,9 @@
 //! the whole catalog, one `!markPrice@arr` session, chunked dynamic sessions
 //! for the books and candles the terminal follows (`subs`), and a serial
 //! worker for the on-demand REST calls (chart history, the tape of the last
-//! hour). Talks to the UDP loop only through channels; knows symbols, not
-//! market indexes.
+//! hour), and the startup warm-up of the screener's 5m candles on threads of
+//! its own (`spawn_warmup`). Talks to the UDP loop only through channels;
+//! knows symbols, not market indexes.
 //!
 //! The shape is TInvestCore's `feed.rs`; what changed is the venue under it.
 //! A chunk there was a grpc-web stream of 300 instruments, here it is a
@@ -13,7 +14,7 @@
 //! group is gone, and so is the MOEX history thread: deep history is the
 //! exchange's own `klines`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -59,6 +60,23 @@ const HISTORY_PAGES: usize = 5;
 /// should not cost a reopen each way.
 const SUBS_GRACE_MS: i64 = 120_000;
 const SUBS_LINGER_CAP: usize = MAX_STREAMS;
+/// The warm-up of the screener's 5m candles (`candles5m`): one `klines` call
+/// per market at the most bars weight 2 buys (measured 01.10: 2 up to 499).
+const WARMUP_BARS: u32 = 499;
+/// Calls in flight. Measured 01.10: a `klines 5m 499` answers in 0.27–1.1 s
+/// (median 0.51 s), so one at a time is five minutes over the catalog, four
+/// are about seventy seconds — ~1000 weight a minute of the 2400 allowed
+/// (measured live 01.10: 596 markets in 45 s, none failed).
+const WARMUP_THREADS: usize = 4;
+/// The warm-up yields to everything else above this much of the minute's
+/// weight, as the gateway itself counts it (`x-mbx-used-weight-1m`): it waits
+/// for the next minute rather than spend what the top-of-book refresher and
+/// the terminal's chart requests need.
+const WARMUP_WEIGHT_CEILING: i64 = 1_600;
+/// Calls per market before it is left to the tape, and the pause between two
+/// that failed for any reason but the rate limit.
+const WARMUP_ATTEMPTS: u32 = 3;
+const WARMUP_RETRY: Duration = Duration::from_secs(2);
 
 /// MoonProto's candle timeframes as Aster spells them. All six are native
 /// exchange intervals, so nothing is aggregated here.
@@ -143,6 +161,12 @@ pub enum FeedEvent {
     /// A feed thread the core cannot do without has died (by panicking): the
     /// engine latches it and `main` leaves (`CoreHandler::feed_lost`).
     Lost(&'static str),
+    /// One market's `klines 5m`, oldest first, the last one still in progress.
+    Warmup { symbol: String, bars: Vec<Kline> },
+    /// Every market of the warm-up was asked, whatever it answered: the
+    /// screener's candles are as complete as they will get from history, and
+    /// the held `RequestCandlesData` answers can go out.
+    WarmupDone,
 }
 
 /// Spawn the feed: the trade sessions over `symbols` and the mark-price
@@ -189,6 +213,8 @@ pub fn start(
         beat,
         ev_tx.clone(),
     );
+
+    spawn_warmup(symbols.to_vec(), ev_tx.clone());
 
     let (unary_tx, unary_rx) = mpsc::channel();
     thread::Builder::new()
@@ -567,6 +593,129 @@ fn unary_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
             return;
         }
         thread::sleep(UNARY_PACE);
+    }
+}
+
+/// The warm-up: [`WARMUP_THREADS`] threads take the catalog's markets in
+/// turn, one `klines 5m` each (`warm_one`). A market that fails every attempt
+/// is named in the journal and left to the tape; a ban (418) ends the whole
+/// warm-up at once, because every call made under a ban extends it.
+/// `WarmupDone` goes out when the last thread ends, panicking included
+/// (`Finish`): the engine holds the terminal's candle request until then, and
+/// must not hold it forever.
+fn spawn_warmup(symbols: Vec<String>, tx: Sender<FeedEvent>) {
+    let symbols = Arc::new(symbols);
+    let next = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let left = Arc::new(AtomicUsize::new(WARMUP_THREADS));
+    let banned = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+    for i in 0..WARMUP_THREADS {
+        let finish = Finish {
+            left: Arc::clone(&left),
+            failed: Arc::clone(&failed),
+            markets: symbols.len(),
+            started,
+            tx: tx.clone(),
+        };
+        let (symbols, next, banned) =
+            (Arc::clone(&symbols), Arc::clone(&next), Arc::clone(&banned));
+        thread::Builder::new()
+            .name(format!("warmup#{i}"))
+            .spawn(move || {
+                let mut rest = Rest::new();
+                while let Some(symbol) = symbols.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    if banned.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match warm_one(&mut rest, symbol) {
+                        Ok(bars) => {
+                            let ev = FeedEvent::Warmup {
+                                symbol: symbol.clone(),
+                                bars,
+                            };
+                            if finish.tx.send(ev).is_err() {
+                                return;
+                            }
+                        }
+                        Err(e @ rest::Error::Api { status: 418, .. }) => {
+                            if !banned.swap(true, Ordering::Relaxed) {
+                                log::error!(
+                                    "warmup {symbol}: {e}; banned, the rest is left to the tape"
+                                );
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            log::warn!("warmup {symbol}: {e}; left to the tape");
+                            finish.failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+            .expect("spawn");
+    }
+}
+
+/// One market's `klines 5m`, tried [`WARMUP_ATTEMPTS`] times. A rate-limit
+/// refusal (429) waits for the next minute before the next try, any other
+/// failure a moment; a ban (418) is not retried at all. An answer showing the
+/// minute's weight past [`WARMUP_WEIGHT_CEILING`] waits for the next minute
+/// too — read off that answer only, since a failed call leaves the last
+/// figure behind.
+fn warm_one(rest: &mut Rest, symbol: &str) -> Result<Vec<Kline>, rest::Error> {
+    let mut attempt = 1;
+    loop {
+        match rest.klines(symbol, "5m", WARMUP_BARS) {
+            Ok(bars) => {
+                if rest.usage().weight_1m.unwrap_or(0) >= WARMUP_WEIGHT_CEILING {
+                    to_next_minute();
+                }
+                return Ok(bars);
+            }
+            Err(e @ rest::Error::Api { status: 418, .. }) => return Err(e),
+            Err(e) if attempt >= WARMUP_ATTEMPTS => return Err(e),
+            Err(e) => {
+                log::debug!("warmup {symbol}: {e}; attempt {attempt} of {WARMUP_ATTEMPTS}");
+                if matches!(e, rest::Error::Api { status: 429, .. }) {
+                    to_next_minute();
+                } else {
+                    thread::sleep(WARMUP_RETRY);
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// To the next minute by the local clock, plus a second for the gateway's:
+/// still over the ceiling then, the next answer says so and this waits again.
+fn to_next_minute() {
+    let into = rest::now_ms().rem_euclid(60_000);
+    thread::sleep(Duration::from_millis((60_000 - into) as u64 + 1_000));
+}
+
+/// One warm-up thread's end; the last one to end reports the warm-up done.
+struct Finish {
+    left: Arc<AtomicUsize>,
+    failed: Arc<AtomicUsize>,
+    markets: usize,
+    started: Instant,
+    tx: Sender<FeedEvent>,
+}
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        if self.left.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        log::info!(
+            "warmup: 5m candles asked for {} markets in {:.0} s, {} failed",
+            self.markets,
+            self.started.elapsed().as_secs_f64(),
+            self.failed.load(Ordering::Relaxed)
+        );
+        let _ = self.tx.send(FeedEvent::WarmupDone);
     }
 }
 

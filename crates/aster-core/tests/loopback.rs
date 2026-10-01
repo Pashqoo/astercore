@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aster_core::aster::json::{BookTicker, ExchangeInfo, PremiumIndex};
+use aster_core::aster::json::{BookTicker, ExchangeInfo, Kline, PremiumIndex};
 use aster_core::engine::{
     CoreHandler, FeedLink, ACCOUNT_PLACEHOLDER, EXCHANGE_CODE, EXCHANGE_NAME, SERVER_NAME,
 };
@@ -654,6 +654,70 @@ fn a_refused_history_call_reaches_the_client_as_a_failure() {
             })
         }),
         "the client never heard the history refusal"
+    );
+    let _ = client.disconnect();
+}
+
+/// The screener's window columns: the terminal's one-shot `RequestCandlesData`
+/// is held until the warm-up ends, and the answer is the sealed 5m bars in
+/// quote turnover — the bar still in progress stays out, the client builds
+/// that one from its own tape.
+#[test]
+fn the_held_candle_snapshot_fills_the_hourly_volume_after_the_warmup() {
+    let core = FedCore::start();
+    let client = core.connect();
+    // Subscribing to the tape is what makes the client ask for the snapshot.
+    client
+        .streams()
+        .subscribe_all_trades(moonproto::TradesStreamMode::TradesOnly)
+        .unwrap();
+    let one_hour = || {
+        client
+            .snapshot()
+            .and_then(|s| s.market_history_derived_snapshot_now("BTCUSDT"))
+            .map_or(0.0, |d| d.candle_volumes.one_hour)
+    };
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(one_hour(), 0.0, "answered before the warm-up");
+
+    let period = 300_000;
+    let current = now_ms() / period * period;
+    let bar = |open_ms: i64, quote_volume: f64| Kline {
+        open_ms,
+        interval: "5m".into(),
+        open: 83_700.0,
+        high: 83_800.0,
+        low: 83_600.0,
+        close: 83_750.0,
+        volume: quote_volume / 83_700.0,
+        quote_volume,
+    };
+    // Three sealed bars inside the hour (the client derives nothing from
+    // fewer), one older than it, and the one in progress.
+    let bars = vec![
+        bar(current - 20 * period, 9_000_000.0),
+        bar(current - 3 * period, 1_000_000.0),
+        bar(current - 2 * period, 2_000_000.0),
+        bar(current - period, 3_000_000.0),
+        bar(current, 50_000_000.0),
+    ];
+    core.ev_tx
+        .send(FeedEvent::Warmup {
+            symbol: "BTCUSDT".into(),
+            bars,
+        })
+        .unwrap();
+    core.ev_tx.send(FeedEvent::WarmupDone).unwrap();
+
+    // The client's retry of the held request lands within its 15 s timeout.
+    assert!(
+        wait_until(Duration::from_secs(20), || one_hour() > 0.0),
+        "the snapshot never reached the client's windows"
+    );
+    let v = one_hour();
+    assert!(
+        (v - 6_000_000.0).abs() < 1.0,
+        "the hour is the three sealed bars, not the one in progress: {v}"
     );
     let _ = client.disconnect();
 }

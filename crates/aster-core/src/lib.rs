@@ -5,6 +5,7 @@
 //! deleted rather than left beside the new code.
 
 pub mod aster;
+pub mod candles5m;
 pub mod engine;
 pub mod feed;
 pub mod key_store;

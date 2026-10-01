@@ -29,6 +29,7 @@ use moonproto::server::codec::{balance, strat, trade, ui, BaseHeader, BASE_HEADE
 use moonproto::server::{Command, Handler, Session};
 
 use crate::aster::ws::Stamp;
+use crate::candles5m::Candles5m;
 use crate::feed::{FeedCommand, FeedEvent};
 use crate::load::Load;
 use crate::model::{Catalog, QUOTE, QUOTE_CODE};
@@ -132,6 +133,13 @@ pub struct CoreHandler {
     /// union as last sent to the feed.
     candle_subs: HashMap<u64, HashMap<u16, DeepHistoryKind>>,
     feed_candles: BTreeSet<(u16, i64)>,
+    /// The screener's 5m candles, what `RequestCandlesData` answers.
+    candles: Candles5m,
+    /// The feed's 5m warm-up has ended (`FeedEvent::WarmupDone`); true
+    /// without a feed, where there is nothing to wait for.
+    warmup_done: bool,
+    /// `RequestCandlesData` uids held until the warm-up ends (client → uid).
+    candles_pending: HashMap<u64, u64>,
     health_at: i64,
     load_at: Stamp,
     feed_lost: bool,
@@ -160,6 +168,9 @@ impl CoreHandler {
             books: HashMap::new(),
             candle_subs: HashMap::new(),
             feed_candles: BTreeSet::new(),
+            candles: Candles5m::default(),
+            warmup_done: true,
+            candles_pending: HashMap::new(),
             health_at: 0,
             load_at: Stamp::now(),
             feed_lost: false,
@@ -169,6 +180,7 @@ impl CoreHandler {
     /// Connect the handler to the market feed (`feed::start`).
     pub fn with_feed(mut self, feed: FeedLink) -> Self {
         self.feed = Some(feed);
+        self.warmup_done = false;
         self
     }
 
@@ -309,6 +321,24 @@ impl CoreHandler {
             } => {
                 if let Some(idx) = self.catalog.index_of_symbol(&symbol) {
                     self.trades.push(idx, time_ms, price as f32, qty as f32);
+                    self.candles.push(idx, time_ms, price, qty);
+                }
+            }
+            FeedEvent::Warmup { symbol, bars } => {
+                if let Some(idx) = self.catalog.index_of_symbol(&symbol) {
+                    for b in &bars {
+                        self.candles
+                            .seed(idx, b.open_ms, b.low, b.high, b.quote_volume);
+                    }
+                }
+            }
+            FeedEvent::WarmupDone => {
+                self.warmup_done = true;
+                let pending = std::mem::take(&mut self.candles_pending);
+                for s in sessions.iter_mut() {
+                    if let Some(&uid) = pending.get(&s.client_id()) {
+                        self.send_candles_snapshot(s, uid);
+                    }
                 }
             }
             FeedEvent::Marks(rows) => {
@@ -469,6 +499,43 @@ impl CoreHandler {
                     }
                 }
             }
+        }
+    }
+
+    /// `RequestCandlesData`: every market's sealed 5m candles in one chunked
+    /// answer. The journal line is the size of what went out — the one number
+    /// that says whether a slow first load is ours or the network's.
+    fn send_candles_snapshot(&self, session: &mut Session, request_uid: u64) {
+        let started = Instant::now();
+        let now = now_ms();
+        let per_market: Vec<(&str, Vec<market_data::Candle>)> = self
+            .catalog
+            .markets()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                let candles = self.candles.sealed(i as u16, now);
+                (!candles.is_empty()).then_some((m.symbol.as_str(), candles))
+            })
+            .collect();
+        let refs: Vec<(&str, &[market_data::Candle])> =
+            per_market.iter().map(|(n, c)| (*n, c.as_slice())).collect();
+        let chunks = market_data::candles_snapshot(&refs);
+        log::info!(
+            "candles: {} markets, {} candles, {} chunks of {} bytes in {} ms to client {:#x}",
+            refs.len(),
+            refs.iter().map(|(_, c)| c.len()).sum::<usize>(),
+            chunks.len(),
+            chunks.iter().map(Vec::len).sum::<usize>(),
+            started.elapsed().as_millis(),
+            session.client_id()
+        );
+        for chunk in chunks {
+            session.send_encrypted(
+                API,
+                &engine::response_ok(request_uid, EngineMethod::RequestCandlesData, &chunk),
+                true,
+            );
         }
     }
 
@@ -633,6 +700,18 @@ impl CoreHandler {
                 });
                 if !sent {
                     self.reply_err(session, &req, "no market data source");
+                }
+                return;
+            }
+            // Held until the warm-up: the client asks once per connection and
+            // keeps what it got, so an early answer would leave the window
+            // columns empty until a reconnect. Held, its request times out
+            // after 15 s and is asked again; the newest uid is the one kept.
+            EngineMethod::RequestCandlesData => {
+                if self.warmup_done {
+                    self.send_candles_snapshot(session, req.uid);
+                } else {
+                    self.candles_pending.insert(client, req.uid);
                 }
                 return;
             }
@@ -846,6 +925,7 @@ impl Handler for CoreHandler {
         self.trade_subs.remove(&client_id);
         self.book_subs.remove(&client_id);
         self.candle_subs.remove(&client_id);
+        self.candles_pending.remove(&client_id);
         self.sync_feed_subscriptions();
     }
 }

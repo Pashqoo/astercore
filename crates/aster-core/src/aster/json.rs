@@ -462,6 +462,10 @@ pub struct Kline {
     /// BASE volume — the one a chart row carries (`PLAN.md`, "Объёмы").
     #[serde(default, deserialize_with = "str_f64", rename = "v")]
     pub volume: f64,
+    /// QUOTE turnover (USDT) — the one the screener's retained 5m candles
+    /// carry (`candles5m`). NaN on a REST row that carries none.
+    #[serde(default, deserialize_with = "str_f64", rename = "q")]
+    pub quote_volume: f64,
 }
 
 /// One row of `!markPrice@arr`.
@@ -546,6 +550,12 @@ pub fn kline_row(cells: &[serde_json::Value]) -> Option<Kline> {
         low: num(3)?,
         close: num(4)?,
         volume: num(5)?,
+        // Cell 7 (measured 01.10: all 12 cells present on every row). Not a
+        // reason to drop the bar if it ever goes missing: a CoinCard row does
+        // not read it, and a screener candle without it still has its range.
+        // NaN rather than 0, so that `Candles5m::seed` can tell "no figure"
+        // from "nothing traded" and keep what the tape counted.
+        quote_volume: num(7).unwrap_or(f64::NAN),
     })
 }
 
@@ -589,7 +599,14 @@ mod stream_tests {
         else {
             panic!("kline")
         };
-        assert_eq!((k.kline.interval.as_str(), k.kline.volume), ("1m", 3.502));
+        assert_eq!(
+            (
+                k.kline.interval.as_str(),
+                k.kline.volume,
+                k.kline.quote_volume
+            ),
+            ("1m", 3.502, 295045.4887)
+        );
 
         let arr = r#"{"stream":"!markPrice@arr","data":[{"e":"markPriceUpdate","E":1,"s":"BTCUSDT","p":"84249.30000000","P":"1","i":"1","r":"0.00009554","T":1790899200000},{"e":"somethingNew","s":"X"}]}"#;
         let Envelope {
@@ -618,8 +635,8 @@ mod stream_tests {
         .unwrap();
         let k = kline_row(&row).unwrap();
         assert_eq!(
-            (k.open_ms, k.high, k.volume),
-            (1661299200000, 21899.0, 1073.265)
+            (k.open_ms, k.high, k.volume, k.quote_volume),
+            (1661299200000, 21899.0, 1073.265, 2.3e7)
         );
         assert!(kline_row(&row[..3]).is_none(), "a short row is no bar");
     }
