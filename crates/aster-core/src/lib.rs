@@ -4,6 +4,7 @@
 //! `PLAN.md` records what carries over, what is replaced, and what had to be
 //! deleted rather than left beside the new code.
 
+pub mod account;
 pub mod aster;
 pub mod book;
 pub mod candles5m;

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aster_core::account::{Account, Position};
 use aster_core::aster::json::{BookTicker, ExchangeInfo, Kline, PremiumIndex};
 use aster_core::book::{Diff, Snapshot};
 use aster_core::engine::{
@@ -32,7 +33,7 @@ use aster_core::stream_health::StreamHealth;
 use moonproto::server::codec::market_data::{delphi_days, Candle};
 use moonproto::server::key_export::ServerKey;
 use moonproto::server::Server;
-use moonproto::state::AccountEvent;
+use moonproto::state::{AccountEvent, BalanceEvent, MarketBalancePosition};
 use moonproto::{
     BaseCurrency, ClientConfig, ConnectConfig, Event, ExchangeTypeMask, InitConfig,
     InitialStrategies, MoonClient, TransportMode,
@@ -842,5 +843,99 @@ fn the_held_candle_snapshot_fills_the_hourly_volume_after_the_warmup() {
         (v - 6_000_000.0).abs() < 1.0,
         "the hour is the three sealed bars, not the one in progress: {v}"
     );
+    let _ = client.disconnect();
+}
+
+/// The balance and position the client holds for `market` once a full
+/// snapshot lands: the globals in USDT and that market's row.
+fn next_balance(client: &MoonClient, market: &str) -> ((f64, f64, f64), MarketBalancePosition) {
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            client
+                .drain_events()
+                .into_iter()
+                .any(|e| matches!(e, Event::Balance(BalanceEvent::SnapshotApplied { .. })))
+        }),
+        "no balance snapshot reached the client"
+    );
+    let snap = client.snapshot().expect("snapshot");
+    let g = snap.balances().global().clone();
+    let pos = snap
+        .markets()
+        .iter()
+        .find(|h| h.with(|m| m.symbol() == market))
+        .expect("market")
+        .balance_position();
+    (
+        (
+            g.btc_balance_total,
+            g.btc_balance_locked,
+            g.btc_balance_full,
+        ),
+        pos,
+    )
+}
+
+/// M2: the account. A core without a key answers the client's balance refresh
+/// with the empty snapshot; an account read reaches every session as a full
+/// snapshot — money in USDT, a short with its entry price — the next read
+/// without the position leaves the market flat on the client, and a withdrawn
+/// (stale) account is the empty snapshot again.
+#[test]
+fn the_account_reaches_the_client_and_a_closed_position_goes_flat() {
+    let core = FedCore::start();
+    let client = core.connect();
+    client.balances().refresh().unwrap();
+    let (money, btc) = next_balance(&client, "BTCUSDT");
+    assert_eq!(money, (0.0, 0.0, 0.0), "no key: no money claimed");
+    assert_eq!(btc.pos_size, 0.0);
+
+    core.ev_tx
+        .send(FeedEvent::Account(Some(Account {
+            free: 700.0,
+            equity: 1009.5,
+            positions: vec![Position {
+                symbol: "BTCUSDT".into(),
+                size: -0.002,
+                entry: 83_000.0,
+            }],
+        })))
+        .unwrap();
+    let (money, btc) = next_balance(&client, "BTCUSDT");
+    assert_eq!(money, (700.0, 309.5, 1009.5), "free, locked, equity");
+    assert_eq!((btc.pos_size, btc.pos_price), (0.002, 83_000.0));
+    assert_eq!(
+        btc.pos_dir,
+        moonproto::OrderType::Sell,
+        "a short is a size with a sell direction"
+    );
+
+    core.ev_tx
+        .send(FeedEvent::Account(Some(Account {
+            free: 1000.0,
+            equity: 1000.0,
+            positions: Vec::new(),
+        })))
+        .unwrap();
+    let (money, btc) = next_balance(&client, "BTCUSDT");
+    assert_eq!(money, (1000.0, 0.0, 1000.0));
+    assert_eq!(
+        (btc.pos_size, btc.pos_price),
+        (0.0, 0.0),
+        "a position left out of a full snapshot is closed on the client"
+    );
+
+    // Reads failing past `STALE_AFTER`: the money is withdrawn, not frozen,
+    // and a refresh the client asks for afterwards gets the same answer.
+    core.ev_tx.send(FeedEvent::Account(None)).unwrap();
+    let (money, _) = next_balance(&client, "BTCUSDT");
+    assert_eq!(
+        money,
+        (0.0, 0.0, 0.0),
+        "a stale balance is not shown as live"
+    );
+    client.balances().refresh().unwrap();
+    let (money, _) = next_balance(&client, "BTCUSDT");
+    assert_eq!(money, (0.0, 0.0, 0.0));
     let _ = client.disconnect();
 }

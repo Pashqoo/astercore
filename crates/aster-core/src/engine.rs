@@ -6,8 +6,9 @@
 //! schema all answer (`client::init::steps`), and it then sends an order
 //! snapshot request, a settings request, its strategy list and a balance
 //! refresh whose replies are *not* part of the barrier. So this file answers
-//! the first group with real data and the second with the honest empty answer
-//! for a core that has no signed access yet (M2).
+//! the first group with real data, the balance with the account when the core
+//! has a key (`account.rs`), and the rest with the honest empty answer of a
+//! core that does not trade yet (M2).
 //!
 //! Adapted from TInvestCore's `engine.rs`, which is the same spine over 6000
 //! lines of trading on top. Market data (M1) is here: the tape, the books and
@@ -28,6 +29,7 @@ use moonproto::server::codec::market_data::{self, DeepHistoryKind, BOOK_KIND_FUT
 use moonproto::server::codec::{balance, strat, trade, ui, BaseHeader, BASE_HEADER_SIZE};
 use moonproto::server::{Command, Handler, Session};
 
+use crate::account::Account;
 use crate::aster::ws::Stamp;
 use crate::book::{LocalBook, Out};
 use crate::candles5m::Candles5m;
@@ -56,11 +58,12 @@ pub const SERVER_VERSION: i32 = 1;
 const EXCHANGE_TYPE_FUTURES: u8 = 0x02;
 /// Largest payload the core will accept from one client, reported in AuthCheck.
 const MAX_PAYLOAD: i32 = 4 * 1024 * 1024;
-/// What AuthCheck reports as the account until M2 can ask the exchange.
+/// What AuthCheck reports as the account: Aster has no account id to report
+/// (`CoreHandler::account_id`).
 ///
 /// Here rather than in `main.rs` because the contract test asserts the same
 /// string: it is one fact about what the terminal is told, and two copies of it
-/// drift the moment the real account id arrives.
+/// drift the moment it changes.
 pub const ACCOUNT_PLACEHOLDER: &str = "aster";
 
 const API: u8 = Command::API.to_byte();
@@ -109,10 +112,11 @@ pub struct CoreHandler {
     bot_id: i64,
     /// What AuthCheck reports as the account.
     ///
-    /// The exchange account id needs a signed call to learn (M2), so until then
-    /// it is [`ACCOUNT_PLACEHOLDER`] — a non-empty string, because an empty one
-    /// reads in the terminal as "not authorized", and a placeholder the trader
-    /// can recognise as one rather than a number that looks like an account.
+    /// An Aster account has no id of its own — it is the main wallet's address,
+    /// which the key file may not even name — so this stays
+    /// [`ACCOUNT_PLACEHOLDER`], also on a core that reads the account: a
+    /// non-empty string, because an empty one reads in the terminal as "not
+    /// authorized", and one the trader can recognise as a placeholder.
     account_id: String,
     catalog: Catalog,
     strategies: Strategies,
@@ -128,10 +132,14 @@ pub struct CoreHandler {
     /// How many markets the last book snapshot quoted, so a change is a journal
     /// line and the steady state is not.
     quoted: usize,
-    /// `TBalanceFull.epoch`. Fixed at 1 while there is no account to read: the
-    /// epoch exists to tell one snapshot generation from the next, and this
-    /// core has exactly one — the empty one. M2 moves it with the account.
+    /// `TBalanceFull.epoch`. Fixed at 1, as in TInvestCore: the core sends
+    /// full snapshots only, which the client applies whatever their epoch —
+    /// the epoch orders INCREMENTAL updates, and there are none.
     balance_epoch: u16,
+    /// The last read of the account; `None` on a core without a key, and while
+    /// the reads keep failing (`account::STALE_AFTER`) — either way the money
+    /// is unknown, and a balance request is answered with the empty snapshot.
+    account: Option<Account>,
     feed: Option<FeedLink>,
     /// The core-wide tape packetizer, broadcast to `trade_subs`.
     trades: TradesStream,
@@ -174,6 +182,7 @@ impl CoreHandler {
             shared_config: ui::default_shared_config_blob(),
             quoted,
             balance_epoch: 1,
+            account: None,
             feed: None,
             trades: TradesStream::new(now_ms),
             trade_subs: HashSet::new(),
@@ -190,6 +199,13 @@ impl CoreHandler {
             load_at: Stamp::now(),
             feed_lost: false,
         }
+    }
+
+    /// Start from the account `main` read at startup, so the first terminal
+    /// is answered with it rather than with an empty wallet for a period.
+    pub fn with_account(mut self, account: Account) -> Self {
+        self.account = Some(account);
+        self
     }
 
     /// Connect the handler to the market feed (`feed::start`).
@@ -521,6 +537,13 @@ impl CoreHandler {
             FeedEvent::Lost(what) => {
                 log::error!("feed: {what} is gone");
                 self.feed_lost = true;
+            }
+            FeedEvent::Account(account) => {
+                self.account = account;
+                let payload = self.balance_payload(rand_uid());
+                for s in sessions.iter_mut() {
+                    s.send_encrypted(BALANCE, &payload, true);
+                }
             }
             FeedEvent::CandlesReply {
                 client_id,
@@ -974,16 +997,43 @@ impl CoreHandler {
             hdr.cmd_id,
             balance::CMD_REQUEST_REFRESH | balance::CMD_DIGEST
         ) {
-            // Zeros and no rows: reading the account needs a signed call
-            // (M2), so what this core knows about the money is nothing. The
-            // empty snapshot is how that is spelled on this wire — there is no
-            // "unknown" for a balance — and the terminal draws an empty Assets
-            // panel, which is the right picture for a core that cannot trade
-            // yet. Answering at all matters: the client asks once per init and
+            // Answering at all matters: the client asks once per init and
             // again on every digest mismatch, and silence leaves it asking.
-            let resp = balance::balance_full(hdr.uid, self.balance_epoch, 0.0, 0.0, 0.0, &[]);
+            let resp = self.balance_payload(hdr.uid);
             session.send_encrypted(BALANCE, &resp, true);
         }
+    }
+
+    /// `TBalanceFull` of the last account read: free, locked and equity in
+    /// USDT, a row per open position. A market missing from the rows is flat —
+    /// the client resets every market a full snapshot leaves out.
+    ///
+    /// Without a key, or with the reads failing, the money is unknown, and the
+    /// empty snapshot is how that is spelled on this wire — there is no "unknown" for a balance: the
+    /// terminal draws an empty Assets panel, the right picture for a core that
+    /// cannot trade.
+    fn balance_payload(&self, uid: u64) -> Vec<u8> {
+        let Some(a) = &self.account else {
+            return balance::balance_full(uid, self.balance_epoch, 0.0, 0.0, 0.0, &[]);
+        };
+        let items: Vec<balance::BalanceItem> = a
+            .positions
+            .iter()
+            .map(|p| balance::BalanceItem {
+                market: &p.symbol,
+                pos_size: p.size,
+                pos_price: p.entry,
+                ..balance::BalanceItem::default()
+            })
+            .collect();
+        balance::balance_full(
+            uid,
+            self.balance_epoch,
+            a.free,
+            a.locked(),
+            a.equity,
+            &items,
+        )
     }
 }
 

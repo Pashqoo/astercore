@@ -2,8 +2,9 @@
 //!
 //! Aster speaks the Binance USDⓈ-M Futures dialect: plain `GET`/`POST` with
 //! query parameters, JSON answers, decimal strings for every number. Signed
-//! calls take the v3 form (`sign.rs`): the signer's network decides where they
-//! go, the public calls stay on mainnet.
+//! calls take the v3 form (`sign.rs`) and go to the client's own network
+//! ([`Rest::on`]): the account's client lives where its signer does, so its
+//! clock is measured against the gateway that checks its nonces.
 //!
 //! Synchronous on purpose (`ureq`, no Tokio): the core is thread-per-stream,
 //! and a runtime would be the only async thing in the process.
@@ -17,9 +18,9 @@ use ureq::{Agent, Body};
 
 use super::json::{
     kline_row, AggTrade, ApiError, Balance, BookTicker, DepthSnapshot, ExchangeInfo, Kline,
-    PremiumIndex, ServerTime, Ticker24h,
+    PositionRisk, PremiumIndex, ServerTime, Ticker24h,
 };
-use super::sign::Signer;
+use super::sign::{Network, Signer};
 
 pub const BASE: &str = "https://fapi.asterdex.com";
 
@@ -78,6 +79,7 @@ pub struct Usage {
 
 pub struct Rest {
     agent: Agent,
+    network: Network,
     /// `server_time - local_time`, in milliseconds, from the last
     /// [`Rest::sync_clock`]. Signed calls add it to their nonce, which the
     /// gateway refuses outside ±60 s of its own clock.
@@ -88,7 +90,15 @@ pub struct Rest {
 }
 
 impl Rest {
+    /// A mainnet client: the market data, which only mainnet carries.
     pub fn new() -> Self {
+        Self::on(Network::Mainnet)
+    }
+
+    /// A client of `network`'s gateway: every call it makes, the clock
+    /// included, goes there. Weight is counted per client, which is per IP
+    /// at the gateway — a separate figure, not a separate budget.
+    pub fn on(network: Network) -> Self {
         let agent = Agent::config_builder()
             // Aster's refusals carry the code we need to act on, so a non-2xx
             // must reach `check_status` as a response with a body, not as a
@@ -103,6 +113,7 @@ impl Rest {
             .new_agent();
         Self {
             agent,
+            network,
             clock_delta_ms: 0,
             usage: Usage::default(),
             last_rtt: None,
@@ -247,13 +258,48 @@ impl Rest {
         }
     }
 
-    /// `GET /fapi/v3/balance`, signed, weight 5: every asset of the account.
-    pub fn balance(&mut self, signer: &mut Signer) -> Result<Vec<Balance>, Error> {
-        self.signed_get(signer, "/fapi/v3/balance", &[])
+    /// `GET /fapi/v3/balance`, signed, weight 5: the row of `asset`, or
+    /// `None` when the account has none.
+    ///
+    /// Only that row is decoded, and strictly (`Balance`): the answer lists
+    /// every asset of the account (35 on 01.10), and a field the core does not
+    /// read, odd in a row it does not read, must not cost it the one it does.
+    pub fn balance(&mut self, signer: &mut Signer, asset: &str) -> Result<Option<Balance>, Error> {
+        let rows: Vec<serde_json::Value> = self.signed_get(signer, "/fapi/v3/balance", &[])?;
+        rows.into_iter()
+            .find(|r| r.get("asset").and_then(|a| a.as_str()) == Some(asset))
+            .map(|r| {
+                serde_json::from_value(r)
+                    .map_err(|e| Error::Decode(format!("/fapi/v3/balance {asset}: {e}")))
+            })
+            .transpose()
+    }
+
+    /// `GET /fapi/v3/positionRisk`, signed, weight 5 (docs): one row per
+    /// symbol and side, flat ones included — the rows of the symbols `keep`
+    /// names.
+    ///
+    /// Only those rows are decoded, and strictly (`PositionRisk`), for the
+    /// reason `balance` gives: the answer covers every symbol of the venue,
+    /// and an odd row of one the core does not count must not cost it the
+    /// read.
+    pub fn position_risk(
+        &mut self,
+        signer: &mut Signer,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<Vec<PositionRisk>, Error> {
+        let rows: Vec<serde_json::Value> = self.signed_get(signer, "/fapi/v3/positionRisk", &[])?;
+        rows.into_iter()
+            .filter(|r| r.get("symbol").and_then(|s| s.as_str()).is_some_and(&keep))
+            .map(|r| {
+                serde_json::from_value(r)
+                    .map_err(|e| Error::Decode(format!("/fapi/v3/positionRisk: {e}")))
+            })
+            .collect()
     }
 
     fn get<T: DeserializeOwned>(&mut self, path: &str, query: &[(&str, &str)]) -> Result<T, Error> {
-        let mut url = format!("{BASE}{path}");
+        let mut url = format!("{}{path}", self.network.rest_base());
         for (i, (k, v)) in query.iter().enumerate() {
             url.push(if i == 0 { '?' } else { '&' });
             url.push_str(k);
@@ -265,16 +311,27 @@ impl Rest {
 
     /// A v3-signed `GET`: the signed query string goes after `?` as it was
     /// signed, because the gateway checks the signature against those bytes.
+    ///
+    /// Refused unsent when the signer is on another network than this client:
+    /// the nonce would carry a clock measured against the wrong gateway, and
+    /// the chain id inside the signature would be refused there anyway.
     fn signed_get<T: DeserializeOwned>(
         &mut self,
         signer: &mut Signer,
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<T, Error> {
+        if signer.network() != self.network {
+            return Err(Error::Transport(format!(
+                "{path}: the signer is on {}, this client on {}",
+                signer.network().name(),
+                self.network.name()
+            )));
+        }
         let now_us = (now_us() + self.clock_delta_ms * 1000).max(0) as u64;
         let url = format!(
             "{}{path}?{}",
-            signer.network().rest_base(),
+            self.network.rest_base(),
             signer.sign_query(query, now_us)
         );
         self.fetch(&url, path)

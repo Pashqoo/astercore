@@ -4,8 +4,9 @@
 //! the catalog mapping work against the real exchange — `clock:`, `limits:`,
 //! `catalog:` and `wire:`, each number of them meant to be read against an
 //! independent parse of `/fapi/v1/exchangeInfo` (`AGENTS.md`, "Канал
-//! наблюдения"), and `account:` — one signed call, when there is a key to sign
-//! it with. After them it opens the market streams (`feed.rs`), binds the
+//! наблюдения"), then `account:` — the first read of the balance and
+//! positions, when there is a key to sign it with; the terminal gets every
+//! later one. After them it opens the market streams (`feed.rs`), binds the
 //! UDP socket and serves: the catalog goes to the terminal once per session,
 //! the prices every couple of seconds, the tape, books and candles live.
 
@@ -13,13 +14,14 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
 
+use aster_core::account;
 use aster_core::aster::rest::Rest;
 use aster_core::aster::sign::{Credentials, LoadError, Network, Signer};
 use aster_core::engine::{self, CoreHandler, FeedLink};
 use aster_core::feed;
 use aster_core::key_store;
 use aster_core::load::Load;
-use aster_core::model::Catalog;
+use aster_core::model::{Catalog, QUOTE};
 use aster_core::prices;
 use aster_core::stderr_log;
 use aster_core::strategies::Strategies;
@@ -126,67 +128,6 @@ fn main() -> ExitCode {
         }
     }
 
-    // The account, when there is a key. No key is a market-data core, as M1
-    // was; a key that is there and does not sign is fatal, because the trader
-    // put it there to trade and would otherwise learn it on the first order.
-    // A path named explicitly is a key the operator means to trade with, so its
-    // absence is fatal; only the default name may be absent.
-    let named_key = std::env::var("ASTER_API_KEY_FILE")
-        .ok()
-        .filter(|p| !p.trim().is_empty());
-    let key_path = named_key.clone().unwrap_or_else(|| API_KEY_FILE.into());
-    let network = match std::env::var("ASTER_NET") {
-        Ok(n) if !n.trim().is_empty() => match Network::parse(&n) {
-            Some(net) => net,
-            None => {
-                eprintln!("account: ASTER_NET is neither mainnet nor testnet: {n}");
-                return ExitCode::FAILURE;
-            }
-        },
-        _ => Network::Mainnet,
-    };
-    match Credentials::load(&key_path) {
-        Err(LoadError::Io(e))
-            if e.kind() == std::io::ErrorKind::NotFound && named_key.is_none() =>
-        {
-            println!(
-                "account: none ({key_path} absent, {}) — market data only",
-                network.name()
-            );
-        }
-        Err(e) => {
-            eprintln!("account: {key_path}: {e}");
-            return ExitCode::FAILURE;
-        }
-        Ok(creds) => {
-            warn_if_shared(&key_path);
-            let mut signer = Signer::new(creds, network);
-            let who = format!(
-                "{} signer {} user {}",
-                network.name(),
-                short(signer.credentials().signer()),
-                signer.credentials().user().map_or("none".into(), short)
-            );
-            match rest.balance(&mut signer) {
-                Ok(rows) => {
-                    // No USDT row is said as such: a printed 0 would read as
-                    // an empty wallet the exchange reported.
-                    let usdt = rows.iter().find(|b| b.asset == "USDT").map_or_else(
-                        || "no USDT row".to_string(),
-                        |b| format!("USDT wallet {} available {}", b.balance, b.available),
-                    );
-                    println!("account: {who}, {} assets, {usdt}", rows.len());
-                }
-                Err(e) => {
-                    eprintln!("account: {who}: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            // The signer goes no further yet: the account reaches the terminal
-            // with the balance and positions step of M2 (`PLAN.md`).
-        }
-    }
-
     let info = match rest.exchange_info() {
         Ok(i) => i,
         Err(e) => {
@@ -242,6 +183,98 @@ fn main() -> ExitCode {
         engine_codec::write_markets_list(&specs).len(),
         cat.prices().len()
     );
+    // The account, when there is a key. No key is a market-data core, as M1
+    // was; a key that is there and does not sign is fatal, because the trader
+    // put it there to trade and would otherwise learn it on the first order.
+    // A path named explicitly is a key the operator means to trade with, so its
+    // absence is fatal; only the default name may be absent.
+    //
+    // After the catalog, because a position counts only on one of its markets
+    // (`account.rs`); before the socket, so the first terminal gets the money.
+    let named_key = std::env::var("ASTER_API_KEY_FILE")
+        .ok()
+        .filter(|p| !p.trim().is_empty());
+    let key_path = named_key.clone().unwrap_or_else(|| API_KEY_FILE.into());
+    let network = match std::env::var("ASTER_NET") {
+        Ok(n) if !n.trim().is_empty() => match Network::parse(&n) {
+            Some(net) => net,
+            None => {
+                eprintln!("account: ASTER_NET is neither mainnet nor testnet: {n}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => Network::Mainnet,
+    };
+    let symbols_of_account = account::Symbols {
+        rows: cat.symbols().iter().map(|s| s.to_string()).collect(),
+        usdt: info
+            .symbols
+            .iter()
+            .filter(|s| {
+                let margin = if s.margin_asset.is_empty() {
+                    &s.quote_asset
+                } else {
+                    &s.margin_asset
+                };
+                margin == QUOTE
+            })
+            .map(|s| s.symbol.clone())
+            .collect(),
+    };
+    let account = match Credentials::load(&key_path) {
+        Err(LoadError::Io(e))
+            if e.kind() == std::io::ErrorKind::NotFound && named_key.is_none() =>
+        {
+            println!(
+                "account: none ({key_path} absent, {}) — market data only",
+                network.name()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("account: {key_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+        Ok(creds) => {
+            warn_if_shared(&key_path);
+            let mut signer = Signer::new(creds, network);
+            let who = format!(
+                "{} signer {} user {}",
+                network.name(),
+                short(signer.credentials().signer()),
+                signer.credentials().user().map_or("none".into(), short)
+            );
+            // The account's own client, on the signer's network: its nonces
+            // carry a clock measured against the gateway that checks them.
+            let mut account_rest = Rest::on(network);
+            if let Err(e) = account_rest.sync_clock() {
+                eprintln!("account: {who}: clock: {e}");
+                return ExitCode::FAILURE;
+            }
+            match account::read(&mut account_rest, &mut signer, &symbols_of_account) {
+                Ok(a) => {
+                    println!(
+                        "account: {who}, clock delta {} ms, USDT free {:.2} equity {:.2}, \
+                         {} positions{}",
+                        account_rest.clock_delta_ms(),
+                        a.free,
+                        a.equity,
+                        a.positions.len(),
+                        a.positions
+                            .iter()
+                            .map(|p| format!(" {} {}@{}", p.symbol, p.size, p.entry))
+                            .collect::<String>()
+                    );
+                    Some((account_rest, signer, a))
+                }
+                Err(e) => {
+                    eprintln!("account: {who}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
     if let Some(usage) = rest.usage().weight_1m {
         log::info!("usage: weight-1m {usage}");
     }
@@ -260,14 +293,24 @@ fn main() -> ExitCode {
     let mut health = StreamHealth::default();
     let load = Arc::new(Load::default());
     let symbols: Vec<String> = cat.symbols().iter().map(|s| s.to_string()).collect();
-    let feed_tx = feed::start(&symbols, ev_tx, &mut health, Arc::clone(&load));
-    let handler = CoreHandler::new(
+    let mut handler = CoreHandler::new(
         1,
         engine::ACCOUNT_PLACEHOLDER.to_string(),
         cat,
         Strategies::new(),
-    )
-    .with_feed(FeedLink {
+    );
+    if let Some((account_rest, signer, first)) = account {
+        account::start(
+            account_rest,
+            signer,
+            symbols_of_account,
+            first.clone(),
+            ev_tx.clone(),
+        );
+        handler = handler.with_account(first);
+    }
+    let feed_tx = feed::start(&symbols, ev_tx, &mut health, Arc::clone(&load));
+    let handler = handler.with_feed(FeedLink {
         tx: feed_tx,
         health,
         load,

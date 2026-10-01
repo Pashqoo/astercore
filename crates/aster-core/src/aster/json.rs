@@ -1,8 +1,10 @@
 //! Wire forms of the Aster REST answers this core reads.
 //!
 //! Aster is a Binance USDⓈ-M Futures clone: every number arrives as a decimal
-//! *string* (`"0.1"`, not `0.1`), so each numeric field goes through
-//! [`str_f64`]. Reading them as `f64` directly fails the whole document on the
+//! *string* (`"0.1"`, not `0.1`), so each numeric field of the market data goes
+//! through [`str_f64`], and each one of the account through the strict
+//! [`dec_f64`] — the tolerance below is the market data's, and the account's
+//! reason to refuse it is on [`dec_f64`]. Reading them as `f64` directly fails the whole document on the
 //! first field, which is the kind of break that looks like "the exchange is
 //! down".
 //!
@@ -382,18 +384,89 @@ pub struct Ticker24h {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
 pub struct Dec(#[serde(deserialize_with = "str_f64")] pub f64);
 
-/// One asset of `GET /fapi/v3/balance` (signed, weight 5).
+/// Deserialize an ACCOUNT number: a decimal string or a bare number, and
+/// nothing else.
+///
+/// The opposite of [`str_f64`] on purpose. The catalog's tolerance trades one
+/// market's field for the other 612 symbols; on the account the trade runs the
+/// other way — a malformed `positionAmt` read as 0.0 is an open position the
+/// terminal shows as flat, and a malformed balance is money that is not there.
+/// Failing the decode fails the one refresh, the last good snapshot stays,
+/// and the error is logged (`account.rs`).
+fn dec_f64<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    struct Strict;
+
+    impl serde::de::Visitor<'_> for Strict {
+        type Value = f64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a finite decimal string or number")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<f64, E> {
+            s.parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| E::custom(format!("not a finite decimal: {s:?}")))
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<f64, E> {
+            if v.is_finite() {
+                Ok(v)
+            } else {
+                Err(E::custom("not a finite number"))
+            }
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+    }
+
+    d.deserialize_any(Strict)
+}
+
+/// One asset of `GET /fapi/v3/balance` (signed, weight 5), the fields this
+/// core reads.
+///
+/// Required and strict ([`dec_f64`]): an absent or malformed amount fails the
+/// row rather than reading as an empty wallet. Only the row the core reads is
+/// decoded this way (`Rest::balance`), so another asset's odd row cannot fail
+/// it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Balance {
-    #[serde(default)]
     pub asset: String,
-    /// Wallet balance.
-    #[serde(default, deserialize_with = "str_f64")]
+    /// Wallet balance: deposits plus realized PnL, isolated wallets included,
+    /// unrealized PnL NOT included.
+    #[serde(deserialize_with = "dec_f64")]
     pub balance: f64,
-    #[serde(default, deserialize_with = "str_f64", rename = "crossUnPnl")]
-    pub cross_un_pnl: f64,
-    #[serde(default, deserialize_with = "str_f64", rename = "availableBalance")]
+    #[serde(deserialize_with = "dec_f64", rename = "availableBalance")]
     pub available: f64,
+}
+
+/// One row of `GET /fapi/v3/positionRisk` (signed, weight 5).
+///
+/// Every symbol comes back, flat ones with `positionAmt` `"0.000"` (the docs'
+/// one-way example). One-way mode answers one `BOTH` row a symbol, hedge mode a
+/// `LONG` and a `SHORT` row, each with its own entry price and with
+/// `positionAmt` already signed (the docs' SHORT row is `"-10.000"`). Read
+/// strictly, like [`Balance`], and like it only for the rows the core counts
+/// (`Rest::position_risk`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PositionRisk {
+    pub symbol: String,
+    /// Signed base quantity: long > 0.
+    #[serde(deserialize_with = "dec_f64", rename = "positionAmt")]
+    pub amount: f64,
+    #[serde(deserialize_with = "dec_f64", rename = "entryPrice")]
+    pub entry_price: f64,
+    /// In the symbol's margin asset, at the mark price.
+    #[serde(deserialize_with = "dec_f64", rename = "unRealizedProfit")]
+    pub unrealized: f64,
 }
 
 /// One aggregated trade, from `<symbol>@aggTrade` or `GET /fapi/v1/aggTrades`.
@@ -684,5 +757,51 @@ mod stream_tests {
             (1661299200000, 21899.0, 1073.265, 2.3e7)
         );
         assert!(kline_row(&row[..3]).is_none(), "a short row is no bar");
+    }
+
+    #[test]
+    fn account_rows_read_the_documented_v3_shapes() {
+        // `/fapi/v3/balance` and the hedge-mode `/fapi/v3/positionRisk`
+        // examples of the v3 docs, trimmed to the fields that matter.
+        let b: Vec<Balance> = serde_json::from_str(
+            r#"[{"accountAlias":"SgsR","asset":"USDT","balance":"122607.35137903",
+                "crossWalletBalance":"23.72469206","crossUnPnl":"0.84683141",
+                "availableBalance":"23.72469206","maxWithdrawAmount":"23.72469206",
+                "marginAvailable":true,"updateTime":1617939110373}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (b[0].asset.as_str(), b[0].balance, b[0].available),
+            ("USDT", 122607.35137903, 23.72469206)
+        );
+        let p: Vec<PositionRisk> = serde_json::from_str(
+            r#"[{"entryPrice":"6563.66500","marginType":"isolated","positionAmt":"20.000",
+                 "symbol":"BTCUSDT","unRealizedProfit":"2316.83423560","positionSide":"LONG"},
+                {"entryPrice":"0.00000","positionAmt":"-10.000","symbol":"BTCUSDT",
+                 "unRealizedProfit":"-1156.46711780","positionSide":"SHORT"}]"#,
+        )
+        .unwrap();
+        assert_eq!((p[0].amount, p[0].entry_price), (20.0, 6563.665));
+        assert_eq!((p[1].amount, p[1].unrealized), (-10.0, -1156.4671178));
+    }
+
+    #[test]
+    fn a_malformed_account_number_fails_the_answer_instead_of_reading_zero() {
+        for bad in [
+            r#"[{"symbol":"BTCUSDT","positionAmt":"abc","entryPrice":"1","unRealizedProfit":"0"}]"#,
+            r#"[{"symbol":"BTCUSDT","positionAmt":"NaN","entryPrice":"1","unRealizedProfit":"0"}]"#,
+            r#"[{"symbol":"BTCUSDT","positionAmt":null,"entryPrice":"1","unRealizedProfit":"0"}]"#,
+            r#"[{"symbol":"BTCUSDT","entryPrice":"1","unRealizedProfit":"0"}]"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Vec<PositionRisk>>(bad).is_err(),
+                "{bad} would show an open position as flat"
+            );
+        }
+        let bare: Vec<PositionRisk> = serde_json::from_str(
+            r#"[{"symbol":"X","positionAmt":-2,"entryPrice":1.5,"unRealizedProfit":0}]"#,
+        )
+        .unwrap();
+        assert_eq!((bare[0].amount, bare[0].entry_price), (-2.0, 1.5));
     }
 }

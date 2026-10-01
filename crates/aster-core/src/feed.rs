@@ -169,6 +169,10 @@ pub enum FeedEvent {
     /// A feed thread the core cannot do without has died (by panicking): the
     /// engine latches it and `main` leaves (`CoreHandler::feed_lost`).
     Lost(&'static str),
+    /// A read of the account that differs from the last one sent, or `None`
+    /// once reads have failed for `account::STALE_AFTER` (`account.rs`). Not
+    /// market data, but it reaches the sessions by the same road.
+    Account(Option<crate::account::Account>),
     /// One market's `klines 5m`, oldest first, the last one still in progress.
     Warmup { symbol: String, bars: Vec<Kline> },
     /// Every market of the warm-up was asked, whatever it answered: the
