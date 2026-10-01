@@ -1,5 +1,6 @@
-//! Aster's market streams over WebSocket: one combined-stream session at a
-//! time, read on the calling thread.
+//! Aster's streams over WebSocket: one session at a time, read on the calling
+//! thread — the market's combined streams ([`run`]) and the account's
+//! user-data stream ([`run_at`]).
 //!
 //! The shape is TInvestCore's `tinvest/stream.rs` without the grpc-web: a
 //! session is opened for a FIXED set of streams named in the URL
@@ -215,11 +216,38 @@ pub fn run(
         !streams.is_empty() && streams.len() <= MAX_STREAMS,
         "a session carries 1..={MAX_STREAMS} streams"
     );
-    let addr = (HOST, 443)
+    run_at(HOST, url(streams), idle, stop, beat, |text| {
+        match serde_json::from_str::<Envelope>(text) {
+            Ok(env) => on_frame(env.data),
+            // One frame lost, not the session: the next one is a whole
+            // snapshot for every stream this core reads except the tape, and a
+            // frame that does not decode is a format change the journal must
+            // name.
+            Err(e) => log::warn!(
+                "ws: undecodable frame ({e}): {}",
+                text.chars().take(160).collect::<String>()
+            ),
+        }
+    })
+}
+
+/// [`run`] for any `url` on `host`, every text frame handed on as it came:
+/// the account's user-data stream (`/ws/<listenKey>`), whose frames are bare
+/// events rather than combined-stream envelopes, on the signer's network, and
+/// whose reader must hear of a frame even when it does not decode.
+pub fn run_at(
+    host: &str,
+    url: String,
+    idle: Duration,
+    stop: &AtomicBool,
+    beat: &Beat,
+    mut on_text: impl FnMut(&str),
+) -> Result<(), Error> {
+    let addr = (host, 443)
         .to_socket_addrs()
-        .map_err(|e| Error::Connect(format!("resolve {HOST}: {e}")))?
+        .map_err(|e| Error::Connect(format!("resolve {host}: {e}")))?
         .next()
-        .ok_or_else(|| Error::Connect(format!("resolve {HOST}: no address")))?;
+        .ok_or_else(|| Error::Connect(format!("resolve {host}: no address")))?;
     let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .map_err(|e| Error::Connect(e.to_string()))?;
     // A second handle on the same socket, so the read timeout can be moved
@@ -232,7 +260,7 @@ pub fn run(
     };
     set_timeout(CONNECT_TIMEOUT)?;
     let (mut socket, _) =
-        tungstenite::client_tls(url(streams), tcp).map_err(|e| Error::Connect(e.to_string()))?;
+        tungstenite::client_tls(url, tcp).map_err(|e| Error::Connect(e.to_string()))?;
     set_timeout(READ_POLL)?;
     beat.opened();
     let deadline = Instant::now() + beat.session(Stamp::now().wall);
@@ -259,17 +287,7 @@ pub fn run(
         match read {
             Ok(Message::Text(text)) => {
                 beat.touch();
-                match serde_json::from_str::<Envelope>(text.as_str()) {
-                    Ok(env) => on_frame(env.data),
-                    // One frame lost, not the session: the next one is a whole
-                    // snapshot for every stream this core reads except the
-                    // tape, and a frame that does not decode is a format change
-                    // the journal must name.
-                    Err(e) => log::warn!(
-                        "ws: undecodable frame ({e}): {}",
-                        text.as_str().chars().take(160).collect::<String>()
-                    ),
-                }
+                on_text(text.as_str());
             }
             Ok(Message::Close(frame)) => {
                 return Err(Error::Closed(frame.map_or_else(

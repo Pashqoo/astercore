@@ -99,6 +99,13 @@ pub struct ServerTime {
     pub server_time_ms: i64,
 }
 
+/// `POST /fapi/v3/listenKey`: `{"listenKey": "…"}`.
+#[derive(Debug, Deserialize)]
+pub struct ListenKey {
+    #[serde(rename = "listenKey")]
+    pub listen_key: String,
+}
+
 /// Non-2xx body: `{"code":-1121,"msg":"Invalid symbol."}`.
 ///
 /// `code` is a negative integer, unlike T-Invest's string codes — the policy
@@ -636,6 +643,86 @@ pub enum StreamData {
     One(StreamEvent),
 }
 
+/// One event of the account's user-data stream (`/ws/<listenKey>`), which
+/// sends bare events, not combined-stream envelopes.
+///
+/// The core does not build its account from these: `ACCOUNT_UPDATE` carries no
+/// available balance, and an order placed or cancelled moves the free margin
+/// without one (docs). Each event is a reason to re-read the account now
+/// (`account.rs`); what it says is read only for the journal. Every field
+/// therefore defaults, an event type the core does not name is `Other`, and
+/// a frame that does not decode at all is read as `Other` too
+/// (`account::user_event`): a changed shape costs a line of the journal,
+/// never the wake-up.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "e")]
+pub enum UserEvent {
+    #[serde(rename = "ACCOUNT_UPDATE")]
+    Account(AccountUpdate),
+    #[serde(rename = "ORDER_TRADE_UPDATE")]
+    Order(Box<OrderUpdate>),
+    #[serde(rename = "MARGIN_CALL")]
+    MarginCall,
+    /// The key behind the open stream expired; no more events on it until a
+    /// new key is used (docs).
+    #[serde(rename = "listenKeyExpired")]
+    Expired,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct AccountUpdate {
+    #[serde(default, rename = "a")]
+    pub update: AccountUpdateData,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct AccountUpdateData {
+    /// `ORDER`, `FUNDING_FEE`, `DEPOSIT`, …
+    #[serde(default, rename = "m")]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct OrderUpdate {
+    #[serde(default, rename = "o")]
+    pub order: OrderEvent,
+}
+
+/// The order inside an `ORDER_TRADE_UPDATE`, as the exchange wrote it:
+/// quantities and prices stay the decimal strings they arrived as, because
+/// nothing here computes with them.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct OrderEvent {
+    #[serde(default, rename = "s")]
+    pub symbol: String,
+    #[serde(default, rename = "c")]
+    pub client_id: String,
+    #[serde(default, rename = "i")]
+    pub id: i64,
+    #[serde(default, rename = "S")]
+    pub side: String,
+    #[serde(default, rename = "o")]
+    pub kind: String,
+    /// Execution type: `NEW`, `TRADE`, `CANCELED`, `EXPIRED`, `CALCULATED`.
+    #[serde(default, rename = "x")]
+    pub execution: String,
+    /// Order status: `NEW`, `PARTIALLY_FILLED`, `FILLED`, …
+    #[serde(default, rename = "X")]
+    pub status: String,
+    #[serde(default, rename = "q")]
+    pub qty: String,
+    #[serde(default, rename = "p")]
+    pub price: String,
+    /// Filled so far.
+    #[serde(default, rename = "z")]
+    pub filled: String,
+    /// Price of the last fill.
+    #[serde(default, rename = "L")]
+    pub last_price: String,
+}
+
 /// One row of `GET /fapi/v1/klines`: a 12-cell array of mixed numbers and
 /// decimal strings. Read cell by cell, because a tuple struct of fixed length
 /// fails the whole answer the day the exchange appends a thirteenth cell.
@@ -667,6 +754,42 @@ pub fn kline_row(cells: &[serde_json::Value]) -> Option<Kline> {
 #[cfg(test)]
 mod stream_tests {
     use super::*;
+
+    /// The docs' payloads (`aster-finance-futures-api-v3.md`, "User Data
+    /// Streams"), cut short.
+    #[test]
+    fn user_events_decode_and_an_unknown_one_is_other() {
+        let acc = r#"{"e":"ACCOUNT_UPDATE","E":1564745798939,"T":1564745798938,"a":{"m":"ORDER","B":[{"a":"USDT","wb":"122624.12345678","cw":"100.12345678","bc":"50.12345678"}],"P":[{"s":"BTCUSDT","pa":"0","ep":"0.00000","cr":"200","up":"0","mt":"isolated","iw":"0.00000000","ps":"BOTH"}]}}"#;
+        match serde_json::from_str::<UserEvent>(acc).unwrap() {
+            UserEvent::Account(a) => assert_eq!(a.update.reason, "ORDER"),
+            e => panic!("{e:?}"),
+        }
+        let ord = r#"{"e":"ORDER_TRADE_UPDATE","E":1568879465651,"T":1568879465650,"o":{"s":"BTCUSDT","c":"TEST","S":"SELL","o":"TRAILING_STOP_MARKET","f":"GTC","q":"0.001","p":"0","ap":"0","sp":"7103.04","x":"NEW","X":"NEW","i":8886774,"l":"0","z":"0","L":"0","T":1568879465651,"t":0,"m":false,"R":false,"ps":"LONG","rp":"0"}}"#;
+        match serde_json::from_str::<UserEvent>(ord).unwrap() {
+            UserEvent::Order(o) => {
+                let o = o.order;
+                assert_eq!(
+                    (o.symbol.as_str(), o.id, o.side.as_str(), o.status.as_str()),
+                    ("BTCUSDT", 8886774, "SELL", "NEW")
+                );
+                assert_eq!(
+                    (o.qty.as_str(), o.kind.as_str()),
+                    ("0.001", "TRAILING_STOP_MARKET")
+                );
+            }
+            e => panic!("{e:?}"),
+        }
+        let exp = r#"{"e":"listenKeyExpired","E":1576653824250}"#;
+        assert!(matches!(
+            serde_json::from_str::<UserEvent>(exp).unwrap(),
+            UserEvent::Expired
+        ));
+        let cfg = r#"{"e":"ACCOUNT_CONFIG_UPDATE","E":1611646737479,"T":1611646737476,"ac":{"s":"BTCUSDT","l":25}}"#;
+        assert!(matches!(
+            serde_json::from_str::<UserEvent>(cfg).unwrap(),
+            UserEvent::Other
+        ));
+    }
 
     /// The frames below are the ones the exchange sent on 01.10, cut short.
     #[test]

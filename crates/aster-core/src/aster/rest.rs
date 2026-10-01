@@ -18,7 +18,7 @@ use ureq::{Agent, Body};
 
 use super::json::{
     kline_row, AggTrade, ApiError, Balance, BookTicker, DepthSnapshot, ExchangeInfo, Kline,
-    PositionRisk, PremiumIndex, ServerTime, Ticker24h,
+    ListenKey, PositionRisk, PremiumIndex, ServerTime, Ticker24h,
 };
 use super::sign::{Network, Signer};
 
@@ -298,6 +298,21 @@ impl Rest {
             .collect()
     }
 
+    /// `POST /fapi/v3/listenKey`, signed, weight 1: the account's user-data
+    /// stream key. An account with an active key gets that same key back with
+    /// its 60 minutes renewed (docs; measured 01.10: two calls, one key), so
+    /// this one call is both the start and the keepalive — and, unlike `PUT`,
+    /// it says WHICH key is active. That matters, because the stream itself
+    /// never does: measured 01.10, `/ws/<made-up key>` is accepted with 101
+    /// and answers pings, exactly like a live quiet stream.
+    pub fn listen_key(&mut self, signer: &mut Signer) -> Result<String, Error> {
+        let key: ListenKey = self.signed_post(signer, "/fapi/v3/listenKey", &[])?;
+        if key.listen_key.is_empty() {
+            return Err(Error::Decode("/fapi/v3/listenKey: empty key".into()));
+        }
+        Ok(key.listen_key)
+    }
+
     fn get<T: DeserializeOwned>(&mut self, path: &str, query: &[(&str, &str)]) -> Result<T, Error> {
         let mut url = format!("{}{path}", self.network.rest_base());
         for (i, (k, v)) in query.iter().enumerate() {
@@ -311,16 +326,50 @@ impl Rest {
 
     /// A v3-signed `GET`: the signed query string goes after `?` as it was
     /// signed, because the gateway checks the signature against those bytes.
-    ///
-    /// Refused unsent when the signer is on another network than this client:
-    /// the nonce would carry a clock measured against the wrong gateway, and
-    /// the chain id inside the signature would be refused there anyway.
     fn signed_get<T: DeserializeOwned>(
         &mut self,
         signer: &mut Signer,
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<T, Error> {
+        let signed = self.sign(signer, path, query)?;
+        let url = format!("{}{path}?{signed}", self.network.rest_base());
+        self.fetch(&url, path)
+    }
+
+    /// A v3-signed `POST`: the signed string is the form-encoded body, sent
+    /// as it was signed — the docs' own example passes every parameter of a
+    /// `POST` "through the request body".
+    fn signed_post<T: DeserializeOwned>(
+        &mut self,
+        signer: &mut Signer,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<T, Error> {
+        let body = self.sign(signer, path, query)?;
+        let url = format!("{}{path}", self.network.rest_base());
+        const FORM: &str = "application/x-www-form-urlencoded";
+        self.exchange(path, |agent| {
+            agent
+                .post(&url)
+                .header("Accept", "application/json")
+                .header("Content-Type", FORM)
+                .send(&body)
+        })
+    }
+
+    /// The signed parameter string of one call, its nonce taken from this
+    /// client's clock.
+    ///
+    /// Refused unsent when the signer is on another network than this client:
+    /// the nonce would carry a clock measured against the wrong gateway, and
+    /// the chain id inside the signature would be refused there anyway.
+    fn sign(
+        &self,
+        signer: &mut Signer,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<String, Error> {
         if signer.network() != self.network {
             return Err(Error::Transport(format!(
                 "{path}: the signer is on {}, this client on {}",
@@ -329,21 +378,23 @@ impl Rest {
             )));
         }
         let now_us = (now_us() + self.clock_delta_ms * 1000).max(0) as u64;
-        let url = format!(
-            "{}{path}?{}",
-            self.network.rest_base(),
-            signer.sign_query(query, now_us)
-        );
-        self.fetch(&url, path)
+        Ok(signer.sign_query(query, now_us))
     }
 
     fn fetch<T: DeserializeOwned>(&mut self, url: &str, path: &str) -> Result<T, Error> {
+        self.exchange(path, |agent| {
+            agent.get(url).header("Accept", "application/json").call()
+        })
+    }
+
+    /// One call made by `send`, its answer metered, checked and decoded.
+    fn exchange<T: DeserializeOwned>(
+        &mut self,
+        path: &str,
+        send: impl FnOnce(&Agent) -> Result<Response<Body>, ureq::Error>,
+    ) -> Result<T, Error> {
         let sent = Instant::now();
-        let sending = self
-            .agent
-            .get(url)
-            .header("Accept", "application/json")
-            .call();
+        let sending = send(&self.agent);
         // The elapsed time of the one exchange, whatever came of it: a refusal
         // answers as much as a body does, and a call that never answered
         // carries the time it waited — which is what makes a dead gateway look

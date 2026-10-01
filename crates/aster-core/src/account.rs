@@ -8,19 +8,28 @@
 //! gateway's ±60 s otherwise, on a Mac that sleeps.
 //!
 //! The period is TInvestCore's `POSITIONS_PERIOD` (`trading.rs`), ported as
-//! is: it is what MoonTerminal was shown by that core. A user-data stream
-//! (`ACCOUNT_UPDATE`) replaces the polling for timeliness — the next step of
-//! M2, `PLAN.md`.
+//! is: it is what MoonTerminal was shown by that core. Between two periods the
+//! account's user-data stream wakes the reader: any event on it — a fill, an
+//! order placed or cancelled, a funding fee — is a reason to read now
+//! ([`user_stream`]). The events themselves are not applied: `ACCOUNT_UPDATE`
+//! carries no available balance, and an order that only rests moves the free
+//! margin without one. The REST pair stays the one source of the snapshot,
+//! the stream only makes it timely, and the period stays because the
+//! unrealized PnL inside the equity moves with every mark price, which no
+//! account event reports.
 
 use std::collections::{BTreeMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::aster::json::{Balance, PositionRisk};
+use crate::aster::json::{Balance, PositionRisk, UserEvent};
 use crate::aster::rest::{self, Rest};
-use crate::aster::sign::Signer;
+use crate::aster::sign::{Network, Signer};
+use crate::aster::ws;
 use crate::feed::FeedEvent;
 use crate::model::QUOTE;
 
@@ -34,6 +43,24 @@ pub const CLOCK_EVERY: Duration = Duration::from_secs(600);
 /// dropped call or a gateway hiccup does not blank the terminal's money; a
 /// revoked key or a changed answer does in about a minute.
 pub const STALE_AFTER: Duration = Duration::from_secs(60);
+/// How often the stream key is renewed: half of its 60 minutes (docs), so one
+/// failed renewal still leaves the key half an hour to be renewed in.
+pub const KEY_EVERY: Duration = Duration::from_secs(30 * 60);
+/// How soon a failed key call is retried. The polling carries the account
+/// meanwhile, so this is about the stream's timeliness, not the money.
+pub const KEY_RETRY: Duration = Duration::from_secs(60);
+/// A read woken by the stream waits this long after the event, so that the
+/// burst one fill makes (an order update, then the account's) is read once.
+pub const SETTLE: Duration = Duration::from_millis(250);
+/// Woken reads are at least this far apart: 30 reads a minute at weight 10
+/// is 300 of the 2400 the IP may spend, however busy the account gets.
+pub const MIN_GAP: Duration = Duration::from_secs(2);
+/// How long after a session's end the account is read: the key call and the
+/// handshake of the next session, measured 01.10 at 0.3 s and 0.83 s, with
+/// room to spare.
+pub const REOPEN: Duration = Duration::from_secs(3);
+/// The longest the stream thread waits before reopening a failed session.
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// One read of the account, in USDT: what `TBalanceFull` carries.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -157,9 +184,10 @@ pub fn read(rest: &mut Rest, signer: &mut Signer, symbols: &Symbols) -> Result<A
     Account::from_rows(usdt.as_ref(), &positions, symbols).map_err(ReadError::Shape)
 }
 
-/// Re-read the account every [`REFRESH`] on a thread named `aster-account`,
-/// sending each read that differs from the last one sent. `first` is the read
-/// `main` made at startup, already in the engine.
+/// Re-read the account every [`REFRESH`], and soon after any event of the
+/// account's user-data stream, on a thread named `aster-account`, sending each
+/// read that differs from the last one sent. `first` is the read `main` made
+/// at startup, already in the engine.
 ///
 /// A failed read is logged, and the next tick re-measures the clock first — a
 /// nonce outside the gateway's window is the failure a sleeping Mac makes. A
@@ -169,6 +197,10 @@ pub fn read(rest: &mut Rest, signer: &mut Signer, symbols: &Symbols) -> Result<A
 /// silently stopped moving. The first good read brings it back. A panic is
 /// sent as [`FeedEvent::Lost`], and the core leaves on it like on any dead
 /// feed.
+///
+/// Every signed call stays on this thread, the stream key's included: one
+/// signer, one nonce sequence. The stream itself is read on its own thread
+/// ([`user_stream`]), which this one hands the key to.
 pub fn start(
     mut rest: Rest,
     mut signer: Signer,
@@ -181,11 +213,53 @@ pub fn start(
         .spawn(move || {
             let lost = tx.clone();
             let run = panic::catch_unwind(AssertUnwindSafe(move || {
+                let (wake_tx, wake_rx) = mpsc::channel();
+                let slot = Arc::new(Slot::default());
+                user_stream(signer.network(), Arc::clone(&slot), wake_tx);
+                let mut stream = Stream {
+                    wake: Some(wake_rx),
+                    slot,
+                    key: None,
+                    key_due: Instant::now(),
+                };
                 let mut last = Some(first);
                 let mut failing_since: Option<Instant> = None;
                 let mut clock_due = Instant::now() + CLOCK_EVERY;
+                let mut last_read = Instant::now();
+                let mut read_due = last_read + REFRESH;
                 loop {
-                    thread::sleep(REFRESH);
+                    let due = read_due.min(stream.key_due);
+                    if let Some(woken) = stream.wait(due) {
+                        let after = match woken {
+                            // The first event of a burst sets the read; the
+                            // rest of the burst lands inside its settle time.
+                            Wake::Event => SETTLE,
+                            // Read once the next session is likely open, so
+                            // that the read covers what the gap missed. After
+                            // a failed session the reopen waits its backoff
+                            // too; what lands after this read then waits for
+                            // the period.
+                            Wake::Ended => {
+                                stream.key_due = Instant::now();
+                                REOPEN
+                            }
+                        };
+                        // While the reads fail, the stream does not make them
+                        // more frequent: the period's pace is the backoff.
+                        if failing_since.is_none() {
+                            let soon = (Instant::now() + after).max(last_read + MIN_GAP);
+                            read_due = read_due.min(soon);
+                        }
+                        continue;
+                    }
+                    if Instant::now() >= stream.key_due && !stream.renew(&mut rest, &mut signer) {
+                        // A nonce outside the window is the likeliest reason,
+                        // as for a read.
+                        clock_due = Instant::now();
+                    }
+                    if Instant::now() < read_due {
+                        continue;
+                    }
                     if Instant::now() >= clock_due {
                         // A failed measurement keeps the old delta and is
                         // retried on the next tick, not in ten minutes.
@@ -197,6 +271,8 @@ pub fn start(
                             Err(e) => log::warn!("account: clock: {e}"),
                         }
                     }
+                    last_read = Instant::now();
+                    read_due = last_read + REFRESH;
                     let send = match read(&mut rest, &mut signer, &symbols) {
                         Ok(now) => {
                             if let Some(since) = failing_since.take() {
@@ -234,6 +310,215 @@ pub fn start(
             }
         })
         .expect("spawn");
+}
+
+/// What the stream thread tells the account thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    /// An event arrived: read the account soon.
+    Event,
+    /// The session ended — rotated, failed, expired or told to stop. The
+    /// thread has emptied the slot and opens the next session on the key the
+    /// next `POST` puts there; the account is read once that session is
+    /// likely open, since events may have been missed while it was down.
+    Ended,
+}
+
+/// The key the stream thread opens its next session on, and the stop of the
+/// session it has open. One slot, not a queue: only the newest key matters.
+/// Both halves change under the one lock, so a key placed with a stop either
+/// ends the session that was open when it was placed, or is the key the next
+/// session takes with the stop cleared — never a stop that lands on the
+/// session of the very key it came with.
+#[derive(Default)]
+struct Slot {
+    key: Mutex<Option<String>>,
+    placed: Condvar,
+    stop: AtomicBool,
+}
+
+impl Slot {
+    fn lock(&self) -> MutexGuard<'_, Option<String>> {
+        self.key.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The account thread's side of the user-data stream: the key it last got
+/// from the exchange and when to ask again.
+struct Stream {
+    /// `None` once the stream thread is gone; the account is then polled.
+    wake: Option<Receiver<Wake>>,
+    slot: Arc<Slot>,
+    key: Option<String>,
+    key_due: Instant,
+}
+
+impl Stream {
+    /// Wait for a wake-up until `due`: `Some` if one came first.
+    fn wait(&mut self, due: Instant) -> Option<Wake> {
+        let left = due.saturating_duration_since(Instant::now());
+        let Some(rx) = &self.wake else {
+            thread::sleep(left);
+            return None;
+        };
+        match rx.recv_timeout(left) {
+            Ok(w) => Some(w),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                log::error!("user: the stream thread is gone — the account is polled only");
+                self.wake = None;
+                None
+            }
+        }
+    }
+
+    /// Ask for the account's active key and place it in the slot. A changed
+    /// key under an open session ends that session too: its own key is dead,
+    /// and the stream would never say so (`Rest::listen_key`). `false` when
+    /// the call failed; it is retried in [`KEY_RETRY`]. Nothing is asked once
+    /// the stream thread is gone: nobody would read the key.
+    fn renew(&mut self, rest: &mut Rest, signer: &mut Signer) -> bool {
+        if self.wake.is_none() {
+            self.key_due = Instant::now() + KEY_EVERY;
+            return true;
+        }
+        match rest.listen_key(signer) {
+            Ok(key) => {
+                let changed = self.key.as_ref().is_some_and(|k| *k != key);
+                if changed {
+                    log::info!("user: the stream key changed");
+                }
+                {
+                    let mut slot = self.slot.lock();
+                    *slot = Some(key.clone());
+                    if changed {
+                        self.slot.stop.store(true, Ordering::Relaxed);
+                    }
+                }
+                self.slot.placed.notify_one();
+                self.key = Some(key);
+                self.key_due = Instant::now() + KEY_EVERY;
+                true
+            }
+            Err(e) => {
+                log::warn!("user: stream key: {e}");
+                self.key_due = Instant::now() + KEY_RETRY;
+                false
+            }
+        }
+    }
+}
+
+/// Read the account's user-data stream on a thread named `aster-user`, one
+/// session per key placed in `slot`, and tell the account thread of every
+/// event and of every session's end.
+///
+/// The thread holds no credentials: the key is all the stream needs, and it
+/// only reads. At every session's end it empties the slot before it says so,
+/// so the next session opens on a key the exchange named no earlier than the
+/// renewal in flight when this one ended — never on one placed during the
+/// session, which may have expired since. A failed
+/// session is reopened after a backoff that doubles to [`BACKOFF_MAX`] and
+/// starts over after a session that lived longer than that; one that ended on
+/// its own — rotated, stopped, its key expired — at once.
+fn user_stream(network: Network, slot: Arc<Slot>, wake: Sender<Wake>) {
+    thread::Builder::new()
+        .name("aster-user".into())
+        .spawn(move || {
+            let beat = ws::Beat::new();
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                let key = {
+                    let mut placed = slot.lock();
+                    loop {
+                        if let Some(key) = placed.take() {
+                            slot.stop.store(false, Ordering::Relaxed);
+                            break key;
+                        }
+                        placed = slot.placed.wait(placed).unwrap_or_else(|e| e.into_inner());
+                    }
+                };
+                log::info!(
+                    "user: stream open on {} (session {})",
+                    network.name(),
+                    beat.sessions() + 1
+                );
+                let opened = Instant::now();
+                let url = format!("wss://{}/ws/{key}", network.ws_host());
+                let res = ws::guarded(|| {
+                    ws::run_at(
+                        network.ws_host(),
+                        url,
+                        ws::IDLE_LIMIT,
+                        &slot.stop,
+                        &beat,
+                        |text| {
+                            let event = user_event(text);
+                            log_event(&event);
+                            if event == UserEvent::Expired {
+                                slot.stop.store(true, Ordering::Relaxed);
+                            }
+                            let _ = wake.send(Wake::Event);
+                        },
+                    )
+                });
+                slot.lock().take();
+                if wake.send(Wake::Ended).is_err() {
+                    return;
+                }
+                if opened.elapsed() > BACKOFF_MAX {
+                    backoff = Duration::from_secs(1);
+                }
+                match res {
+                    Ok(()) => backoff = Duration::from_secs(1),
+                    Err(e) => {
+                        log::warn!("user: {e}; reopening in {} s", backoff.as_secs());
+                        thread::sleep(backoff);
+                        backoff = (backoff * 2).min(BACKOFF_MAX);
+                    }
+                }
+            }
+        })
+        .expect("spawn");
+}
+
+/// One frame of the user-data stream as an event. A frame that does not read
+/// as the docs describe — fields of another shape, or not JSON at all — is
+/// `Other`: it is still an event, and still wakes the reader.
+fn user_event(text: &str) -> UserEvent {
+    serde_json::from_str(text).unwrap_or_else(|e| {
+        log::warn!(
+            "user: unreadable event ({e}): {}",
+            text.chars().take(160).collect::<String>()
+        );
+        UserEvent::Other
+    })
+}
+
+fn log_event(event: &UserEvent) {
+    match event {
+        UserEvent::Account(a) => log::info!("account: update ({})", a.update.reason),
+        UserEvent::Order(o) => {
+            let o = &o.order;
+            log::info!(
+                "order: {} {} {} {} {}/{} {}@{} filled {} last {} client {}",
+                o.symbol,
+                o.id,
+                o.side,
+                o.kind,
+                o.execution,
+                o.status,
+                o.qty,
+                o.price,
+                o.filled,
+                o.last_price,
+                o.client_id
+            );
+        }
+        UserEvent::MarginCall => log::warn!("account: MARGIN CALL"),
+        UserEvent::Expired => log::info!("user: the stream key expired"),
+        UserEvent::Other => log::debug!("user: event"),
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +628,16 @@ mod tests {
     fn no_usdt_row_is_an_error_not_an_empty_wallet() {
         let e = Account::from_rows(None, &[], &Symbols::default()).unwrap_err();
         assert!(e.contains("no USDT row"), "{e}");
+    }
+
+    #[test]
+    fn an_unreadable_event_still_wakes_and_known_ones_decode() {
+        let odd = r#"{"e":"ACCOUNT_UPDATE","a":{"m":7}}"#;
+        assert_eq!(user_event(odd), UserEvent::Other);
+        let exp = r#"{"e":"listenKeyExpired","E":1}"#;
+        assert_eq!(user_event(exp), UserEvent::Expired);
+        assert_eq!(user_event(r#"{"result":null,"id":1}"#), UserEvent::Other);
+        assert_eq!(user_event("not json"), UserEvent::Other);
     }
 
     #[test]

@@ -53,6 +53,17 @@ impl Network {
         }
     }
 
+    /// The host of this network's user-data stream: the one each network's
+    /// docs name in their "User Data Streams" section. The testnet docs name
+    /// `fstream5.` for the market streams and `fstream.` here; measured 01.10,
+    /// the two resolve to the same two addresses.
+    pub fn ws_host(self) -> &'static str {
+        match self {
+            Self::Mainnet => super::ws::HOST,
+            Self::Testnet => "fstream.asterdex-testnet.com",
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Mainnet => "mainnet",
