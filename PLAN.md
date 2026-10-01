@@ -193,6 +193,10 @@ spread: 1.50%» при выставлении; один вход отказан 
 пока у ядра открыта позиция (как у MoonBot). Коды: `-4225 Nonce Expired` (так v3 называет nonce вне
 окна; `-1021` в v3 нет) → пересверка часов и один повтор; `-2022` (reduceOnly отклонён) — `error` в
 журнале. Сигналы (SIGTERM/SIGINT) — по-прежнему M4: без `libc` их не поймать, процесс уходит сразу.
+**Живьём 01.10, 21:54:** вход BTCUSDT 0.023 @ 83702.4 стоял, позиции нет → команда остановки
+(`TShutdownCommand`, вендорный `shutdown_core`) → «shutdown: the core is leaving» → «stop:
+withdrawing 1 entry order(s)» → через 0.34 с «every entry order withdrawn», биржа: `CANCELED`,
+процесс вышел, `orders.json` пуст.
 
 **M2, шаг 7 — MoveAll и закрытый рынок, код 01.10.** «Переместить все» терминала (Order 11) —
 перенос TInvestCore: `kind` 2 — на процент, `kind` 0 — на цену для All/LastSet/TopVol/LowVol (без
