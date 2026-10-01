@@ -939,3 +939,52 @@ fn the_account_reaches_the_client_and_a_closed_position_goes_flat() {
     assert_eq!(money, (0.0, 0.0, 0.0));
     let _ = client.disconnect();
 }
+
+// ----- M2: orders ---------------------------------------------------------------
+
+/// A Start from the terminal on a core without an account is refused before
+/// anything reaches an exchange — and the terminal hears it: the order comes
+/// back as BuyFail, and the reason as a line of its core log, not silence.
+#[test]
+fn a_start_without_an_account_comes_back_as_buy_fail_with_its_reason() {
+    // The core's own loop, `step` then `pump`: order images and log lines
+    // leave from `pump`, as in `main`.
+    let core = FedCore::start();
+    let client = core.connect();
+
+    client
+        .trade()
+        .new_order(moonproto::NewOrderParams::new(
+            "BTCUSDT",
+            moonproto::OrderSide::Long,
+            80_000.0,
+            50.0,
+        ))
+        .expect("the order request itself is sent");
+    let (mut failed, mut reason) = (false, None);
+    let answered = wait_until(Duration::from_secs(5), || {
+        for event in client.drain_events() {
+            match event {
+                Event::Order(
+                    moonproto::state::OrderEvent::Created(o)
+                    | moonproto::state::OrderEvent::Updated(o),
+                ) if o.market_name == "BTCUSDT"
+                    && o.status == moonproto::OrderWorkerStatus::BuyFail =>
+                {
+                    failed = true;
+                }
+                Event::ServerLog(log) if log.msg.contains("trading is off") => {
+                    reason = Some(log.msg.clone());
+                }
+                _ => {}
+            }
+        }
+        failed && reason.is_some()
+    });
+    assert!(
+        answered,
+        "BuyFail image: {failed}, log line: {reason:?} — a refused Start must reach the terminal"
+    );
+
+    let _ = client.disconnect();
+}

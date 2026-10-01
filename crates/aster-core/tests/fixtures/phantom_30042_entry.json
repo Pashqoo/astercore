@@ -1,0 +1,102 @@
+[
+ {
+  "bot_stop": [
+   0.0,
+   0.0
+  ],
+  "buy": {
+   "cancel_requested": true,
+   "deferred": null,
+   "exchange_id": "01a0c225-a796-71a3-a088-cea868b88b71",
+   "executions": [
+    {
+     "awaiting_reply": false,
+     "filled": 0,
+     "ids": [
+      "01a0c225-a7e8-7a25-a0b2-7e1297191bef",
+      "01a0c225-a796-71a3-a088-cea868b88b71"
+     ],
+     "key": "bb27187f-b172-44d6-b11b-04ae0cf120c6",
+     "lots": 1,
+     "mean": 0.0,
+     "price": 2950.0,
+     "reason": 0,
+     "retired": false,
+     "status": "New"
+    }
+   ],
+   "filled_lots": 0,
+   "key": "bb27187f-b172-44d6-b11b-04ae0cf120c6",
+   "lots": 1,
+   "owned": true,
+   "replacing": false,
+   "resolve_key": "bb27187f-b172-44d6-b11b-04ae0cf120c6",
+   "state": {
+    "canceled": false,
+    "close_ms": 0,
+    "closed": false,
+    "create_ms": 1789963642511,
+    "exchange_id": 8013675712856235927,
+    "filled": 0.0,
+    "is_market": false,
+    "mean_price": 0.0,
+    "notional": 2950.0,
+    "open_ms": 1789963642851,
+    "opened": true,
+    "price": 2950.0,
+    "quantity": 1.0,
+    "spent": 0.0
+   },
+   "uncertain": true
+  },
+  "done_ms": 0,
+  "entry_moved_at": 0,
+  "id": 1789936344230,
+  "is_short": true,
+  "lot": 1.0,
+  "market": "NNSB",
+  "next_reason": 0,
+  "panic": false,
+  "planned_ratio": 0.9898305084745764,
+  "planned_sell": 2920.0,
+  "point_value": 1.0,
+  "rev": 3,
+  "sell": {
+   "cancel_requested": false,
+   "deferred": null,
+   "exchange_id": "",
+   "executions": [],
+   "filled_lots": 0,
+   "key": "",
+   "lots": 0,
+   "owned": false,
+   "replacing": false,
+   "resolve_key": "",
+   "state": {
+    "canceled": false,
+    "close_ms": 0,
+    "closed": false,
+    "create_ms": 0,
+    "exchange_id": 0,
+    "filled": 0.0,
+    "is_market": false,
+    "mean_price": 0.0,
+    "notional": 0.0,
+    "open_ms": 0,
+    "opened": false,
+    "price": 0.0,
+    "quantity": 0.0,
+    "spent": 0.0
+   },
+   "uncertain": false
+  },
+  "status": 2,
+  "stop_pct": 0.0,
+  "stop_price": 0.0,
+  "stop_spread": 0.0,
+  "strategy_id": 7,
+  "tick": 10.0,
+  "uid": "9b5366b0-2a2e-4074-ace6-d844fefee42b",
+  "use_market_stop": false
+ }
+]

@@ -10,6 +10,7 @@
 //! UDP socket and serves: the catalog goes to the terminal once per session,
 //! the prices every couple of seconds, the tape, books and candles live.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
@@ -22,10 +23,12 @@ use aster_core::feed;
 use aster_core::key_store;
 use aster_core::load::Load;
 use aster_core::model::{Catalog, QUOTE};
+use aster_core::order_store::OrderStore;
 use aster_core::prices;
 use aster_core::stderr_log;
 use aster_core::strategies::Strategies;
 use aster_core::stream_health::StreamHealth;
+use aster_core::trading;
 use moonproto::server::codec::engine as engine_codec;
 use moonproto::server::Server;
 
@@ -39,6 +42,9 @@ const APPLY_BATCH: usize = 16;
 /// The API wallet's key file, unless `ASTER_API_KEY_FILE` names another. The
 /// name is the one `.gitignore` already closes (`asterkey*`).
 const API_KEY_FILE: &str = "asterkey";
+/// The order store (`order_store.rs`), in the working directory, as
+/// TInvestCore keeps it.
+const ORDERS_FILE: &str = "data/orders.json";
 
 fn main() -> ExitCode {
     stderr_log::init();
@@ -293,6 +299,18 @@ fn main() -> ExitCode {
     let mut health = StreamHealth::default();
     let load = Arc::new(Load::default());
     let symbols: Vec<String> = cat.symbols().iter().map(|s| s.to_string()).collect();
+    // The grid of every market, for the order worker to read open orders on.
+    let grids: std::collections::HashMap<String, trading::Grid> = cat
+        .markets()
+        .iter()
+        .map(|m| {
+            let grid = trading::Grid {
+                step: m.step_size,
+                tick: m.tick_size,
+            };
+            (m.symbol.clone(), grid)
+        })
+        .collect();
     let mut handler = CoreHandler::new(
         1,
         engine::ACCOUNT_PLACEHOLDER.to_string(),
@@ -300,6 +318,13 @@ fn main() -> ExitCode {
         Strategies::new(),
     );
     if let Some((account_rest, signer, first)) = account {
+        // The order worker signs with a clone of the account's signer: one
+        // wallet, one nonce sequence (`Signer`). Its own client, on the same
+        // network, measured against the same gateway.
+        let mut orders_rest = Rest::on(signer.network());
+        orders_rest.set_clock_delta_ms(account_rest.clock_delta_ms());
+        let trading = trading::start(orders_rest, signer.clone(), grids, ev_tx.clone());
+        let (store, saved) = OrderStore::open(PathBuf::from(ORDERS_FILE));
         account::start(
             account_rest,
             signer,
@@ -307,7 +332,9 @@ fn main() -> ExitCode {
             first.clone(),
             ev_tx.clone(),
         );
-        handler = handler.with_account(first);
+        handler = handler
+            .with_account(first)
+            .with_trading(trading, store, saved);
     }
     let feed_tx = feed::start(&symbols, ev_tx, &mut health, Arc::clone(&load));
     let handler = handler.with_feed(FeedLink {

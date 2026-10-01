@@ -166,6 +166,12 @@ pub enum FeedEvent {
         request_uid: u64,
         result: Result<Vec<HistoryTrade>, String>,
     },
+    /// An outcome of the order worker (`trading.rs`).
+    Trading(crate::trading::TradingEvent),
+    /// An `ORDER_TRADE_UPDATE` of the account's user-data stream.
+    UserOrder(crate::aster::json::OrderEvent),
+    /// A session of the user-data stream is opening.
+    UserStreamOpen,
     /// A feed thread the core cannot do without has died (by panicking): the
     /// engine latches it and `main` leaves (`CoreHandler::feed_lost`).
     Lost(&'static str),

@@ -215,7 +215,7 @@ pub fn start(
             let run = panic::catch_unwind(AssertUnwindSafe(move || {
                 let (wake_tx, wake_rx) = mpsc::channel();
                 let slot = Arc::new(Slot::default());
-                user_stream(signer.network(), Arc::clone(&slot), wake_tx);
+                user_stream(signer.network(), Arc::clone(&slot), wake_tx, tx.clone());
                 let mut stream = Stream {
                     wake: Some(wake_rx),
                     slot,
@@ -411,7 +411,8 @@ impl Stream {
 
 /// Read the account's user-data stream on a thread named `aster-user`, one
 /// session per key placed in `slot`, and tell the account thread of every
-/// event and of every session's end.
+/// event and of every session's end; each order's event also goes to the
+/// engine (`feed`), for the order model.
 ///
 /// The thread holds no credentials: the key is all the stream needs, and it
 /// only reads. At every session's end it empties the slot before it says so,
@@ -421,7 +422,7 @@ impl Stream {
 /// session is reopened after a backoff that doubles to [`BACKOFF_MAX`] and
 /// starts over after a session that lived longer than that; one that ended on
 /// its own — rotated, stopped, its key expired — at once.
-fn user_stream(network: Network, slot: Arc<Slot>, wake: Sender<Wake>) {
+fn user_stream(network: Network, slot: Arc<Slot>, wake: Sender<Wake>, feed: Sender<FeedEvent>) {
     thread::Builder::new()
         .name("aster-user".into())
         .spawn(move || {
@@ -443,6 +444,9 @@ fn user_stream(network: Network, slot: Arc<Slot>, wake: Sender<Wake>) {
                     network.name(),
                     beat.sessions() + 1
                 );
+                // Events between the last session and this one may be lost:
+                // the engine reads the open orders again (`TradeCommand::OpenOrders`).
+                let _ = feed.send(FeedEvent::UserStreamOpen);
                 let opened = Instant::now();
                 let url = format!("wss://{}/ws/{key}", network.ws_host());
                 let res = ws::guarded(|| {
@@ -455,6 +459,10 @@ fn user_stream(network: Network, slot: Arc<Slot>, wake: Sender<Wake>) {
                         |text| {
                             let event = user_event(text);
                             log_event(&event);
+                            // The order model's report of the order (`orders.rs`).
+                            if let UserEvent::Order(o) = &event {
+                                let _ = feed.send(FeedEvent::UserOrder(o.order.clone()));
+                            }
                             if event == UserEvent::Expired {
                                 slot.stop.store(true, Ordering::Relaxed);
                             }

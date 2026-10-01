@@ -18,7 +18,7 @@ use ureq::{Agent, Body};
 
 use super::json::{
     kline_row, AggTrade, ApiError, Balance, BookTicker, DepthSnapshot, ExchangeInfo, Kline,
-    ListenKey, PositionRisk, PremiumIndex, ServerTime, Ticker24h,
+    ListenKey, OrderReply, PositionRisk, PremiumIndex, ServerTime, Ticker24h,
 };
 use super::sign::{Network, Signer};
 
@@ -126,6 +126,11 @@ impl Rest {
 
     pub fn clock_delta_ms(&self) -> i64 {
         self.clock_delta_ms
+    }
+
+    /// Take a clock difference another client of the same gateway measured.
+    pub fn set_clock_delta_ms(&mut self, delta_ms: i64) {
+        self.clock_delta_ms = delta_ms;
     }
 
     pub fn last_rtt(&self) -> Option<Duration> {
@@ -306,11 +311,57 @@ impl Rest {
     /// never does: measured 01.10, `/ws/<made-up key>` is accepted with 101
     /// and answers pings, exactly like a live quiet stream.
     pub fn listen_key(&mut self, signer: &mut Signer) -> Result<String, Error> {
-        let key: ListenKey = self.signed_post(signer, "/fapi/v3/listenKey", &[])?;
+        let key: ListenKey = self.signed_send(Method::Post, signer, "/fapi/v3/listenKey", &[])?;
         if key.listen_key.is_empty() {
             return Err(Error::Decode("/fapi/v3/listenKey: empty key".into()));
         }
         Ok(key.listen_key)
+    }
+
+    /// `POST /fapi/v3/order`, signed: a new order with `params` (symbol, side,
+    /// type, quantity, price, `newClientOrderId`, …). Weight 0 by the docs;
+    /// the order counters (`x-mbx-order-count-*`) are what it spends.
+    pub fn new_order(
+        &mut self,
+        signer: &mut Signer,
+        params: &[(&str, &str)],
+    ) -> Result<OrderReply, Error> {
+        self.signed_send(Method::Post, signer, "/fapi/v3/order", params)
+    }
+
+    /// `DELETE /fapi/v3/order`, signed, weight 1: cancel `symbol`'s order.
+    pub fn cancel_order(
+        &mut self,
+        signer: &mut Signer,
+        symbol: &str,
+        order: OrderRef<'_>,
+    ) -> Result<OrderReply, Error> {
+        let (k, v) = order.param();
+        self.signed_send(
+            Method::Delete,
+            signer,
+            "/fapi/v3/order",
+            &[("symbol", symbol), (k, &v)],
+        )
+    }
+
+    /// `GET /fapi/v3/order`, signed, weight 1: one order of `symbol`, by the
+    /// exchange's id or by our key. Not found once it is cancelled or expired
+    /// without a fill and 7 days old (docs).
+    pub fn query_order(
+        &mut self,
+        signer: &mut Signer,
+        symbol: &str,
+        order: OrderRef<'_>,
+    ) -> Result<OrderReply, Error> {
+        let (k, v) = order.param();
+        self.signed_get(signer, "/fapi/v3/order", &[("symbol", symbol), (k, &v)])
+    }
+
+    /// `GET /fapi/v3/openOrders` of every symbol, signed, weight 40 (docs):
+    /// the account's live orders, to reconcile the core's against.
+    pub fn open_orders(&mut self, signer: &mut Signer) -> Result<Vec<OrderReply>, Error> {
+        self.signed_get(signer, "/fapi/v3/openOrders", &[])
     }
 
     fn get<T: DeserializeOwned>(&mut self, path: &str, query: &[(&str, &str)]) -> Result<T, Error> {
@@ -337,11 +388,12 @@ impl Rest {
         self.fetch(&url, path)
     }
 
-    /// A v3-signed `POST`: the signed string is the form-encoded body, sent
-    /// as it was signed — the docs' own example passes every parameter of a
-    /// `POST` "through the request body".
-    fn signed_post<T: DeserializeOwned>(
+    /// A v3-signed `POST` or `DELETE`: the signed string is the form-encoded
+    /// body, sent as it was signed — the docs pass every parameter of these
+    /// methods "in the request body".
+    fn signed_send<T: DeserializeOwned>(
         &mut self,
+        method: Method,
         signer: &mut Signer,
         path: &str,
         query: &[(&str, &str)],
@@ -349,12 +401,18 @@ impl Rest {
         let body = self.sign(signer, path, query)?;
         let url = format!("{}{path}", self.network.rest_base());
         const FORM: &str = "application/x-www-form-urlencoded";
-        self.exchange(path, |agent| {
-            agent
+        self.exchange(path, |agent| match method {
+            Method::Post => agent
                 .post(&url)
                 .header("Accept", "application/json")
                 .header("Content-Type", FORM)
-                .send(&body)
+                .send(&body),
+            Method::Delete => agent
+                .delete(&url)
+                .header("Accept", "application/json")
+                .header("Content-Type", FORM)
+                .force_send_body()
+                .send(&body),
         })
     }
 
@@ -459,6 +517,29 @@ impl Rest {
 impl Default for Rest {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The methods a signed call is sent with besides `GET`.
+#[derive(Debug, Clone, Copy)]
+enum Method {
+    Post,
+    Delete,
+}
+
+/// Which order a cancel or a query names: the exchange's id, or our key.
+#[derive(Debug, Clone, Copy)]
+pub enum OrderRef<'a> {
+    Id(&'a str),
+    Key(&'a str),
+}
+
+impl OrderRef<'_> {
+    fn param(self) -> (&'static str, String) {
+        match self {
+            Self::Id(id) => ("orderId", id.to_string()),
+            Self::Key(key) => ("origClientOrderId", key.to_string()),
+        }
     }
 }
 

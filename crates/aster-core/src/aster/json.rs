@@ -476,6 +476,35 @@ pub struct PositionRisk {
     pub unrealized: f64,
 }
 
+/// An order as `POST`, `DELETE` and `GET /fapi/v3/order` answer it (docs:
+/// the three answers carry the same fields).
+///
+/// Strict, like the account rows ([`dec_f64`]): a quantity misread as 0 is a
+/// fill the core never counts, so a malformed one fails the call and the
+/// model reconciles the order instead.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrderReply {
+    #[serde(rename = "orderId")]
+    pub order_id: i64,
+    #[serde(default, rename = "clientOrderId")]
+    pub client_order_id: String,
+    pub symbol: String,
+    pub status: String,
+    pub side: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(deserialize_with = "dec_f64", rename = "origQty")]
+    pub orig_qty: f64,
+    #[serde(deserialize_with = "dec_f64", rename = "executedQty")]
+    pub executed_qty: f64,
+    #[serde(deserialize_with = "dec_f64")]
+    pub price: f64,
+    #[serde(default, deserialize_with = "dec_f64", rename = "avgPrice")]
+    pub avg_price: f64,
+    #[serde(default, rename = "updateTime")]
+    pub update_ms: i64,
+}
+
 /// One aggregated trade, from `<symbol>@aggTrade` or `GET /fapi/v1/aggTrades`.
 ///
 /// Measured 01.10 the two carry the same fields under the same names; the
@@ -691,8 +720,10 @@ pub struct OrderUpdate {
 }
 
 /// The order inside an `ORDER_TRADE_UPDATE`, as the exchange wrote it:
-/// quantities and prices stay the decimal strings they arrived as, because
-/// nothing here computes with them.
+/// quantities and prices stay the decimal strings they arrived as. Every field
+/// defaults, so an odd one costs no more than a line of the journal; the
+/// report the order model reads is parsed from them strictly
+/// (`OrderUpdate::from_event`), and an unreadable one is not a report.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct OrderEvent {
     #[serde(default, rename = "s")]
@@ -721,6 +752,12 @@ pub struct OrderEvent {
     /// Price of the last fill.
     #[serde(default, rename = "L")]
     pub last_price: String,
+    /// Average fill price.
+    #[serde(default, rename = "ap")]
+    pub avg_price: String,
+    /// Transaction time, ms.
+    #[serde(default, rename = "T")]
+    pub time_ms: i64,
 }
 
 /// One row of `GET /fapi/v1/klines`: a 12-cell array of mixed numbers and

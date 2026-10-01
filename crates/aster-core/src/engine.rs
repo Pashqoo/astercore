@@ -26,6 +26,7 @@ use std::time::Instant;
 use moonproto::server::codec::engine::{self, EngineMethod, EngineRequest, ServerInfo};
 use moonproto::server::codec::log::log_msg;
 use moonproto::server::codec::market_data::{self, DeepHistoryKind, BOOK_KIND_FUTURES};
+use moonproto::server::codec::trade::{OrderCommand, StartOrder};
 use moonproto::server::codec::{balance, strat, trade, ui, BaseHeader, BASE_HEADER_SIZE};
 use moonproto::server::{Command, Handler, Session};
 
@@ -36,10 +37,13 @@ use crate::candles5m::Candles5m;
 use crate::feed::{FeedCommand, FeedEvent};
 use crate::load::Load;
 use crate::model::{Catalog, QUOTE, QUOTE_CODE};
+use crate::order_store::{self, OrderStore};
+use crate::orders::{Action, Effects, Leg, Orders};
 use crate::prices::Snapshot;
 use crate::strategies::Strategies;
 use crate::stream_health::{Scope, StreamHealth, SUMMARY_EVERY_MS};
 use crate::trades_stream::TradesStream;
+use crate::trading::{Grid, OrderUpdate, TradeCommand, TradingEvent};
 
 pub const SERVER_NAME: &str = "Astercore";
 pub const EXCHANGE_NAME: &str = "Aster";
@@ -67,6 +71,11 @@ const MAX_PAYLOAD: i32 = 4 * 1024 * 1024;
 pub const ACCOUNT_PLACEHOLDER: &str = "aster";
 
 const API: u8 = Command::API.to_byte();
+/// How long after a user-data session opens the open orders are read.
+const OPEN_ORDERS_AFTER_MS: i64 = 3_000;
+/// How often stops, trailing, pending triggers and panic exits are judged
+/// (`Orders::watch`), as TInvestCore did.
+const WATCH_EVERY_MS: i64 = 1_000;
 const STRAT: u8 = Command::Strat.to_byte();
 const UI: u8 = Command::UI.to_byte();
 const ORDER: u8 = Command::Order.to_byte();
@@ -165,6 +174,21 @@ pub struct CoreHandler {
     health_at: i64,
     load_at: Stamp,
     feed_lost: bool,
+    /// The core's orders (`orders.rs`).
+    orders: Orders,
+    /// The order worker; `None` on a core without an account, where every
+    /// order is refused before it is made.
+    trading: Option<Sender<TradeCommand>>,
+    order_store: Option<OrderStore>,
+    /// Exchange work of the last effects, sent by `pump` after one snapshot
+    /// of the whole batch (`flush_actions`), with the market it is on.
+    pending_actions: Vec<(Action, String)>,
+    /// Messages for every session (order images, log lines), sent by `pump`.
+    outbox: Vec<(u8, Vec<u8>)>,
+    /// When `Orders::watch` last ran.
+    watch_at: i64,
+    /// When to read the account's open orders (`TradeCommand::OpenOrders`).
+    open_orders_due: Option<i64>,
 }
 
 impl CoreHandler {
@@ -198,6 +222,13 @@ impl CoreHandler {
             health_at: 0,
             load_at: Stamp::now(),
             feed_lost: false,
+            orders: Orders::new(),
+            trading: None,
+            order_store: None,
+            pending_actions: Vec::new(),
+            outbox: Vec::new(),
+            watch_at: 0,
+            open_orders_due: None,
         }
     }
 
@@ -205,6 +236,35 @@ impl CoreHandler {
     /// is answered with it rather than with an empty wallet for a period.
     pub fn with_account(mut self, account: Account) -> Self {
         self.account = Some(account);
+        self
+    }
+
+    /// Trade on the account: the order worker (`trading::start`) and the order
+    /// store, with the orders the previous run left there.
+    pub fn with_trading(
+        mut self,
+        tx: Sender<TradeCommand>,
+        store: OrderStore,
+        saved: order_store::Saved,
+    ) -> Self {
+        // Ids above every restored one, so a new order never takes an old id.
+        self.orders = Orders::starting_at(now_ms() as u64);
+        let restored = self.orders.restore(saved.orders);
+        self.orders.restore_left(saved.left);
+        let (refreshed, missing) = self.orders.respec(|uid| self.catalog.get(uid));
+        if restored > 0 {
+            log::info!(
+                "orders: {restored} restored, {refreshed} on today's catalog, {missing} on a market it lacks"
+            );
+        }
+        if !saved.client_settings.is_empty() {
+            self.client_settings = saved.client_settings;
+        }
+        // What the exchange holds now: the restored orders are read against
+        // it before any terminal acts on them.
+        let _ = tx.send(TradeCommand::OpenOrders);
+        self.trading = Some(tx);
+        self.order_store = Some(store);
         self
     }
 
@@ -373,6 +433,24 @@ impl CoreHandler {
             self.health_at = now;
             self.judge_streams();
         }
+        if now - self.watch_at >= WATCH_EVERY_MS {
+            self.watch_at = now;
+            let fx = self.orders.watch(&self.catalog, now);
+            self.effects(fx, now);
+        }
+        if self.open_orders_due.is_some_and(|due| now >= due) {
+            self.open_orders_due = None;
+            if let Some(tx) = &self.trading {
+                let _ = tx.send(TradeCommand::OpenOrders);
+            }
+        }
+        self.flush_actions(now);
+        self.persist_orders(false, now);
+        for (channel, payload) in std::mem::take(&mut self.outbox) {
+            for s in sessions.iter_mut() {
+                s.send_encrypted(channel, &payload, true);
+            }
+        }
         if let Some(packet) = self.trades.poll(Instant::now()) {
             for s in sessions
                 .iter_mut()
@@ -393,13 +471,24 @@ impl CoreHandler {
             return;
         };
         let stamp = Stamp::now();
-        let marks_died = feed
-            .health
-            .judge(stamp)
-            .iter()
-            .any(|(scope, alive)| **scope == Scope::Marks && !alive);
+        let mut markets: Vec<(Vec<String>, bool)> = Vec::new();
+        let mut marks_died = false;
+        for (scope, alive) in feed.health.judge(stamp) {
+            match scope {
+                Scope::Marks if !alive => marks_died = true,
+                Scope::Marks => {}
+                Scope::Markets(symbols) => markets.push((symbols.clone(), alive)),
+            }
+        }
         if marks_died {
             self.catalog.apply_premium_index(&[]);
+        }
+        // A market whose tape is dead has no price to trade on: its orders
+        // hold (`Market::fresh`).
+        for (symbols, alive) in markets {
+            for symbol in &symbols {
+                self.catalog.set_feed_fresh(symbol, alive);
+            }
         }
         // Monotonic, unlike the streams line: a stepped wall clock must not
         // print a load line for a period that never lasted.
@@ -420,6 +509,7 @@ impl CoreHandler {
                 if let Some(idx) = self.catalog.index_of_symbol(&symbol) {
                     self.trades.push(idx, time_ms, price as f32, qty as f32);
                     self.candles.push(idx, time_ms, price, qty);
+                    self.catalog.set_last(&symbol, price);
                 }
             }
             FeedEvent::Warmup { symbol, bars } => {
@@ -538,7 +628,33 @@ impl CoreHandler {
                 log::error!("feed: {what} is gone");
                 self.feed_lost = true;
             }
+            FeedEvent::Trading(ev) => self.on_trading(ev),
+            FeedEvent::UserOrder(o) => {
+                let step = self.catalog.get(&o.symbol).map_or(0.0, |m| m.step_size);
+                match OrderUpdate::from_event(&o, step) {
+                    Some(u) => self.on_trading(TradingEvent::Order(u)),
+                    None if o.status.starts_with("NEW_") => {}
+                    None => log::warn!("order: unreadable report of {} {}", o.symbol, o.id),
+                }
+            }
+            // Read once the session is likely subscribed — its handshake
+            // measured 0.83 s: a read made before it leaves a window that
+            // neither the read nor the stream covers. Retries in between fold
+            // into the one read.
+            FeedEvent::UserStreamOpen => {
+                if self.open_orders_due.is_none() {
+                    self.open_orders_due = Some(now_ms() + OPEN_ORDERS_AFTER_MS);
+                }
+            }
             FeedEvent::Account(account) => {
+                // Positions that left the account outside the core close
+                // their orders (`Orders::reconcile`). An unknown account
+                // closes nothing.
+                if let Some(a) = &account {
+                    let now = now_ms();
+                    let fx = self.orders.reconcile(&Self::held(a), &self.catalog, now);
+                    self.effects(fx, now);
+                }
                 self.account = account;
                 let payload = self.balance_payload(rand_uid());
                 for s in sessions.iter_mut() {
@@ -975,17 +1091,360 @@ impl CoreHandler {
         let Some(hdr) = BaseHeader::parse(payload) else {
             return;
         };
-        match hdr.cmd_id {
-            // The post-init snapshot request. There is no order path until M2,
-            // and an empty snapshot is the true answer: this core holds no
-            // orders. Silence would leave the terminal's ORDERS table waiting.
+        let resp = match hdr.cmd_id {
             trade::CMD_ORDER_STATUS_REQUEST if hdr.uid == 0 => {
-                session.send_encrypted(ORDER, &trade::orders_snapshot(0, &[]), true);
+                trade::orders_snapshot(0, &self.orders.records(now_ms()))
             }
-            trade::CMD_ORDER_STATUS_REQUEST => {
-                session.send_encrypted(ORDER, &trade::order_not_found(hdr.uid), true);
+            trade::CMD_ORDER_STATUS_REQUEST => match self.orders.get(hdr.uid) {
+                Some(o) => trade::order_image(&o.record()),
+                None => trade::order_not_found(hdr.uid),
+            },
+            trade::CMD_ORDER_COMMAND => {
+                return self.on_order_command(hdr.uid, &payload[BASE_HEADER_SIZE..]);
             }
-            other => log::debug!("Order cmd {other} ignored until M2"),
+            other => {
+                log::debug!("Order cmd {other} ignored");
+                return;
+            }
+        };
+        session.send_encrypted(ORDER, &resp, true);
+    }
+
+    /// `TOrderCommand` from the terminal; results go out through `effects`.
+    /// Ported from TInvestCore without what this core does not have yet: the
+    /// manual strategy and the toolbar's stop and take profit (M3), MoveAll,
+    /// the emulator.
+    fn on_order_command(&mut self, req_uid: u64, body: &[u8]) {
+        let now = now_ms();
+        let fx = match OrderCommand::parse(body) {
+            OrderCommand::Start(s) => self.start_order(req_uid, &s, false, now),
+            OrderCommand::StartPending(s) => self.start_order(req_uid, &s, true, now),
+            OrderCommand::TargetBuy {
+                order_id,
+                price,
+                size,
+            } => self.orders.target_manual(
+                order_id,
+                Leg::Buy,
+                price,
+                (size > 0.0).then_some(size),
+                now,
+            ),
+            OrderCommand::TargetSell { order_id, price } => {
+                self.orders.target(order_id, Leg::Sell, price, None)
+            }
+            OrderCommand::CancelBuy { order_id } => self.orders.cancel_buy(order_id, now),
+            OrderCommand::CancelSell { order_id } => self.orders.cancel(order_id, Leg::Sell),
+            OrderCommand::Stops {
+                order_id,
+                sl_on,
+                sl_fixed,
+                sl_level,
+                sl_spread,
+                trail_on,
+                trail_fixed,
+                trail_level,
+                trail_spread,
+                tp_on,
+                tp,
+            } => {
+                let mut fx = self
+                    .orders
+                    .set_stops(order_id, sl_on, sl_fixed, sl_level, sl_spread);
+                fx.extend(self.orders.set_trailing(
+                    order_id,
+                    trail_on,
+                    trail_fixed,
+                    trail_level,
+                    trail_spread,
+                    tp_on,
+                    tp,
+                ));
+                fx
+            }
+            OrderCommand::Panic { order_id, enabled } => {
+                let uid = self.orders.get(order_id).map(|o| o.uid.clone());
+                match uid.as_deref().and_then(|u| self.catalog.get(u)) {
+                    Some(m) => self.orders.set_panic(order_id, enabled, m, now),
+                    None => Effects {
+                        logs: vec![format!(
+                            "Panic Sell of order {order_id}: no such order on a known market"
+                        )],
+                        ..Effects::default()
+                    },
+                }
+            }
+            // Modes 2/3 split the position into pieces; closing it whole
+            // instead would sell what the trader meant to keep.
+            OrderCommand::ClosePosition { market, mode, .. } if mode >= 2 => Effects {
+                logs: vec![format!(
+                    "{market}: split position is not supported by this core"
+                )],
+                ..Effects::default()
+            },
+            // Mode 0: all, `flag` = at market; mode 1: the limit close of one
+            // side (`flag` = short).
+            OrderCommand::ClosePosition { market, mode, flag } => {
+                let (side, at_market) = if mode == 1 {
+                    (Some(flag), false)
+                } else {
+                    (None, flag)
+                };
+                match self.tradable(&market) {
+                    Ok(()) => {
+                        let m = self.catalog.get(&market).expect("tradable");
+                        self.orders.close_position(m, false, side, at_market, now)
+                    }
+                    Err(reason) => Effects {
+                        logs: vec![reason],
+                        ..Effects::default()
+                    },
+                }
+            }
+            OrderCommand::Immune { order_id, enabled } => self.orders.set_immune(order_id, enabled),
+            OrderCommand::PanicSellAll => self.orders.panic_all(&self.catalog, now),
+            OrderCommand::PendingCancel { order_id } => self.orders.cancel_pending(order_id, now),
+            OrderCommand::MoveAll { market, .. } => Effects {
+                logs: vec![format!(
+                    "{market}: Move all is not supported by this core yet"
+                )],
+                ..Effects::default()
+            },
+            OrderCommand::Other(op) => Effects {
+                logs: vec![format!("order command {op} is not supported by this core")],
+                ..Effects::default()
+            },
+        };
+        self.effects(fx, now);
+    }
+
+    /// `Start` / `StartPending` (`pending`: the core holds the order until the
+    /// price crosses its trigger). A manual entry on a market whose trade
+    /// stream is down is refused: its price is not the market's.
+    fn start_order(&mut self, req_uid: u64, s: &StartOrder, pending: bool, now: i64) -> Effects {
+        if let Err(reason) = self.tradable(&s.market) {
+            return self.orders.fail_start(req_uid, s, &reason, now);
+        }
+        let m = self.catalog.get(&s.market).expect("tradable");
+        if !m.fresh() {
+            let reason = format!(
+                "{}: market data is stale (no trade stream): orders are held",
+                s.market
+            );
+            return self.orders.fail_start(req_uid, s, &reason, now);
+        }
+        if pending {
+            self.orders.start_pending(req_uid, s, m, now)
+        } else {
+            self.orders.start(req_uid, s, m, now)
+        }
+    }
+
+    /// The core may send exchange orders for `market`.
+    fn tradable(&self, market: &str) -> Result<(), String> {
+        if self.trading.is_none() {
+            return Err("trading is off: the core runs without an account key".into());
+        }
+        match self.catalog.get(market) {
+            Some(m) if m.trading => Ok(()),
+            Some(_) => Err(format!("{market}: the market is not trading")),
+            None => Err(format!("{market}: unknown market")),
+        }
+    }
+
+    /// An outcome of the exchange, from the worker or the user-data stream.
+    fn on_trading(&mut self, ev: TradingEvent) {
+        let now = now_ms();
+        let fx = match ev {
+            TradingEvent::Order(u) => self.order_update(&u, now),
+            TradingEvent::OpenOrders(list) => {
+                let open: Vec<String> = list.iter().map(|u| u.exchange_id.clone()).collect();
+                for u in &list {
+                    let fx = self.order_update(u, now);
+                    self.effects(fx, now);
+                }
+                let open: Vec<&str> = open.iter().map(String::as_str).collect();
+                Effects {
+                    actions: self.orders.missing_from(&open),
+                    ..Effects::default()
+                }
+            }
+            TradingEvent::Failed {
+                action,
+                definitive,
+                msg,
+            } => self.orders.failed(&action, definitive, &msg, now),
+            TradingEvent::Ping(ms) => {
+                log::debug!("orders: call answered in {ms} ms");
+                return;
+            }
+        };
+        self.effects(fx, now);
+    }
+
+    /// A report of an exchange order: the core's own is applied; one placed
+    /// outside the core is adopted as the exit of a position it closes, or
+    /// left to the account (`Orders::adopt`), judged on the account's
+    /// positions as last read.
+    fn order_update(&mut self, u: &OrderUpdate, now: i64) -> Effects {
+        if self.orders.knows(u) {
+            return self.orders.apply(u, now);
+        }
+        let Some(m) = self.catalog.get(&u.uid) else {
+            log::debug!(
+                "order {} on unknown market {} ignored",
+                u.exchange_id,
+                u.uid
+            );
+            return Effects::default();
+        };
+        let held = self.account.as_ref().map(|a| {
+            a.positions
+                .iter()
+                .find(|p| p.symbol == u.uid)
+                .map_or(0.0, |p| p.size)
+        });
+        self.orders.adopt(u, m, held, now)
+    }
+
+    /// The account's positions as `Orders::reconcile` reads them: signed
+    /// base quantity per symbol.
+    fn held(account: &Account) -> HashMap<String, f64> {
+        account
+            .positions
+            .iter()
+            .map(|p| (p.symbol.clone(), p.size))
+            .collect()
+    }
+
+    /// Queue order images and log lines for every session; hold the exchange
+    /// work for `flush_actions`. A limit outside the `PERCENT_PRICE` band is
+    /// pinned to it first, the image following (the gateway refuses it).
+    fn effects(&mut self, mut fx: Effects, now: i64) {
+        self.cap_to_band(&mut fx);
+        self.orders.note_moves(&fx.changed, now);
+        for id in fx.changed {
+            if let Some(o) = self.orders.get(id) {
+                self.outbox.push((ORDER, trade::order_image(&o.record())));
+            }
+        }
+        for text in fx.logs {
+            log::info!("{text}");
+            self.outbox.push((LOG, log_msg(now, &text)));
+        }
+        for action in fx.actions {
+            if let Some(o) = self.orders.get(action.order()) {
+                let uid = o.uid.clone();
+                self.pending_actions.push((action, uid));
+            }
+        }
+    }
+
+    fn cap_to_band(&mut self, fx: &mut Effects) {
+        for a in &mut fx.actions {
+            let (order, leg, price) = match a {
+                Action::Post {
+                    order,
+                    leg,
+                    price: Some(price),
+                    ..
+                }
+                | Action::Replace {
+                    order, leg, price, ..
+                } => (*order, *leg, price),
+                _ => continue,
+            };
+            let Some(m) = self
+                .orders
+                .get(order)
+                .and_then(|o| self.catalog.get(&o.uid))
+            else {
+                continue;
+            };
+            let capped = m.within_limits(*price);
+            if capped != *price {
+                let (down, up) = m.band().unwrap_or_default();
+                fx.logs.push(format!(
+                    "{}: price {price} is outside the exchange band {down}..{up}, placed at {capped}",
+                    m.symbol
+                ));
+                *price = capped;
+                if self.orders.reprice(order, leg, capped) && !fx.changed.contains(&order) {
+                    fx.changed.push(order);
+                }
+            }
+        }
+    }
+
+    /// Hand the queued exchange work to the order worker. A Post or Replace
+    /// carries a new request key: the order store is written first, once for
+    /// the whole batch, so the key is on disk before the exchange can know it.
+    fn flush_actions(&mut self, now: i64) {
+        if self.pending_actions.is_empty() {
+            return;
+        }
+        let keyed = |a: &Action| matches!(a, Action::Post { .. } | Action::Replace { .. });
+        // A new key not on disk is a request a restart could not recognise:
+        // it does not leave.
+        let stored =
+            !self.pending_actions.iter().any(|(a, _)| keyed(a)) || self.persist_orders(true, now);
+        let mut refused = Effects::default();
+        for (action, uid) in std::mem::take(&mut self.pending_actions) {
+            let grid = self.catalog.get(&uid).map(|m| Grid {
+                step: m.step_size,
+                tick: m.tick_size,
+            });
+            let why = match (&self.trading, grid) {
+                // An exit still goes: a position without its exit is worse than
+                // an exit a restart would take for a foreign one (`adopt`).
+                _ if !stored && keyed(&action) && action_leg(&action) == Leg::Buy => {
+                    "the order store could not be written, the entry is not sent".to_string()
+                }
+                (Some(tx), Some(grid)) => {
+                    match tx.send(TradeCommand::Exchange { action, uid, grid }) {
+                        Ok(()) => continue,
+                        Err(e) => {
+                            let TradeCommand::Exchange { action, .. } = e.0 else {
+                                continue;
+                            };
+                            refused.extend(self.orders.failed(
+                                &action,
+                                true,
+                                "the order worker is gone",
+                                now,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                (None, _) => "trading is off".to_string(),
+                (_, None) => format!("{uid}: not in the catalog"),
+            };
+            // Told to the model as a refusal, so the leg does not wait for an
+            // answer that is never coming.
+            log::warn!("{why}: {action:?}");
+            refused.extend(self.orders.failed(&action, true, &why, now));
+        }
+        if !refused.changed.is_empty() || !refused.logs.is_empty() || !refused.actions.is_empty() {
+            self.effects(refused, now);
+        }
+    }
+
+    /// Snapshot the live orders (`force`: now, before an order request);
+    /// `false` when the snapshot is not on disk.
+    fn persist_orders(&mut self, force: bool, now: i64) -> bool {
+        let Some(store) = &mut self.order_store else {
+            return true;
+        };
+        {
+            let state = order_store::State {
+                running: false,
+                client_settings: &self.client_settings,
+                settings_at: 0,
+                loss_since: 0,
+                market_stopped: false,
+            };
+            store.save(&self.orders, &state, force, now)
         }
     }
 
@@ -1102,4 +1561,15 @@ fn rand_uid() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(1, |d| d.as_nanos() as u64);
     (nanos & 0x0000_ffff_ffff_ffff) | (SEQ.fetch_add(1, Ordering::Relaxed) << 48)
+}
+
+/// The leg an action works on.
+fn action_leg(a: &Action) -> Leg {
+    match a {
+        Action::Post { leg, .. }
+        | Action::Cancel { leg, .. }
+        | Action::Replace { leg, .. }
+        | Action::Query { leg, .. }
+        | Action::QueryRequest { leg, .. } => *leg,
+    }
 }

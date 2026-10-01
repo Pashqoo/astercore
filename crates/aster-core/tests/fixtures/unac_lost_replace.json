@@ -1,0 +1,256 @@
+[
+ {
+  "bot_stop": [
+   0.0,
+   0.0
+  ],
+  "buy": {
+   "cancel_requested": true,
+   "deferred": null,
+   "exchange_id": "84589350267",
+   "executions": [
+    {
+     "awaiting_reply": false,
+     "filled": 0,
+     "ids": [
+      "01a0b5c5-6c3e-7f1d-903b-2dac019cef5a",
+      "84589350063"
+     ],
+     "key": "689b0456-897c-4bb8-965c-97c98bcc5141",
+     "lots": 2,
+     "mean": 0.0,
+     "price": 0.3765,
+     "reason": 0,
+     "retired": false,
+     "status": "Cancelled"
+    },
+    {
+     "awaiting_reply": false,
+     "filled": 0,
+     "ids": [
+      "01a0b5c5-6fda-7a38-890a-b9aae45fdcf0",
+      "84589350267"
+     ],
+     "key": "34fb4dfa-3828-42de-acab-1b3076c3828e",
+     "lots": 2,
+     "mean": 0.0,
+     "price": 0.3755,
+     "reason": 0,
+     "retired": false,
+     "status": "Cancelled"
+    },
+    {
+     "awaiting_reply": false,
+     "filled": 0,
+     "ids": [],
+     "key": "9bcd66c5-c143-415f-9198-0d9d8a417b00",
+     "lots": 2,
+     "mean": 0.0,
+     "price": 0.3745,
+     "reason": 0,
+     "retired": false,
+     "status": null
+    }
+   ],
+   "filled_lots": 0,
+   "key": "9bcd66c5-c143-415f-9198-0d9d8a417b00",
+   "lots": 2,
+   "owned": true,
+   "replacing": false,
+   "resolve_key": "9bcd66c5-c143-415f-9198-0d9d8a417b00",
+   "state": {
+    "canceled": false,
+    "close_ms": 0,
+    "closed": false,
+    "create_ms": 1789754320007,
+    "exchange_id": 84589350267,
+    "filled": 0.0,
+    "is_market": false,
+    "mean_price": 0.0,
+    "notional": 749.0,
+    "open_ms": 1789754352878,
+    "opened": true,
+    "price": 0.3745,
+    "quantity": 2000.0,
+    "spent": 0.0
+   },
+   "uncertain": true
+  },
+  "done_ms": 0,
+  "entry_moved_at": 0,
+  "id": 1789754294004,
+  "is_short": false,
+  "lot": 1000.0,
+  "market": "UNAC",
+  "next_reason": 0,
+  "panic": false,
+  "planned_ratio": 0.0,
+  "planned_sell": 0.0,
+  "point_value": 1.0,
+  "rev": 25,
+  "sell": {
+   "cancel_requested": false,
+   "deferred": null,
+   "exchange_id": "",
+   "executions": [],
+   "filled_lots": 0,
+   "key": "",
+   "lots": 0,
+   "owned": false,
+   "replacing": false,
+   "resolve_key": "",
+   "state": {
+    "canceled": false,
+    "close_ms": 0,
+    "closed": false,
+    "create_ms": 0,
+    "exchange_id": 0,
+    "filled": 0.0,
+    "is_market": false,
+    "mean_price": 0.0,
+    "notional": 0.0,
+    "open_ms": 0,
+    "opened": false,
+    "price": 0.0,
+    "quantity": 0.0,
+    "spent": 0.0
+   },
+   "uncertain": false
+  },
+  "status": 2,
+  "stop_pct": 0.0,
+  "stop_price": 0.0,
+  "stop_spread": 0.0,
+  "strategy_id": 4,
+  "tick": 0.0005,
+  "uid": "43666aea-a4df-46e1-a815-e5eccbc1fb3f",
+  "use_market_stop": false
+ },
+ {
+  "bot_stop": [
+   0.0,
+   0.0
+  ],
+  "buy": {
+   "cancel_requested": true,
+   "deferred": null,
+   "exchange_id": "84589350210",
+   "executions": [
+    {
+     "awaiting_reply": false,
+     "filled": 0,
+     "ids": [
+      "84589349996",
+      "01a0b5c5-6af9-7209-88b1-68bc1c2bf1d6"
+     ],
+     "key": "9163afc2-6309-486c-93c3-2cfe0dceb779",
+     "lots": 2,
+     "mean": 0.0,
+     "price": 0.3775,
+     "reason": 0,
+     "retired": false,
+     "status": "Cancelled"
+    },
+    {
+     "awaiting_reply": false,
+     "filled": 2,
+     "ids": [
+      "84589350210",
+      "01a0b5c5-6eab-7e2b-a9d9-b271eccfdb53"
+     ],
+     "key": "01baeddf-7b54-4cd0-b480-c29a56a4cb8a",
+     "lots": 2,
+     "mean": 0.3765,
+     "price": 0.3765,
+     "reason": 0,
+     "retired": false,
+     "status": "Filled"
+    },
+    {
+     "awaiting_reply": false,
+     "filled": 0,
+     "ids": [],
+     "key": "07e842a1-01e7-470a-9075-9bf124bc4579",
+     "lots": 2,
+     "mean": 0.0,
+     "price": 0.3755,
+     "reason": 0,
+     "retired": false,
+     "status": null
+    }
+   ],
+   "filled_lots": 2,
+   "key": "07e842a1-01e7-470a-9075-9bf124bc4579",
+   "lots": 4,
+   "owned": true,
+   "replacing": false,
+   "resolve_key": "07e842a1-01e7-470a-9075-9bf124bc4579",
+   "state": {
+    "canceled": false,
+    "close_ms": 0,
+    "closed": false,
+    "create_ms": 1789754320007,
+    "exchange_id": 84589350210,
+    "filled": 2000.0,
+    "is_market": false,
+    "mean_price": 0.3765,
+    "notional": 1502.0,
+    "open_ms": 1789754352584,
+    "opened": true,
+    "price": 0.3755,
+    "quantity": 4000.0,
+    "spent": 753.0
+   },
+   "uncertain": true
+  },
+  "done_ms": 0,
+  "entry_moved_at": 0,
+  "id": 1789754294002,
+  "is_short": false,
+  "lot": 1000.0,
+  "market": "UNAC",
+  "next_reason": 0,
+  "panic": false,
+  "planned_ratio": 0.0,
+  "planned_sell": 0.0,
+  "point_value": 1.0,
+  "rev": 26,
+  "sell": {
+   "cancel_requested": false,
+   "deferred": null,
+   "exchange_id": "",
+   "executions": [],
+   "filled_lots": 0,
+   "key": "",
+   "lots": 0,
+   "owned": false,
+   "replacing": false,
+   "resolve_key": "",
+   "state": {
+    "canceled": false,
+    "close_ms": 0,
+    "closed": false,
+    "create_ms": 0,
+    "exchange_id": 0,
+    "filled": 0.0,
+    "is_market": false,
+    "mean_price": 0.0,
+    "notional": 0.0,
+    "open_ms": 0,
+    "opened": false,
+    "price": 0.0,
+    "quantity": 0.0,
+    "spent": 0.0
+   },
+   "uncertain": false
+  },
+  "status": 2,
+  "stop_pct": 0.0,
+  "stop_price": 0.0,
+  "stop_spread": 0.0,
+  "strategy_id": 4,
+  "tick": 0.0005,
+  "uid": "43666aea-a4df-46e1-a815-e5eccbc1fb3f",
+  "use_market_stop": false
+ }
+]

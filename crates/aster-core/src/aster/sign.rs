@@ -23,6 +23,8 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use k256::ecdsa::SigningKey;
 use sha3::{Digest, Keccak256};
@@ -226,12 +228,16 @@ impl std::error::Error for LoadError {}
 ///
 /// One per wallet, not one per thread: the gateway tracks nonces per API
 /// wallet, so two signers of the same wallet could issue the same microsecond
-/// twice and the second request would be refused as a duplicate.
+/// twice and the second request would be refused as a duplicate. A clone is
+/// that same signer for another thread — it shares the key (not a copy of
+/// it) and the one nonce sequence, so the account reader and the order worker
+/// never issue the same nonce.
+#[derive(Clone)]
 pub struct Signer {
-    creds: Credentials,
+    creds: Arc<Credentials>,
     network: Network,
     domain: [u8; 32],
-    last_nonce: u64,
+    last_nonce: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for Signer {
@@ -247,9 +253,9 @@ impl Signer {
     pub fn new(creds: Credentials, network: Network) -> Self {
         Self {
             domain: domain_separator(network.chain_id()),
-            creds,
+            creds: Arc::new(creds),
             network,
-            last_nonce: 0,
+            last_nonce: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -264,8 +270,14 @@ impl Signer {
     /// The next nonce: `now_us`, the gateway's time in microseconds, unless an
     /// earlier call already took that microsecond or a later one.
     pub fn next_nonce(&mut self, now_us: u64) -> u64 {
-        self.last_nonce = now_us.max(self.last_nonce + 1);
-        self.last_nonce
+        let next = |last: u64| now_us.max(last + 1);
+        let last = self
+            .last_nonce
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                Some(next(last))
+            })
+            .expect("the update always yields");
+        next(last)
     }
 
     /// The complete signed query string for `params`: the parameters, then

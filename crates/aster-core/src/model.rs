@@ -224,6 +224,11 @@ pub struct Market {
     /// market. Not a zero: a rate of exactly zero is a real answer between
     /// charges on 97 of the 595 rows.
     pub funding: Option<Funding>,
+    /// The market's trade stream is alive: the session that carries its
+    /// `aggTrade` answers (`stream_health`). True from the start, as a stream
+    /// still opening counts as alive; the engine keeps it current. Orders read
+    /// it (`fresh`), as TInvestCore's did.
+    pub feed_fresh: bool,
 }
 
 impl Market {
@@ -460,6 +465,113 @@ impl Market {
     }
 }
 
+/// What the order model (`orders.rs`, ported from TInvestCore) reads of a
+/// market. Its "lot" is one `stepSize` of quantity: whole lots are then whole
+/// steps, which is exactly the grid `LOT_SIZE` admits, and the model's integer
+/// arithmetic carries over without a rounding of its own.
+impl Market {
+    /// `price` at the nearest tick (MoonBot rounds every order price this way).
+    pub fn nearest(&self, price: f64) -> f64 {
+        round_tick(price, self.tick_size)
+    }
+
+    /// `price` on the tick grid, rounded up or down.
+    pub fn snap(&self, price: f64, up: bool) -> f64 {
+        let tick = self.tick_size;
+        if tick <= 0.0 {
+            return price;
+        }
+        // The tolerance scales with the step count — a fixed 1e-9 sinks below
+        // a float's own error once price / tick nears 1e8 — and is capped well
+        // under half a step, so it never turns a ceil or floor into a round.
+        let x = price / tick;
+        let eps = (1e-9 * x.abs().max(1.0)).min(1e-3);
+        let steps = if up {
+            (x - eps).ceil()
+        } else {
+            (x + eps).floor()
+        };
+        quantize(steps, tick)
+    }
+
+    /// The quantity of one lot: one step.
+    pub fn lot(&self) -> f64 {
+        self.step_size
+    }
+
+    /// USDT notional of one lot at `price`. Linear USDT contracts: a unit of
+    /// quantity is worth its price, with no multiplier between them.
+    pub fn lot_value(&self, price: f64) -> f64 {
+        price * self.step_size
+    }
+
+    /// The last trade price, 0 while none is known.
+    pub fn last(&self) -> f64 {
+        self.last_price.unwrap_or(0.0)
+    }
+
+    /// The market's prices are current: its trade stream is alive.
+    pub fn fresh(&self) -> bool {
+        self.feed_fresh
+    }
+
+    /// A limit `spread` through the book: below the bid for a sale, above the
+    /// ask for a purchase, the last price standing in for a missing side.
+    /// `None` without any price.
+    pub fn marketable(&self, sell: bool, spread: f64) -> Option<f64> {
+        let side = if sell { self.bid } else { self.ask };
+        let base = side.filter(|p| *p > 0.0).unwrap_or(self.last());
+        if base <= 0.0 {
+            return None;
+        }
+        let raw = base * if sell { 1.0 - spread } else { 1.0 + spread };
+        Some(self.snap(raw, !sell))
+    }
+
+    /// The band `PERCENT_PRICE` allows a limit in: the mark price times
+    /// `multiplierDown` / `multiplierUp`. `None` while the mark or the
+    /// multipliers are unknown.
+    pub fn band(&self) -> Option<(f64, f64)> {
+        let mark = self.mark_price.filter(|p| *p > 0.0)?;
+        (self.multiplier_down > 0.0 && self.multiplier_up > 0.0).then(|| {
+            (
+                self.snap(mark * self.multiplier_down, true),
+                self.snap(mark * self.multiplier_up, false),
+            )
+        })
+    }
+
+    /// `price` pinned inside the band, unchanged while the band is unknown.
+    pub fn within_limits(&self, price: f64) -> f64 {
+        match self.band() {
+            Some((down, up)) => price.clamp(down, up),
+            None => price,
+        }
+    }
+}
+
+/// `price` at the nearest multiple of `tick` (unchanged for a zero tick).
+pub fn round_tick(price: f64, tick: f64) -> f64 {
+    if tick <= 0.0 {
+        return price;
+    }
+    quantize((price / tick).round(), tick)
+}
+
+/// `value` as the exchange must read it on a grid of `step`: rounded to the
+/// grid and printed at the step's decimals (`0.001` → `"0.016"`), never in
+/// an exponent and never with a float's tail.
+pub fn on_grid(value: f64, step: f64) -> String {
+    let d = decimals_of(step).max(0) as usize;
+    format!("{:.*}", d, round_tick(value, step))
+}
+
+/// `steps × tick` printed clean at the tick's decimals.
+fn quantize(steps: f64, tick: f64) -> f64 {
+    let scale = 10f64.powi(decimals_of(tick));
+    (steps * tick * scale).round() / scale
+}
+
 /// Why a notional could not become an order size. Every arm carries the numbers
 /// the journal line needs, so the refusal can be read without re-deriving it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -612,6 +724,52 @@ impl Catalog {
     /// Markets open for trading right now.
     pub fn trading(&self) -> impl Iterator<Item = &Market> {
         self.markets.iter().filter(|m| m.trading)
+    }
+
+    /// Whether the trade stream of `symbol` is alive (`stream_health`).
+    pub fn set_feed_fresh(&mut self, symbol: &str, fresh: bool) {
+        if let Ok(i) = self
+            .markets
+            .binary_search_by(|m| m.symbol.as_str().cmp(symbol))
+        {
+            self.markets[i].feed_fresh = fresh;
+        }
+    }
+
+    /// The last trade of `symbol`, from the tape: what orders read as the
+    /// market's price (`Market::last`). The startup value is the 24-hour
+    /// ticker's; from the first trade on it is live.
+    pub fn set_last(&mut self, symbol: &str, price: f64) {
+        if !(price.is_finite() && price > 0.0) {
+            return;
+        }
+        if let Ok(i) = self
+            .markets
+            .binary_search_by(|m| m.symbol.as_str().cmp(symbol))
+        {
+            self.markets[i].last_price = Some(price);
+        }
+    }
+
+    /// A catalog of these markets, for tests that need no `exchangeInfo`.
+    #[cfg(test)]
+    pub(crate) fn of(mut markets: Vec<Market>) -> Self {
+        markets.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        Self {
+            markets,
+            ..Self::default()
+        }
+    }
+
+    /// A market to change in place, for tests: the symbol must stay as it is,
+    /// or [`Catalog::get`] loses it.
+    #[cfg(test)]
+    pub(crate) fn get_mut(&mut self, symbol: &str) -> Option<&mut Market> {
+        let i = self
+            .markets
+            .binary_search_by(|m| m.symbol.as_str().cmp(symbol))
+            .ok()?;
+        Some(&mut self.markets[i])
     }
 
     pub fn get(&self, symbol: &str) -> Option<&Market> {
@@ -1062,6 +1220,7 @@ fn market_of(s: &SymbolInfo) -> Market {
         ask: None,
         mark_price: None,
         funding: None,
+        feed_fresh: true,
     };
     for f in &s.filters {
         match f {
@@ -1199,6 +1358,7 @@ mod tests {
             ask: None,
             mark_price: None,
             funding: None,
+            feed_fresh: true,
         }
     }
 
