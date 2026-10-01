@@ -991,6 +991,13 @@ impl Handler for CoreHandler {
     fn on_connected(&mut self, session: &mut Session) {
         log::info!("client {:#x} connected", session.client_id());
         session.send_encrypted(UI, &ui::runtime_state(rand_uid(), true, false), true);
+        // A core pushes its Telegram state on connect (moonproto
+        // `docs/telegram.md`); the terminal asks for it only on a reconnect.
+        session.send_encrypted(
+            UI,
+            &ui::telegram_state(rand_uid(), TELEGRAM_UNSUPPORTED),
+            true,
+        );
         let running = self.strategies.running();
         session.send_encrypted(STRAT, &strat::runtime_state(rand_uid(), running), true);
     }
