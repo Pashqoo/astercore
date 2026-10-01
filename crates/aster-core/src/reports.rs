@@ -406,12 +406,12 @@ impl Reports {
         self.rows.get(&rec_id)
     }
 
-    /// The broker commission of one exchange order of `order_id`'s deal; the
+    /// The exchange commission of one exchange order of `order_id`'s deal; the
     /// row when it changed. A closed row's profit is net of it.
-    pub fn add_commission(&mut self, order_id: u64, exchange_id: &str, rub: f64) -> Option<&Row> {
+    pub fn add_commission(&mut self, order_id: u64, exchange_id: &str, usdt: f64) -> Option<&Row> {
         let rec_id = *self.by_order.get(&order_id)?;
         let mut row = self.rows.get(&rec_id)?.clone();
-        row.commissions.insert(exchange_id.to_owned(), rub);
+        row.commissions.insert(exchange_id.to_owned(), usdt);
         let total: f64 = row.commissions.values().sum();
         if row.closed && row.spent > 0.0 {
             row.profit += row.commission - total;

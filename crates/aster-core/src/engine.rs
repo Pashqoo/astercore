@@ -48,9 +48,14 @@ use crate::prices::Snapshot;
 use crate::reports::{self, Deal, Profit, Reports};
 use crate::strategies::Strategies;
 use crate::stream_health::{Scope, StreamHealth, SUMMARY_EVERY_MS};
+use crate::tape::Tape;
 use crate::trades_stream::TradesStream;
 use crate::trading::{Grid, OrderUpdate, TradeCommand, TradingEvent};
 use crate::windows::Windows;
+
+#[path = "engine_ops.rs"]
+mod ops;
+use ops::{DealNote, EntryNote, Ops};
 
 pub const SERVER_NAME: &str = "Astercore";
 pub const EXCHANGE_NAME: &str = "Aster";
@@ -271,6 +276,11 @@ pub struct CoreHandler {
     /// the report; with the trade ids already summed, so an event heard twice
     /// is counted once.
     commissions: HashMap<(String, String), (f64, HashSet<i64>)>,
+    /// The operator's side: settings, the chat, the deals on their way to it
+    /// (`engine_ops.rs`).
+    ops: Ops,
+    /// The prints the core heard itself, for the deals' pictures.
+    tape: Tape,
 }
 
 /// Per strategy: trades in the emulator, and its Sessions rule.
@@ -346,6 +356,8 @@ impl CoreHandler {
             black_list: (HashSet::new(), Vec::new()),
             settings_at: 0,
             commissions: HashMap::new(),
+            ops: Ops::new(crate::settings::DEFAULT_PATH.into()),
+            tape: Tape::default(),
         }
     }
 
@@ -682,10 +694,9 @@ impl CoreHandler {
                     self.catalog.set_last(&symbol, price);
                     self.windows.push(idx, time_ms, price, qty);
                     let turnover = price * qty.abs();
-                    if self
-                        .shots
-                        .on_trade(idx, now_ms(), price, turnover, qty > 0.0)
-                    {
+                    let now = now_ms();
+                    self.tape.push(idx, now, time_ms, price as f32, qty as f32);
+                    if self.shots.on_trade(idx, now, price, turnover, qty > 0.0) {
                         self.shots_due = true;
                     }
                     self.emulate_fills(&symbol, Some(price));
@@ -853,6 +864,11 @@ impl CoreHandler {
                 request_uid,
                 result,
             } => {
+                // The core's own request: the chat's `/chart` or a deal's
+                // picture, never a terminal session.
+                if client_id == crate::control::CLIENT_ID {
+                    return self.on_control_candles(request_uid, result);
+                }
                 let Some(s) = sessions.iter_mut().find(|s| s.client_id() == client_id) else {
                     return;
                 };
@@ -875,6 +891,9 @@ impl CoreHandler {
                 request_uid,
                 result,
             } => {
+                if client_id == crate::control::CLIENT_ID {
+                    return self.on_control_history(request_uid, result);
+                }
                 let Some(s) = sessions.iter_mut().find(|s| s.client_id() == client_id) else {
                     return;
                 };
@@ -1203,6 +1222,7 @@ impl CoreHandler {
             ui::CMD_SHARED_CONFIG => {
                 if let Some(blob) = ui::shared_config_blob(payload) {
                     self.shared_config = blob.to_vec();
+                    self.read_terminal_shots();
                 }
                 let resp = ui::shared_config_payload(rand_uid(), &self.shared_config);
                 session.send_encrypted(UI, &resp, true);
@@ -1761,11 +1781,6 @@ impl CoreHandler {
         }
     }
 
-    /// The terminal asked the core to leave, and it agreed.
-    pub fn shutdown_requested(&self) -> bool {
-        self.shutdown_requested
-    }
-
     /// Positions of the core still open: a filled entry, with its exit live or
     /// not yet placed. Emulated ones hold no money.
     fn open_positions(&self) -> usize {
@@ -1864,7 +1879,15 @@ impl CoreHandler {
 
     /// The last thing the core does: the orders on disk for the next start.
     pub fn finish(&mut self) {
-        self.persist_orders(true, now_ms());
+        let now = now_ms();
+        self.persist_orders(true, now);
+        let live = self
+            .orders
+            .iter()
+            .filter(|o| !trade::status::is_terminal(o.status))
+            .count();
+        log::info!("stopped: {live} live order(s) saved");
+        self.farewell(now, live);
     }
 
     /// «Move all» (Order opcode 11) of one leg on a market (TInvestCore, as
@@ -2118,6 +2141,25 @@ impl CoreHandler {
                     self.api_errors.push_back(now);
                 }
                 let order = action.order();
+                // The exchange's own refusal, deduplicated by market and code:
+                // one market can be refused every minute for an hour. A rate
+                // limit refused nothing about the order.
+                if definitive && !moonshot::rate_limited(&msg) {
+                    let symbol = self
+                        .orders
+                        .get(order)
+                        .map_or("?".to_string(), |o| o.uid.clone());
+                    let code = msg
+                        .split_once('/')
+                        .and_then(|(_, rest)| rest.split(':').next())
+                        .unwrap_or("?")
+                        .to_string();
+                    self.tg_keyed(
+                        crate::telegram::Kind::Refusal,
+                        format!("{symbol} {code}"),
+                        format!("⚠️ {symbol}: order refused — {msg}"),
+                    );
+                }
                 let mut fx = self.orders.failed(&action, definitive, &msg, now);
                 fx.extend(self.market_closed(&action, &msg));
                 if !fx.logs.is_empty() || !fx.changed.is_empty() {
@@ -2177,6 +2219,8 @@ impl CoreHandler {
         self.cap_to_band(&mut fx);
         self.orders.note_moves(&fx.changed, now);
         let mut reported = false;
+        let mut opened: Vec<EntryNote> = Vec::new();
+        let mut closed: Vec<DealNote> = Vec::new();
         let rules = self.guard_rules();
         for &id in &fx.changed {
             let Some(o) = self.orders.get(id) else {
@@ -2195,6 +2239,34 @@ impl CoreHandler {
                 let row = row.clone();
                 let rule = rule_of(&rules, &row);
                 fx.logs.extend(self.guards.book(&row, rule, now));
+                // The entry is whole (BUY_DONE, or SELL_SET once its exit is
+                // on): MoonBot announces a position, not a partial fill.
+                if !row.closed
+                    && !row.deleted
+                    && matches!(o.status, trade::status::BUY_DONE | trade::status::SELL_SET)
+                {
+                    opened.push(EntryNote {
+                        rec_id: row.rec_id,
+                        ordered: record.buy.quantity,
+                    });
+                }
+                if row.closed && !row.deleted {
+                    let fees = if o.emulator || self.trading.is_none() {
+                        0
+                    } else {
+                        o.filled_orders().len()
+                    };
+                    closed.push(DealNote {
+                        rec_id: row.rec_id,
+                        fees,
+                        due: now + ops::DEAL_SETTLE_MS,
+                        deadline: now + ops::DEAL_FEE_WAIT_MS,
+                        stop: record.stop.map(|(price, _)| price),
+                        take: record.take_profit,
+                        entry_moves: o.moves(Leg::Buy).to_vec(),
+                        exit_moves: o.moves(Leg::Sell).to_vec(),
+                    });
+                }
                 // The commission the user stream has already reported for
                 // this deal's exchange orders.
                 if row.closed && !o.emulator {
@@ -2202,12 +2274,22 @@ impl CoreHandler {
                 }
             }
         }
+        for note in opened {
+            self.note_entry(&note);
+        }
+        for note in closed {
+            self.note_deal(note);
+        }
         if reported {
             self.push_profit(now);
             self.check_auto_stop(now);
         }
         for text in fx.logs {
             log::info!("{text}");
+            // The auto-stop and the market panic are the chat's alarms too.
+            if text.starts_with("AutoStop:") || text.starts_with("AutoStart:") {
+                self.tg(crate::telegram::Kind::Alarm, format!("⛔ {text}"));
+            }
             self.outbox.push((LOG, log_msg(now, &text)));
         }
         // An emulated order's work goes to the emulator (`run_emulator`),
@@ -2406,6 +2488,20 @@ impl CoreHandler {
                     let payload =
                         strat::detect_signal(rand_uid(), &market, strategy_id, is_short, &msg);
                     self.outbox.push((STRAT, payload));
+                    // Off by default, as in MoonBot: a detect a second would
+                    // drown the deals the chat is actually for.
+                    if self
+                        .strategies
+                        .flag(strategy_id, crate::strategies::REPORT_DETECTS)
+                        == Some(true)
+                    {
+                        let side = if is_short { "SHORT" } else { "LONG" };
+                        let label = self.strategy_label(strategy_id);
+                        self.tg(
+                            crate::telegram::Kind::Detect,
+                            format!("🔎 {market} {side} · {label}\n{msg}"),
+                        );
+                    }
                     continue;
                 }
                 Cmd::Log(text) => Effects {
@@ -2494,6 +2590,7 @@ impl CoreHandler {
         self.outbox
             .push((STRAT, strat::runtime_state(rand_uid(), true)));
         let text = format!("AutoStart: {what} back below the level: strategies started");
+        self.tg(crate::telegram::Kind::Alarm, format!("▶️ {text}"));
         log::info!("{text}");
         self.outbox.push((LOG, log_msg(now, &text)));
     }
@@ -2570,7 +2667,8 @@ impl CoreHandler {
         let Ok(fee) = o.commission.parse::<f64>() else {
             return;
         };
-        if !fee.is_finite() || fee == 0.0 {
+        // A zero fee is an answer too: the deal waits for every one of them.
+        if !fee.is_finite() {
             return;
         }
         if !o.commission_asset.is_empty() && o.commission_asset != QUOTE {
@@ -2587,10 +2685,18 @@ impl CoreHandler {
             // the report already holds. A fee of one of those arriving after
             // this would book that exchange order's later part alone — a rare
             // error against unbounded growth.
+            // And of the deals still on their way to the chat, which wait
+            // for exactly these fees.
+            let waiting: HashSet<u64> = self
+                .ops
+                .deal_notes
+                .iter()
+                .filter_map(|n| self.reports.row(n.rec_id).map(|r| r.task_id))
+                .collect();
             let live: HashSet<(String, String)> = self
                 .orders
                 .iter()
-                .filter(|o| !trade::status::is_terminal(o.status))
+                .filter(|o| !trade::status::is_terminal(o.status) || waiting.contains(&o.id))
                 .flat_map(|o| {
                     let symbol = o.uid.clone();
                     o.filled_orders()

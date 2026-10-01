@@ -430,15 +430,18 @@ impl FedCore {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let thread = thread::spawn(move || {
+            // Built here: its receiver stays with the loop that drains it.
+            let control = aster_core::control::Control::new();
             let mut stopping = false;
             while !flag.load(Ordering::Relaxed) {
                 server.step();
                 let (h, sessions) = server.split();
                 h.pump(sessions, &ev_rx);
-                // What `main` does once the terminal's shutdown is agreed:
-                // the stop sweeps the entries (and keeps serving here, so the
-                // test can watch it).
-                if h.shutdown_requested() && !stopping {
+                h.run_control(&control);
+                // What `main` does once a halt is asked for (the terminal's
+                // shutdown among them): the stop sweeps the entries (and
+                // keeps serving here, so the test can watch it).
+                if control.halted().is_some() && !stopping {
                     stopping = true;
                     h.begin_stop(now_ms());
                 }

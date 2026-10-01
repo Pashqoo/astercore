@@ -3572,9 +3572,9 @@ fn filter_counts(
 }
 
 /// The trader's clock, which MoonBot reads its work windows on (the
-/// terminal's auto-start window, `WorkingTime`): Moscow, UTC+3, as in
-/// TInvestCore — the venue's UTC would shift every window by three hours.
-const TRADER_UTC_OFFSET_MS: i64 = 3 * 3_600_000;
+/// terminal's auto-start window, `WorkingTime`) — the venue's UTC would shift
+/// every window by three hours.
+const TRADER_UTC_OFFSET_MS: i64 = crate::clock::TRADER_OFFSET_MS;
 
 /// A time window of the day on the trader's clock, minutes since
 /// midnight, or of the hour, minutes past it; `from > to` wraps over

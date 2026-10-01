@@ -17,8 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aster_core::account;
+use aster_core::api_meter::{self, ApiMeter};
 use aster_core::aster::rest::Rest;
 use aster_core::aster::sign::{Credentials, LoadError, Network, Signer};
+use aster_core::control::{self, Control};
 use aster_core::engine::{self, CoreHandler, FeedLink};
 use aster_core::feed;
 use aster_core::key_store;
@@ -27,10 +29,12 @@ use aster_core::model::{Catalog, QUOTE};
 use aster_core::order_store::OrderStore;
 use aster_core::prices;
 use aster_core::reports::Reports;
+use aster_core::settings;
 use aster_core::stderr_log;
 use aster_core::strategies::Strategies;
 use aster_core::stream_health::StreamHealth;
 use aster_core::trading;
+use aster_core::{telegram, web};
 use moonproto::server::codec::engine as engine_codec;
 use moonproto::server::Server;
 
@@ -54,10 +58,54 @@ const EMULATOR_ORDERS_FILE: &str = "data/orders-emulator.json";
 /// The strategy list as MoonBot text (`strategy_file.rs`) and the trade
 /// reports (`reports.rs`), beside it.
 const STRATEGIES_FILE: &str = "data/strategies.txt";
+/// A day of request counters and round trips for the page's API tab.
+/// Telemetry and nothing else: losing it costs a chart.
+const API_METER_FILE: &str = "data/api_meter.json";
+/// How often the counters go to disk.
+const METER_SAVE: Duration = Duration::from_secs(60);
+/// The link line's heartbeat: `/fapi/v1/time` (weight 1) this often, whatever
+/// else the core is doing — that call *is* the line (`api_meter`), and ten
+/// seconds keeps its connection warm (TInvestCore measured the cold one as a
+/// different number).
+const PING_HEARTBEAT: Duration = Duration::from_secs(10);
 const REPORTS_FILE: &str = "data/reports.jsonl";
 
 fn main() -> ExitCode {
     stderr_log::init();
+    // `data/config.json`: the page, the chat, the journal. A file that exists
+    // and does not read is a refusal to start, not an empty start — its
+    // fields decide whether the page asks for a password.
+    let settings = match settings::load_or_create(settings::DEFAULT_PATH, &settings::from_env()) {
+        Ok(loaded) => {
+            stderr_log::set_level(&loaded.settings.log_level);
+            stderr_log::set_keep_days(loaded.settings.log_keep_days);
+            if loaded.created {
+                log::info!("config: {} created", settings::DEFAULT_PATH);
+            }
+            for var in &loaded.ignored_env {
+                log::warn!(
+                    "config: {var} differs from {} and is ignored; change it there",
+                    settings::DEFAULT_PATH
+                );
+            }
+            loaded.settings
+        }
+        Err(e) => {
+            eprintln!("config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Every REST call of the process counts into it from the first one on.
+    let meter = ApiMeter::new(Some(API_METER_FILE.into()));
+    // Aster prices one call by count: `ORDERS` 1200 a minute, the new orders
+    // (`exchangeInfo.rateLimits`, measured 01.10); the weight and the 10 s
+    // order window are the exchange's own gauges on the page.
+    meter.set_tariff(vec![api_meter::TariffGroup {
+        methods: vec!["POST /fapi/v3/order".into()],
+        per_minute: 1200,
+        per_second: None,
+    }]);
+    api_meter::set_global(Arc::clone(&meter));
 
     let port = std::env::var("ASTER_CORE_PORT")
         .ok()
@@ -322,12 +370,26 @@ fn main() -> ExitCode {
         })
         .collect();
     let now = engine::now_ms();
+    // The account as the page and the chat name it.
+    let account_label = account.as_ref().map_or_else(
+        || "none (emulator only)".to_string(),
+        |(_, s, _)| format!("{} {}", s.network().name(), short(s.credentials().signer())),
+    );
+    // The control queue is built before the handler: the Telegram poller and
+    // the page each hold a sender of it and nothing else of the core's.
+    let control = Control::new();
+    let reporter = telegram::start(&settings, control.sender());
+    web::start(&settings, control.sender(), Some(Arc::clone(&meter)));
+    start_meter(Arc::clone(&meter));
     let handler = CoreHandler::new(
         1,
         engine::ACCOUNT_PLACEHOLDER.to_string(),
         cat,
         Strategies::new(Some(PathBuf::from(STRATEGIES_FILE)), now),
     )
+    .with_settings(settings, PathBuf::from(settings::DEFAULT_PATH))
+    .with_telegram(reporter)
+    .with_account_label(account_label)
     .with_reports(Reports::open(Some(PathBuf::from(REPORTS_FILE)), now));
     // The order store with or without an account: a core without one runs
     // its strategies in the emulator, and a restart must resume them.
@@ -373,11 +435,19 @@ fn main() -> ExitCode {
         engine::SERVER_NAME,
         engine::EXCHANGE_CODE
     );
+    // The signal handlers go up here, not earlier: until the loop below runs
+    // nobody would notice the flag, and a `systemctl stop` during the start
+    // would be swallowed instead of killing the process.
+    control::install_signals();
+    {
+        let (handler, _) = server.split();
+        handler.announce();
+    }
 
     // Every way out of THIS LOOP goes through the stop below: the entries are
-    // withdrawn, the terminals told, the orders written. A signal does not
-    // come through here at all yet — SIGINT/SIGTERM end the process at once,
-    // and the entries stay with the exchange (`PLAN.md`, M4: signals).
+    // withdrawn, the terminals told, the orders written. The exit code is the
+    // supervisor's to read: 0 a stop that was asked for (the page, the
+    // terminal, a signal), 70 a restart it is meant to undo, 1 a failure.
     let code = loop {
         server.step();
         // A dead refresher would leave its prices frozen, and nothing else in
@@ -394,8 +464,10 @@ fn main() -> ExitCode {
             log::error!("feed: the market feed is gone — the tape and books would freeze");
             break ExitCode::FAILURE;
         }
-        if handler.shutdown_requested() {
-            break ExitCode::SUCCESS;
+        handler.run_control(&control);
+        if let Some(halt) = control.halted() {
+            log::info!("exit {} ({})", halt.code(), halt.name());
+            break ExitCode::from(halt.code());
         }
         let mut gone = false;
         for _ in 0..APPLY_BATCH {
@@ -424,11 +496,43 @@ fn main() -> ExitCode {
     flush_sessions(&mut server, &ev_rx);
     let (handler, _) = server.split();
     handler.finish();
+    // The last minute of counters, after everything that matters is on disk.
+    meter.save();
     // A shutdown that left orders with the exchange did not end cleanly.
     if clean {
         code
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// The counters' own thread: the link line's heartbeat and the window to
+/// disk. Neither belongs in the trading loop — one is a request, one a file.
+fn start_meter(meter: Arc<ApiMeter>) {
+    let spawned = std::thread::Builder::new()
+        .name("api-meter".into())
+        .spawn(move || {
+            let mut rest = Rest::new();
+            let (mut next_save, mut next_ping) = (Instant::now() + METER_SAVE, Instant::now());
+            loop {
+                if Instant::now() >= next_ping {
+                    // The answer is thrown away: the round trip is what was
+                    // asked for, and the call has counted itself.
+                    let _ = rest.server_time();
+                    // From the answer, not from the deadline: a beat that
+                    // waited for a dead gateway must not be followed by a
+                    // burst catching up on it.
+                    next_ping = Instant::now() + PING_HEARTBEAT;
+                }
+                if Instant::now() >= next_save {
+                    meter.save();
+                    next_save = Instant::now() + METER_SAVE;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("api meter: the thread did not start: {e}; no ping line, no history on disk");
     }
 }
 

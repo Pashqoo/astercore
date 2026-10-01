@@ -21,6 +21,7 @@ use super::json::{
     ListenKey, OrderReply, PositionRisk, PremiumIndex, ServerTime, Ticker24h,
 };
 use super::sign::{Network, Signer};
+use crate::api_meter::{self, Call};
 
 pub const BASE: &str = "https://fapi.asterdex.com";
 
@@ -401,7 +402,11 @@ impl Rest {
         let body = self.sign(signer, path, query)?;
         let url = format!("{}{path}", self.network.rest_base());
         const FORM: &str = "application/x-www-form-urlencoded";
-        self.exchange(path, |agent| match method {
+        let verb = match method {
+            Method::Post => "POST",
+            Method::Delete => "DELETE",
+        };
+        self.exchange(verb, path, |agent| match method {
             Method::Post => agent
                 .post(&url)
                 .header("Accept", "application/json")
@@ -440,7 +445,7 @@ impl Rest {
     }
 
     fn fetch<T: DeserializeOwned>(&mut self, url: &str, path: &str) -> Result<T, Error> {
-        self.exchange(path, |agent| {
+        self.exchange("GET", path, |agent| {
             agent.get(url).header("Accept", "application/json").call()
         })
     }
@@ -448,9 +453,12 @@ impl Rest {
     /// One call made by `send`, its answer metered, checked and decoded.
     fn exchange<T: DeserializeOwned>(
         &mut self,
+        verb: &str,
         path: &str,
         send: impl FnOnce(&Agent) -> Result<Response<Body>, ureq::Error>,
     ) -> Result<T, Error> {
+        let meter = api_meter::global();
+        let key = format!("{verb} {path}");
         let sent = Instant::now();
         let sending = send(&self.agent);
         // The elapsed time of the one exchange, whatever came of it: a refusal
@@ -465,11 +473,60 @@ impl Rest {
             }
             Err(e) => {
                 self.last_rtt = None;
+                if let Some(m) = meter {
+                    m.note_now(
+                        &key,
+                        Call::Err {
+                            rtt_ms: rtt.as_millis() as i64,
+                        },
+                    );
+                }
                 return Err(e.into());
             }
         };
 
-        self.note_usage(&resp);
+        let figures = Self::usage_of(&resp);
+        self.note_usage(figures);
+        let status = resp.status().as_u16();
+        if let Some(m) = meter {
+            let rtt_ms = rtt.as_millis() as i64;
+            let call = if (200..300).contains(&status) {
+                Call::Ok { rtt_ms }
+            } else {
+                Call::Err { rtt_ms }
+            };
+            m.note_now(&key, call);
+            // This answer's own figures: a remembered one could carry the
+            // last minute's count into the next.
+            m.note_usage(
+                now_ms(),
+                [figures.weight_1m, figures.orders_1m, figures.orders_10s],
+            );
+            // 429 (over a limit) and 418 (banned for ignoring one) name how
+            // long to wait. Said here, once, for every caller; the waiting is
+            // each caller's own (`feed.rs` pauses its REST worker and its
+            // warm-up on these codes). Not a gate on the whole process: an
+            // exit or a cancel must still go out while a warm-up is told to
+            // wait — the order calls have their own budget (`ORDERS`).
+        }
+        if matches!(status, 418 | 429) {
+            // At most one line a few seconds: a burst of refusals is one
+            // event, and the journal is read by a person.
+            static SAID_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let now = now_ms();
+            let said = SAID_AT.load(std::sync::atomic::Ordering::Relaxed);
+            if now - said >= 5_000 {
+                SAID_AT.store(now, std::sync::atomic::Ordering::Relaxed);
+                let after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("?")
+                    .trim()
+                    .to_string();
+                log::warn!("{key}: HTTP {status}, Retry-After {after} s");
+            }
+        }
         let resp = Self::check_status(resp)?;
         let text = resp
             .into_body()
@@ -478,23 +535,32 @@ impl Rest {
         serde_json::from_str(&text).map_err(|e| Error::Decode(format!("{path}: {e}")))
     }
 
-    fn note_usage(&mut self, resp: &Response<Body>) {
+    /// What one answer's headers say this IP has spent.
+    fn usage_of(resp: &Response<Body>) -> Usage {
         let head = |name: &str| {
             resp.headers()
                 .get(name)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<i64>().ok())
         };
+        Usage {
+            weight_1m: head("x-mbx-used-weight-1m"),
+            orders_1m: head("x-mbx-order-count-1m"),
+            orders_10s: head("x-mbx-order-count-10s"),
+        }
+    }
+
+    fn note_usage(&mut self, seen: Usage) {
         // Each header is kept only when this answer carried it: overwriting a
         // known figure with `None` would read as "spent nothing" on the next
         // look, which is the opposite of what a missing header means.
-        if let Some(v) = head("x-mbx-used-weight-1m") {
+        if let Some(v) = seen.weight_1m {
             self.usage.weight_1m = Some(v);
         }
-        if let Some(v) = head("x-mbx-order-count-1m") {
+        if let Some(v) = seen.orders_1m {
             self.usage.orders_1m = Some(v);
         }
-        if let Some(v) = head("x-mbx-order-count-10s") {
+        if let Some(v) = seen.orders_10s {
             self.usage.orders_10s = Some(v);
         }
     }

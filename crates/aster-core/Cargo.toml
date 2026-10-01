@@ -28,8 +28,13 @@ sha3 = "0.10"
 # Already in the tree under `k256`; wipes the key file's text after parsing.
 zeroize = "1"
 
-# No `libc` yet. TInvestCore carries it so that `systemctl stop` is the same
-# graceful stop as its web page's button — this core has neither a stop path nor
-# a page, and a dependency whose comment promises behaviour the tree lacks is
-# the inherited-but-now-wrong case the project's own rules name. It comes back
-# with the signal handling in M4.
+# Deflate and CRC32 for the deal charts the core draws itself (`chart.rs`);
+# already in the tree through ureq. TInvestCore's, as is.
+flate2 = "1"
+# The glyphs of those charts, from `assets/Go-Mono.ttf`.
+ab_glyph = "0.2"
+
+# Signals only (M4): `systemctl stop` must be the same graceful stop as the web
+# page's button. Already in the tree — moonproto takes it for the same reason.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

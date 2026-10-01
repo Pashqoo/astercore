@@ -1,0 +1,40 @@
+# The core as a systemd service, for the host decided on in `PLAN.md`
+# («Открытые решения» п. 6). Installed by hand into
+# /etc/systemd/system/aster-core.service; kept here so the exit codes and the
+# unit that reads them never drift apart (ported from TInvestCore's):
+#
+#   0  — the core was asked to stop (the web page, the terminal's shutdown,
+#        `systemctl stop` / SIGTERM): Restart=on-failure leaves it stopped.
+#   70 — the core was asked to restart itself (the web page): a failure to
+#        systemd, so it comes back.
+#   1  — it could not start (a broken key file, a refused key, a broken
+#        config.json), a feed or the order worker died, or a stop left entry
+#        orders with the exchange: it also comes back, and the journal says why.
+#        The start limit stops the loop.
+#
+# Restart=always would undo a stop, which is why it is not that.
+[Unit]
+Description=Astercore — MoonProto core for Aster
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The directory holds aster-core.key (the terminal's key), asterkey (the API
+# wallet, mode 600), data/ and logs/ — see AGENTS.md, «## Secrets».
+WorkingDirectory=/opt/aster-core
+ExecStart=/opt/aster-core/aster-core
+Environment=ASTER_API_KEY_FILE=/opt/aster-core/asterkey
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+# One arithmetic with `STOP_WITHDRAW` in src/main.rs (30 s): the drain, then
+# the terminals' last messages (`FLUSH_WAIT`, 1 s), then `finish()` — the
+# orders.json save and the chat's 3 s (`TELEGRAM_FLUSH`, engine_ops.rs). Move
+# one and move the other, or SIGKILL lands on a core that has not saved yet.
+TimeoutStopSec=40
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

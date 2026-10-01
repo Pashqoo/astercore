@@ -1,0 +1,1535 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Astercore</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #14171c; --panel: #1b1f26; --line: #2b313b; --text: #d6dae0; --dim: #8a929e;
+    --accent: #8fb4ff; --good: #6ddba0; --bad: #ff8f8f; --warn: #ffc46b;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); margin: 0;
+         font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header { position: sticky; top: 0; z-index: 3; background: var(--bg);
+           border-bottom: 1px solid var(--line); }
+  .top { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: baseline; padding: 10px 16px 8px; }
+  h1 { font-size: 14px; margin: 0; color: var(--accent); font-weight: 600; }
+  nav { display: flex; flex-wrap: wrap; gap: 2px; padding: 0 12px; }
+  nav button { background: none; border: 1px solid transparent; border-bottom: 0;
+               border-radius: 6px 6px 0 0; color: var(--dim); padding: 6px 14px;
+               margin-bottom: -1px; }
+  nav button:hover { color: var(--text); border-color: var(--line); }
+  nav button[aria-current="page"] { color: var(--text); background: var(--panel);
+                                    border-color: var(--line); }
+  .control { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center;
+             padding: 0 16px 10px; }
+  main { padding: 16px; max-width: 1180px; }
+  .panel { display: grid; gap: 16px; }
+  .panel[hidden] { display: none; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim);
+       margin: 0 0 10px; font-weight: 600; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  .chip { border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; color: var(--dim); }
+  .on { color: var(--good); border-color: #2f5b45; }
+  .off { color: var(--bad); border-color: #5b2f2f; }
+  .idle { color: var(--warn); border-color: #5b4a2f; }
+  button { font: inherit; padding: 7px 13px; border-radius: 6px; cursor: pointer;
+           border: 1px solid var(--line); background: #232833; color: var(--text); }
+  button:hover { border-color: var(--accent); }
+  button[disabled] { opacity: .5; cursor: default; }
+  button.go { background: #23503a; border-color: #2f6a4c; }
+  button.stop { background: #4a3520; border-color: #6b4a29; }
+  button.danger { background: #5a2626; border-color: #7a3434; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: right; padding: 3px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--dim); font-weight: 600; }
+  th:first-child, td:first-child { text-align: left; }
+  tbody tr:last-child td { border-bottom: 0; }
+  .empty { color: var(--dim); }
+  .fields { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+  label { display: grid; gap: 3px; color: var(--dim); }
+  input, select { font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line);
+                  background: #14171c; color: var(--text); width: 100%; }
+  .checks { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .checks label { display: flex; flex-direction: row; gap: 6px; align-items: center; color: var(--text); }
+  .checks input { width: auto; }
+  pre { margin: 0; max-height: 52vh; overflow: auto; white-space: pre-wrap; word-break: break-all;
+        color: #b9c0ca; font-size: 12px; }
+  .note { color: var(--dim); }
+  .err { color: var(--bad); }
+  .warn { color: var(--warn); }
+  .ok { color: var(--good); }
+  .rules { display: grid; gap: 6px; }
+  .rules div { display: flex; gap: 10px; align-items: baseline; }
+  .rules b { color: var(--text); font-weight: 600; min-width: 190px; }
+  /* The screener's table wants the whole window; every other tab reads better
+     at a column's width, so the wide one says so for itself. */
+  main.wide { max-width: none; }
+  .split { display: grid; gap: 16px; align-items: start;
+           grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
+  @media (max-width: 1100px) { .split { grid-template-columns: minmax(0, 1fr); } }
+  .scroll { max-height: 70vh; overflow: auto; }
+  .scroll thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+  /* The states of a row, and they are kept apart on purpose: a market the
+     screener and the filters both let through, one that is watched but held
+     by a filter, one that is not watched at all, and a number the windows do
+     not measure yet. */
+  tr.enters td:first-child { color: var(--good); }
+  tr.held td:first-child { color: var(--warn); }
+  tr.out td { color: var(--dim); }
+  td.refused { color: var(--bad); }
+  td.waits { color: var(--dim); font-style: italic; }
+  .card.group { padding: 10px 12px; }
+  .group h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+              color: var(--dim); margin: 0 0 8px; font-weight: 600; }
+  .group + .group { margin-top: 10px; }
+  .pairs { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  /* The API tab: one card per quota group, each a small chart of what the
+     core spent against what it may spend. */
+  .limits { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+  .limit { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .limit.over { border-color: #7a3434; }
+  .limit h3 { font-size: 12px; margin: 0; font-weight: 600; display: flex; gap: 8px; }
+  .limit h3 b { color: var(--text); font-weight: 600; }
+  .limit h3 span { color: var(--dim); font-weight: 400; margin-left: auto; }
+  .limit .methods { color: var(--dim); font-size: 11px; margin: 2px 0 4px;
+                    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  canvas { display: block; width: 100%; }
+  .bar { position: sticky; bottom: 0; z-index: 3; display: flex; flex-wrap: wrap; gap: 10px 14px;
+         align-items: center; padding: 10px 16px; background: var(--panel);
+         border-top: 1px solid var(--accent); }
+  .bar[hidden] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <h1>Astercore</h1>
+    <span id="account" class="note"></span>
+    <span id="flags" class="row"></span>
+    <span id="uptime" class="note"></span>
+    <span id="live" class="note" style="margin-left:auto"></span>
+  </div>
+  <nav id="tabs">
+    <button type="button" data-tab="trading">Trading</button>
+    <button type="button" data-tab="screen">Screener</button>
+    <button type="button" data-tab="telegram">Telegram</button>
+    <button type="button" data-tab="autostop">Auto-stop</button>
+    <button type="button" data-tab="engine">Engine</button>
+    <button type="button" data-tab="api">API</button>
+    <button type="button" data-tab="access">Access</button>
+    <button type="button" data-tab="journal">Journal</button>
+  </nav>
+  <div class="control">
+    <button type="button" id="start" class="go">Start strategies</button>
+    <button type="button" id="stop" class="stop">Stop strategies</button>
+    <button type="button" id="panic" class="danger">Panic: exit every position</button>
+    <button type="button" id="halt" class="danger">Stop the core</button>
+    <button type="button" id="restart">Restart the core</button>
+    <span id="done" class="note"></span>
+  </div>
+</header>
+
+<!-- One form across every tab: the panels are hidden, not removed, so a field
+     on another tab is still filled and still saved by the one Save below. -->
+<form id="settings" autocomplete="off">
+<main>
+
+  <section class="panel" id="tab-trading" hidden>
+    <div class="card">
+      <h2>The buttons above</h2>
+      <p class="note">
+        Stopping the core — or restarting it — withdraws every order that could open or grow a
+        position, and leaves the exits: between this process going away and the next one starting, nobody is watching
+        a fill, while a position whose stop went with it would be worse off than before. Panic
+        is still a different button — it takes the exits too, and sends the positions out. Both
+        live in the bar at the top, reachable from every tab: a panic the operator has to go
+        looking for is the wrong kind of button.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Profit</h2>
+      <div class="row" id="profit"></div>
+      <p class="note">
+        All three count a deal by when it closed, like the chat and the picture thresholds do;
+        only the window differs, and «report» is every deal <code>data/reports.jsonl</code> still
+        holds, however old. The terminal's own table keeps its own counter, which also counts the
+        positions still open — these three do not.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Positions</h2>
+      <div id="orders"></div>
+    </div>
+
+    <div class="card">
+      <h2>Strategies</h2>
+      <p class="note">Edited in the terminal; the core runs what it was given.</p>
+      <div id="strategies"></div>
+    </div>
+
+    <div class="card">
+      <h2>On start</h2>
+      <div class="fields">
+        <label>strategies when the core starts
+          <select name="start_strategies">
+            <option value="remember">remember what was running</option>
+            <option value="on">always start them</option>
+            <option value="off">always start stopped</option>
+          </select></label>
+      </div>
+      <p class="note">
+        A deploy, a crash or a reboot all end in a start. «Remember» is what the core has always
+        done — it puts back the flag the last stop left behind; «always start stopped» is the one
+        to pick when an unplanned restart should not put the strategies back on the market by
+        itself.
+      </p>
+    </div>
+  </section>
+
+  <section class="panel" id="tab-telegram" hidden>
+    <div class="card">
+      <h2>Bot</h2>
+      <div class="fields">
+        <label>token <span class="note" id="tg_set"></span>
+          <input name="telegram_token" type="password" placeholder="leave empty to keep it"></label>
+        <label>proxy <span class="note">(SOCKS5, empty = direct)</span>
+          <input name="telegram_proxy" placeholder="127.0.0.1:1080"></label>
+        <label>approved chat <span class="note">(0 = pair again by PIN)</span>
+          <input name="telegram_chat_id" inputmode="numeric"></label>
+      </div>
+      <p class="note">
+        The chat is approved by the PIN the core prints in its journal, not typed in here. On the
+        server <code>api.telegram.org</code> is reachable only through the local SOCKS5 proxy.
+      </p>
+      <div class="row">
+        <button type="button" id="forget_token" class="stop">Forget the bot token</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Reports</h2>
+      <div class="checks" id="events"></div>
+      <div class="fields" style="margin-top:10px">
+        <label>daily summary at <span class="note">(MSK)</span>
+          <input name="telegram_daily_at" placeholder="23:50"></label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Deal pictures</h2>
+      <div id="shots_source" class="note"></div>
+      <div class="checks" style="margin:8px 0">
+        <label><input type="checkbox" data-shot="may_send"> send them</label>
+        <label><input type="checkbox" data-shot="send_negative"> losing deals too</label>
+      </div>
+      <div class="fields">
+        <label>profit USDT over <input data-shot="profit_abs" inputmode="decimal"></label>
+        <label>profit % over <input data-shot="profit_pct" inputmode="decimal"></label>
+        <label>day profit USDT over <input data-shot="profit_session" inputmode="decimal"></label>
+      </div>
+      <p class="note">
+        Any armed threshold that is passed sends the picture; 0 turns that one off. The window is
+        the deal itself: a minute before the entry, half a minute after the close — not a setting,
+        and not the terminal's «time scale», which is a zoom of its own chart.
+      </p>
+    </div>
+  </section>
+
+  <section class="panel" id="tab-autostop" hidden>
+    <div class="card">
+      <h2>Now</h2>
+      <div class="row" id="stopstate"></div>
+    </div>
+    <div class="card">
+      <h2>Rules</h2>
+      <p class="note">
+        Read only: these arrive with the terminal's settings and are edited there, on its
+        «Auto start» tab. The core acts on exactly what is listed here.
+      </p>
+      <div class="rules" id="rules"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="tab-engine" hidden>
+    <div class="card">
+      <h2>Streams</h2>
+      <div class="row" id="streams"></div>
+    </div>
+    <div class="card">
+      <h2>Core</h2>
+      <div id="facts"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="tab-access" hidden>
+    <div class="card">
+      <h2>Account</h2>
+      <p class="note">
+        The account is the API wallet's key file (<code>ASTER_API_KEY_FILE</code>, <code>asterkey</code>
+        by default): the core reads it at the start and never writes it, and it is not here and never
+        will be. Another account is another key file and a restart. Whether the exchange takes the
+        key is the exchange chip in the header: without one the core trades in the emulator only.
+      </p>
+    </div>
+    <div class="card">
+      <h2>This page</h2>
+      <div class="fields">
+        <label>bind <span class="note">(needs a restart)</span>
+          <input name="web_bind"></label>
+        <label>password <span class="note" id="pw_set"></span>
+          <input name="web_password" type="password" placeholder="leave empty to keep it"></label>
+      </div>
+      <p class="note">
+        An address that is not loopback is refused without a password. Even with one, reach it
+        over an ssh tunnel: the journal below goes out through this page too. A new password
+        drops every login, this one included.
+      </p>
+    </div>
+  </section>
+
+  <section class="panel" id="tab-journal" hidden>
+    <div class="card">
+      <h2>Journal</h2>
+      <div class="row" style="margin-bottom:8px">
+        <label style="max-width:170px">log level
+          <select name="log_level">
+            <option>error</option><option>warn</option><option>info</option>
+            <option>debug</option><option>trace</option>
+          </select></label>
+        <label style="max-width:150px">keep, days
+          <input name="log_keep_days" inputmode="numeric"></label>
+        <label class="checks"><input type="checkbox" id="follow" checked> follow</label>
+        <span id="logstate" class="note"></span>
+      </div>
+      <pre id="log"></pre>
+      <p class="note">
+        The last lines of today's file in <code>logs/</code>, topped up from yesterday's. The
+        level applies at once; <code>debug</code> writes a great deal more into that file. The
+        day files are swept at the next Moscow midnight, so a number lowered by mistake can be
+        put back before anything goes.
+      </p>
+    </div>
+  </section>
+
+</main>
+
+<div class="bar" id="bar" hidden>
+  <span id="dirtystate" class="note"></span>
+  <button type="submit">Save</button>
+  <button type="button" id="revert">Revert</button>
+  <span id="saved" class="note"></span>
+</div>
+</form>
+
+<!-- Outside the settings form, and that is not a layout accident: every
+     control inside it marks the page dirty and raises the Save bar, and none
+     of these is a setting. Nothing on this tab is saved anywhere — the
+     strategy stays the terminal's to edit, and this only answers what its
+     screener would do with the numbers as they stand. -->
+<main class="panel wide" id="tab-screen" hidden>
+  <div class="card">
+    <h2>Strategy screener</h2>
+    <p class="note">
+      A strategy's own settings, loaded from the core and moved here for the asking: the table
+      is what its screener would watch and what its filters would let it enter, market by market,
+      measured right now. Nothing here is saved — move a corridor, watch the table, then type the
+      numbers you settled on into the terminal.
+      Two different questions are kept apart, because the core keeps them apart: the pool is a
+      ranking — <b>MarketTags</b> and the dynamic lists decide which markets the strategy is
+      <i>about</i> — and the filters are a gate on entering one of them. A market can be watched
+      all day and entered never.
+      <br>«Filters passed» is exactly that and no more: the screener and the Filters tab let this
+      market through right now. Whether an order actually goes out is the rest of the pass —
+      <b>MaxMarkets</b>, <b>WorkingTime</b>, the penalties, the session guards, a position already
+      open — and none of it is asked here.
+    </p>
+    <div class="row">
+      <label style="grid-auto-flow: column; align-items: center; gap: 8px">
+        strategy
+        <select id="scr_strategy" style="width: auto"></select>
+      </label>
+      <button type="button" id="scr_reset">Back to the strategy’s own settings</button>
+      <span id="scr_state" class="note" style="margin-left: auto"></span>
+    </div>
+    <div id="scr_problem" style="margin-top: 10px"></div>
+    <div id="scr_sum" class="row" style="margin-top: 10px"></div>
+  </div>
+
+  <div class="split">
+    <div class="card">
+      <h2>Markets</h2>
+      <div class="row" style="margin-bottom: 10px">
+        <input id="scr_find" placeholder="ticker" style="width: 140px">
+        <select id="scr_only" style="width: auto">
+          <option value="all">everything</option>
+          <option value="enters">watched, filters passed</option>
+          <option value="held">watched, held by a filter</option>
+          <option value="pool">watched (the pool)</option>
+          <option value="out">not watched</option>
+        </select>
+        <span id="scr_shown" class="note"></span>
+        <button type="button" id="scr_more" hidden>Show them all</button>
+      </div>
+      <div class="scroll" id="scr_table"></div>
+    </div>
+    <div id="scr_form"></div>
+  </div>
+</main>
+
+<!-- Outside the settings form for the same reason the screener is: a control
+     inside it raises the Save bar, and nothing on this tab is a setting. -->
+<main class="panel wide" id="tab-api" hidden>
+  <div class="card">
+    <h2>Round trip: the link and the orders, 24 hours</h2>
+    <p class="note" id="api_note"></p>
+    <div id="api_ping_head" class="note"></div>
+    <canvas id="api_ping" height="240"></canvas>
+  </div>
+  <div class="card">
+    <h2>Limits and calls</h2>
+    <p class="note">
+      First the exchange's own counts of what this IP spent — weight a minute and new orders a minute
+      and per ten seconds, from the answers' headers, against Aster's limits — then a card per call:
+      the line is requests a minute, the red one is what it may spend, and the strip under it marks
+      every minute that came back an error (red) or that the core did not send at all while it was
+      holding for the exchange's <code>Retry-After</code> (amber). The line is the <b>worst minute</b> behind each pixel, not an average — the ceiling
+      is per minute, and a smoothed line would hide the minute that reached it.
+    </p>
+    <div class="limits" id="api_groups"></div>
+  </div>
+</main>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const HEAD = { 'Content-Type': 'application/json', 'X-Astercore': '1' };
+const STATUS_NAMES = ['—', 'buy failed', 'buy set', 'buy cancelled', 'bought',
+                      'sell failed', 'sell set', 'sell cancelled', 'sold'];
+const TABS = ['trading', 'screen', 'telegram', 'autostop', 'engine', 'api', 'access', 'journal'];
+/* The form is only filled from the core while nobody is typing in it: a poll
+   every two seconds would otherwise take the field out from under the hand.
+   `dirty` holds the keys that were actually touched, because a Save must send
+   those and nothing else — the chat changes the same settings (its `talk`
+   flips the deal reports, a PIN pairing sets the approved chat), and a form
+   that posted every field would revert whatever happened while it was open. */
+let editing = false;
+let dirty = new Set();
+let lastStatus = null;
+let tab = 'trading';
+
+async function call(path, body) {
+  const r = await fetch(path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: HEAD,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (r.status === 401) { location.reload(); throw new Error('logged out'); }
+  const text = await r.text();
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch (e) { parsed = { text }; }
+  if (!r.ok) throw new Error((parsed && parsed.error) || ('HTTP ' + r.status));
+  return parsed;
+}
+
+function chip(text, cls) {
+  const s = document.createElement('span');
+  s.className = 'chip ' + (cls || '');
+  s.textContent = text;
+  return s;
+}
+
+function num(x, digits) {
+  return (typeof x === 'number' ? x : 0).toFixed(digits === undefined ? 2 : digits);
+}
+
+function uptime(s) {
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600);
+  const m = Math.floor(s % 3600 / 60);
+  return (d ? d + 'd ' : '') + h + 'h ' + m + 'm';
+}
+
+/* Seconds as the core holds them, printed in the largest unit they divide
+   into exactly. Never rounded: a loss window shown as «12 h» when it is
+   12 h 30 m would misstate the rule the core is running under. */
+function span(s) {
+  if (s % 3600 === 0) return (s / 3600) + ' h';
+  if (s % 60 === 0) return (s / 60) + ' min';
+  return s + ' s';
+}
+
+/* A per cent with its sign, because these thresholds are directions and one
+   printed bare reads as the opposite alarm. The sign survives the rounding —
+   a hundredth below zero still prints as negative. Exactly zero is the one
+   value that gets none: it points nowhere, and a restart band is allowed to
+   have a bound there. */
+function pct(x) {
+  return (x > 0 ? '+' : '') + num(x) + '%';
+}
+
+function table(head, rows) {
+  if (!rows.length) return '<div class="empty">none</div>';
+  const th = head.map((h) => '<th>' + h + '</th>').join('');
+  const tr = rows.map((r) => '<tr>' + r.map((c) => '<td>' + c + '</td>').join('') + '</tr>').join('');
+  return '<table><thead><tr>' + th + '</tr></thead><tbody>' + tr + '</tbody></table>';
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function show(name) {
+  tab = TABS.indexOf(name) >= 0 ? name : 'trading';
+  for (const t of TABS) $('tab-' + t).hidden = t !== tab;
+  for (const b of $('tabs').children) {
+    if (b.dataset.tab === tab) b.setAttribute('aria-current', 'page');
+    else b.removeAttribute('aria-current');
+  }
+  /* `render` below may pick a strategy and ask for its table itself; this
+     says whether it did, so the two do not put the same question twice to a
+     core that answers one screening per loop step. */
+  scrAsked = false;
+  if (lastStatus) render(lastStatus);
+  if (tab === 'journal') pollLog();
+  if (tab === 'api') pollApi();
+  /* Coming back to the tab re-measures: the numbers behind it are minutes of
+     turnover and hourly deltas, and a table left over from the last visit
+     would look exactly like a fresh one. The form is kept — only a tab that
+     has never been asked takes its settings from the strategy.
+     On the very first paint there is no status yet, so no strategy to ask
+     about: the ask bails, and the first poll's `screenPick` is what brings
+     the table. */
+  if (tab === 'screen' && !scrAsked) askScreen(!scr);
+}
+
+function render(s) {
+  lastStatus = s;
+  $('account').textContent = 'account ' + (s.account || '—') + ' · ' + s.markets + ' markets';
+  $('uptime').textContent = 'up ' + uptime(s.uptime_s);
+  const flags = $('flags');
+  flags.replaceChildren(
+    chip(s.running ? 'strategies on' : 'strategies off', s.running ? 'on' : 'off'),
+    chip(s.trading ? 'exchange' : 'emulator only', s.trading ? 'on' : 'off'),
+    chip(s.feed ? 'feed' : 'no feed', s.feed ? 'on' : 'off'),
+    chip(s.warmup_done ? 'warm' : 'warming up', s.warmup_done ? 'on' : 'idle'),
+  );
+  if (s.market_stopped) flags.append(chip('market panic', 'off'));
+  if (s.circuit_stopped) flags.append(chip('breaker: ' + s.circuit_stopped, 'off'));
+  if (s.settings.telegram_ready) flags.append(chip('telegram', 'on'));
+
+  if (tab === 'screen') screenPick(s);
+  if (tab === 'trading') renderTrading(s);
+  if (tab === 'autostop') renderAutoStop(s);
+  if (tab === 'engine') renderEngine(s);
+  if (tab === 'telegram') renderShotsSource(s);
+  if (!editing) fill(s.settings);
+}
+
+function renderTrading(s) {
+  const p = s.profit;
+  $('profit').replaceChildren(
+    chip('today ' + num(p.day_total) + ' USDT / ' + p.day_trades + ' deals',
+         p.day_total >= 0 ? 'on' : 'off'),
+    chip('last hour ' + num(p.hour_total) + ' USDT / ' + p.hour_trades + ' deals',
+         p.hour_total >= 0 ? 'on' : 'off'),
+    chip('report ' + num(p.report_total) + ' USDT / ' + p.report_trades + ' deals',
+         p.report_total >= 0 ? 'on' : 'off'),
+  );
+  $('orders').innerHTML = table(
+    ['market', 'side', 'state', 'qty', 'filled', 'entry', 'exit', 'exit filled', 'strategy'],
+    s.orders.map((o) => [
+      esc(o.market) + (o.emulator ? ' <span class="note">emu</span>' : '') +
+        (o.panic ? ' <span class="err">panic</span>' : ''),
+      o.short ? 'short' : 'long',
+      esc(STATUS_NAMES[o.status] || o.status),
+      num(o.quantity, 0), num(o.filled, 0),
+      num(o.entry_price, 4), o.exit_price ? num(o.exit_price, 4) : '—', num(o.exit_filled, 0),
+      o.strategy_id,
+    ]),
+  );
+  // The pool is what the screener watches; the filters hold entries back on
+  // part of it without taking those markets out of the pool, so both numbers
+  // are needed to read "watches 100, enters 12" as normal rather than broken.
+  $('strategies').innerHTML = table(
+    ['name', 'kind', 'checked', 'pool', 'filtered'],
+    s.strategies.map((t) => [esc(t.name), esc(t.kind),
+      t.checked ? '<span class="ok">yes</span>' : '<span class="note">no</span>',
+      t.pool,
+      t.filtered.length
+        ? `${t.filtered.reduce((n, f) => n + f.markets, 0)} <span class="note">(${
+          esc(t.filtered.map((f) => `${f.what} ${f.markets}`).join(', '))})</span>`
+        : '<span class="note">—</span>']),
+  );
+}
+
+function renderEngine(s) {
+  $('streams').replaceChildren(...(s.streams.length
+    ? s.streams.map((t) => chip(t.name, t.alive ? 'on' : 'off'))
+    : [chip('none', 'idle')]));
+  $('facts').innerHTML = table(['', 'value'], [
+    ['markets', s.markets],
+    ['market data', s.feed ? '<span class="ok">feed running</span>' : '<span class="err">no feed</span>'],
+    ['orders reach the exchange', s.trading ? '<span class="ok">yes</span>' : '<span class="err">no</span>'],
+    ['history warm-up', s.warmup_done ? '<span class="ok">done</span>' : 'running'],
+    ['strategies', s.running ? '<span class="ok">on</span>' : '<span class="note">off</span>'],
+    ['open positions of the core', s.orders.length],
+    ['uptime', uptime(s.uptime_s)],
+    ['page', esc(s.settings.web_bind) + (s.settings.web_password_set ? ' · password' : ' · no password')],
+  ]);
+}
+
+/* Ф4: while a terminal is connected its own thresholds decide, and the form
+   above is then the fallback the core falls back on when it is not. Said out
+   loud, because a form that looks live and decides nothing is a lie. */
+function renderShotsSource(s) {
+  const t = s.terminal_shots;
+  const el = $('shots_source');
+  if (!t) {
+    say(el, 'No terminal thresholds have arrived: the fields below are the ones in force.');
+    return;
+  }
+  say(el, 'The terminal’s thresholds are in force — ' +
+    (t.may_send ? 'sending' : 'not sending') +
+    ', profit USDT > ' + num(t.profit_abs) +
+    ', profit % > ' + num(t.profit_pct) +
+    ', day profit USDT > ' + num(t.profit_session) +
+    (t.send_negative ? ', losing deals too' : ', winners only') +
+    '. The fields below decide only while no terminal has sent its config.', 'ok');
+}
+
+function rule(text, value) {
+  const d = document.createElement('div');
+  const b = document.createElement('b');
+  b.textContent = text;
+  const v = document.createElement('span');
+  v.textContent = value;
+  d.append(b, v);
+  return d;
+}
+
+function renderAutoStop(s) {
+  const state = $('stopstate');
+  state.replaceChildren(
+    chip(s.running ? 'strategies on' : 'strategies off', s.running ? 'on' : 'off'),
+    chip(s.market_stopped ? 'stopped by a market panic' : 'no market panic',
+         s.market_stopped ? 'off' : 'on'),
+    chip(s.circuit_stopped ? 'breaker: ' + s.circuit_stopped : 'no breaker tripped',
+         s.circuit_stopped ? 'off' : 'on'),
+  );
+
+  const a = s.auto_stop, out = [];
+  if (a.by_trades) {
+    out.push(rule('loss over the last deals',
+      'stop when the last ' + a.by_trades.trades + ' closed deals lost more than ' +
+      num(a.by_trades.loss_usdt) + ' USDT'));
+  }
+  if (a.by_time) {
+    out.push(rule('loss over a window',
+      'stop when ' + span(a.by_time.window_s) + ' lost more than ' + num(a.by_time.loss_usdt) +
+      ' USDT over at least ' + a.by_time.min_trades + ' deals'));
+  }
+  if (a.by_trades || a.by_time) {
+    out.push(rule('on such a stop', a.sell_all
+      ? 'panic-sell every position of the core as well'
+      : 'stop the strategies only, positions stay'));
+    out.push(rule('emulator deals', a.with_emulator ? 'count towards the loss' : 'are not counted'));
+  }
+  if (a.panic_fall_pct !== null && a.panic_fall_pct !== undefined) {
+    out.push(rule('market panic, fall',
+      'panic and stop when BTC’s hourly delta falls to ' + pct(a.panic_fall_pct)));
+  }
+  if (a.panic_market_fall_pct !== null && a.panic_market_fall_pct !== undefined) {
+    out.push(rule('market panic, market',
+      'panic and stop when the markets’ mean hourly delta falls to ' + pct(a.panic_market_fall_pct)));
+  }
+  if (a.panic_rise_pct !== null && a.panic_rise_pct !== undefined) {
+    out.push(rule('market panic, rise',
+      'panic and stop when BTC’s hourly delta rises to ' + pct(a.panic_rise_pct)));
+  }
+  if (a.restart_band) {
+    out.push(rule('restart if',
+      'start again once BTC’s delta is back inside (' + pct(a.restart_band.low_pct) + ', ' +
+      pct(a.restart_band.high_pct) + ') and the market’s is above ' + pct(a.restart_band.market_min_pct)));
+  }
+  if (a.errors) out.push(rule('error breaker', circuit(a.errors, 'API errors a minute')));
+  if (a.ping) out.push(rule('ping breaker', circuit(a.ping, 'ms of median round trip')));
+
+  if (!out.length) {
+    const none = document.createElement('div');
+    none.className = 'empty';
+    none.textContent = 'The terminal has none of these switched on: nothing stops the strategies '
+      + 'by itself. The panic and stop buttons at the top of the page still do.';
+    out.push(none);
+  }
+  $('rules').replaceChildren(...out);
+}
+
+function circuit(c, unit) {
+  return 'stop at ' + c.level + ' ' + unit
+    + (c.sell_all ? ', panic-selling everything' : '')
+    + (c.restart_s === null || c.restart_s === undefined
+        ? ', and stay stopped'
+        : ', starting again after ' + span(c.restart_s));
+}
+
+const EVENTS = [['deals', 'deals'], ['detects', 'detects'], ['refusals', 'exchange refusals'],
+                ['alarms', 'alarms'], ['lifecycle', 'start / stop'], ['daily', 'daily summary']];
+
+function option(value, text) {
+  const o = document.createElement('option');
+  o.value = value;
+  o.textContent = text;
+  return o;
+}
+
+function shotInputs() { return $('settings').querySelectorAll('[data-shot]'); }
+
+function shotValue(i) {
+  if (i.type === 'checkbox') return i.checked;
+  return parseFloat(i.value) || 0;
+}
+
+function fill(v) {
+  const f = $('settings');
+  f.log_level.value = v.log_level;
+  f.log_keep_days.value = v.log_keep_days;
+  f.start_strategies.value = v.start_strategies;
+  f.telegram_daily_at.value = v.telegram_daily_at;
+  f.web_bind.value = v.web_bind;
+  f.telegram_proxy.value = v.telegram_proxy;
+  f.telegram_chat_id.value = v.telegram_chat_id;
+  $('tg_set').textContent = v.telegram_token_set ? '(set)' : '(not set)';
+  $('pw_set').textContent = v.web_password_set ? '(set)' : '(not set)';
+  if (!$('events').children.length) {
+    $('events').replaceChildren(...EVENTS.map(([key, text]) => {
+      const l = document.createElement('label');
+      const i = document.createElement('input');
+      i.type = 'checkbox'; i.dataset.event = key;
+      l.append(i, document.createTextNode(text));
+      return l;
+    }));
+  }
+  for (const i of $('events').querySelectorAll('input')) i.checked = !!v.telegram_events[i.dataset.event];
+  for (const i of shotInputs()) {
+    if (i.type === 'checkbox') i.checked = !!v.telegram_shots[i.dataset.shot];
+    else i.value = v.telegram_shots[i.dataset.shot];
+  }
+}
+
+/* What the operator touched, and nothing else. The two group fields
+   (`telegram_events`, `telegram_shots`) go whole because the core takes them
+   whole, so they are built on top of a base fetched a moment ago rather than
+   on the poll the form was filled from: a box nobody clicked then carries the
+   core's own current value, not one that is two seconds stale. A token or a
+   password left empty is not named at all — an unnamed field is one the core
+   keeps. */
+async function edit() {
+  const base = (await call('/api/status')).settings;
+  const f = $('settings');
+  const body = {};
+  const put = (key, value) => { if (dirty.has(key)) body[key] = value; };
+  put('log_level', f.log_level.value);
+  put('log_keep_days', parseInt(f.log_keep_days.value, 10) || 0);
+  put('start_strategies', f.start_strategies.value);
+  put('telegram_daily_at', f.telegram_daily_at.value);
+  put('web_bind', f.web_bind.value);
+  put('telegram_proxy', f.telegram_proxy.value);
+  put('telegram_chat_id', parseInt(f.telegram_chat_id.value, 10) || 0);
+  const events = Object.assign({}, base.telegram_events);
+  let anyEvent = false;
+  for (const i of $('events').querySelectorAll('input')) {
+    if (!dirty.has('events.' + i.dataset.event)) continue;
+    events[i.dataset.event] = i.checked;
+    anyEvent = true;
+  }
+  if (anyEvent) body.telegram_events = events;
+  const shots = Object.assign({}, base.telegram_shots);
+  let anyShot = false;
+  for (const i of shotInputs()) {
+    if (!dirty.has('shots.' + i.dataset.shot)) continue;
+    shots[i.dataset.shot] = shotValue(i);
+    anyShot = true;
+  }
+  if (anyShot) body.telegram_shots = shots;
+  if (f.telegram_token.value) body.telegram_token = f.telegram_token.value;
+  if (f.web_password.value) body.web_password = f.web_password.value;
+  return body;
+}
+
+/* ── The API tab ───────────────────────────────────────────────────────────
+   The core keeps a cell per minute per method for 24 h; this draws it. It is
+   asked for only while the tab is open, because it is the one answer on this
+   page measured in tens of kilobytes — the status poll below is not to carry
+   it. */
+let apiView = null;
+let apiBusy = false;
+
+const CSS = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+async function pollApi() {
+  if (tab !== 'api' || apiBusy) return;
+  apiBusy = true;
+  try {
+    apiView = await call('/api/metrics');
+    drawApi();
+  } catch (e) {
+    say($('api_note'), String(e.message || e), 'err');
+  } finally {
+    apiBusy = false;
+  }
+}
+
+function drawApi() {
+  const v = apiView;
+  if (!v) return;
+  const total = v.groups.reduce((a, g) => a + g.calls.reduce((x, y) => x + y, 0), 0);
+  const errors = v.groups.reduce((a, g) => a + (g.errors || []).reduce((x, y) => x + y, 0), 0);
+  const held = v.groups.reduce((a, g) => a + (g.held || []).reduce((x, y) => x + y, 0), 0);
+  if (!v.groups.length) {
+    /* No meter at all, so no heartbeat either: saying one is coming would be
+       the page promising what this core cannot do. */
+    say($('api_note'), 'No meter: the core counts no calls.');
+    say($('api_ping_head'), '');
+    $('api_ping').hidden = true;
+    $('api_groups').replaceChildren();
+    return;
+  }
+  $('api_ping').hidden = false;
+  if (!v.tariff) {
+    say($('api_note'),
+      'Only the exchange\u2019s own counts carry a ceiling: no call is priced on its own. ' +
+      total + ' request(s) in the window, ' + errors + ' of them refused, ' +
+      held + ' never sent.', 'warn');
+  } else {
+    say($('api_note'), total + ' request(s) in the window · ' + errors + ' refused · ' +
+      held + ' never sent (held for the exchange\u2019s Retry-After)');
+  }
+  drawPing(v);
+  drawGroups(v);
+}
+
+/* The minutes behind one pixel, reduced to their worst: the ceiling is per
+   minute, so an average would hide the minute that reached it. */
+function peaks(series, cols) {
+  const out = new Array(cols).fill(0);
+  const n = series.length;
+  if (!n) return out;
+  for (let i = 0; i < n; i++) {
+    const c = Math.min(cols - 1, Math.floor(i * cols / n));
+    if (series[i] > out[c]) out[c] = series[i];
+  }
+  return out;
+}
+
+/* A canvas at the width the layout gave it and the device's own pixels: a
+   chart drawn at CSS pixels on a retina screen reads as a blurred one. */
+function fit(cv, height) {
+  const width = cv.clientWidth;
+  if (width < 60) return null;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(width * dpr);
+  cv.height = Math.round(height * dpr);
+  cv.style.height = height + 'px';
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+  return { ctx: ctx, w: width };
+}
+
+function hours(ctx, x0, x1, y, label) {
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = label;
+  for (let h = 24; h >= 0; h -= 6) {
+    const x = x0 + ((24 - h) / 24) * (x1 - x0);
+    ctx.fillText(h === 0 ? 'now' : '-' + h + 'h', Math.min(x1 - 14, Math.max(x0 + 14, x)), y);
+  }
+}
+
+function grid(ctx, x0, x1, py, top, steps, line, label) {
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i <= steps; i++) {
+    const v = (top / steps) * i;
+    const y = Math.round(py(v)) + 0.5;
+    ctx.strokeStyle = line;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x0, y);
+    ctx.lineTo(x1, y);
+    ctx.stroke();
+    ctx.fillStyle = label;
+    ctx.fillText(String(Math.round(v)), x0 - 5, y);
+  }
+}
+
+/* A line with gaps: `has[i]` false leaves the pen up, because a minute nobody
+   measured is not a minute of zero. */
+function line(ctx, cols, x, y, value, has, colour, width, dash) {
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = width;
+  ctx.setLineDash(dash || []);
+  ctx.beginPath();
+  let pen = false;
+  for (let c = 0; c < cols; c++) {
+    if (!has(c)) { pen = false; continue; }
+    const px = x(c), py = y(value(c));
+    if (pen) ctx.lineTo(px, py); else ctx.moveTo(px, py);
+    pen = true;
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+/* Two round trips, drawn apart and never averaged together: the link — the
+   heartbeat's own light read, the same call MoonBot's terminal calls its ping —
+   and the order calls, which are the exchange's work and run an order of
+   magnitude above it. As one line they made a number that answered neither
+   question: 133 ms over 2026-09-30, two thirds of it ReplaceOrder alone, while
+   the link through the same socket was 30.
+
+   Per line the bold stroke is the mean of the minutes behind a pixel and the
+   thin one their worst: hue says which measurement, weight says which
+   statistic. The breaker's level is dashed, and it belongs beside the order
+   line rather than the link: what `trading` feeds it is the round trip of
+   whichever call an order action ended on — for a cancel that is the state
+   read that follows the cancel, not CancelOrder itself — together with
+   GetPositions. The heartbeat it never sees. */
+function drawPing(v) {
+  /* The left gutter fits the widest decade label the axis can carry
+     ("10000 ms"), or a slow day would clip its own scale. */
+  const H = 240, PAD = { l: 62, r: 10, t: 10, b: 20 };
+  const box = fit($('api_ping'), H);
+  if (!box) return;
+  const ctx = box.ctx;
+  const x0 = PAD.l, x1 = box.w - PAD.r, y0 = PAD.t, y1 = H - PAD.b;
+  const cols = Math.max(2, Math.floor(x1 - x0));
+  /* A minute per point is finer than the chart is wide, so a pixel holds
+     several: their means weighted by how many samples each carried, and their
+     worst, which is never smoothed — the potted minute is the one to see. */
+  const fold = (s) => {
+    const span = s.avg.length;
+    const sum = new Array(cols).fill(0), n = new Array(cols).fill(0), worst = new Array(cols).fill(0);
+    for (let i = 0; i < span; i++) {
+      const k = s.n[i] || 0;
+      if (!k) continue;
+      const c = Math.min(cols - 1, Math.floor(i * cols / span));
+      sum[c] += (s.avg[i] || 0) * k;
+      n[c] += k;
+      if ((s.max[i] || 0) > worst[c]) worst[c] = s.max[i];
+    }
+    return { sum: sum, n: n, worst: worst };
+  };
+  const link = fold(v.ping.link), orders = fold(v.ping.orders);
+  const level = lastStatus && lastStatus.auto_stop && lastStatus.auto_stop.ping
+    ? lastStatus.auto_stop.ping.level : 0;
+  /* A log axis, and it is not decoration: one 4-second round trip — the
+     gateway queueing behind a warm-up, say — flattens a whole day of 60 ms
+     onto the floor of a linear chart, and the day is what the line is for.
+     Decades keep the spike and the normal level readable at once. And now they
+     keep both lines readable at once, which a linear axis could not: a 12 ms
+     link and a 283 ms replacement are the same two pixels on one. */
+  const FLOOR = 10;
+  const top = Math.max(200, Math.max.apply(null, link.worst),
+    Math.max.apply(null, orders.worst), level) * 1.15;
+  const lo = Math.log10(FLOOR), hi = Math.log10(top);
+  const x = (c) => x0 + (cols > 1 ? c / (cols - 1) : 0) * (x1 - x0);
+  const y = (ms) => y1 - ((Math.log10(Math.max(ms, FLOOR)) - lo) / (hi - lo)) * (y1 - y0);
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (let ms = FLOOR; ms <= top; ms *= 10) {
+    const gy = Math.round(y(ms)) + 0.5;
+    ctx.strokeStyle = CSS('--line');
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x0, gy);
+    ctx.lineTo(x1, gy);
+    ctx.stroke();
+    ctx.fillStyle = CSS('--dim');
+    ctx.fillText(ms + ' ms', x0 - 5, gy);
+  }
+  hours(ctx, x0, x1, y1 + 5, CSS('--dim'));
+  const stroke = (f, colour) => {
+    line(ctx, cols, x, y, (c) => f.worst[c], (c) => f.n[c] > 0, colour, 1);
+    line(ctx, cols, x, y, (c) => f.sum[c] / f.n[c], (c) => f.n[c] > 0, colour, 1.6);
+  };
+  /* The orders first: the link is the lower and the quieter of the two, and
+     the one an operator looks for, so it is not the one to be drawn under. */
+  stroke(orders, CSS('--warn'));
+  stroke(link, CSS('--accent'));
+  if (level > 0 && y(level) > y0) {
+    line(ctx, cols, x, y, () => level, () => true, CSS('--bad'), 1, [4, 4]);
+  }
+  /* The legend is on the canvas because the head below is plain text (`say`
+     writes textContent), so hue is all that tells the two lines apart, and a
+     hue with no name is a guess. */
+  ctx.textAlign = 'left';
+  let lx = x0 + 10;
+  const key = (colour, label) => {
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(lx, y0 + 6);
+    ctx.lineTo(lx + 14, y0 + 6);
+    ctx.stroke();
+    ctx.fillStyle = CSS('--dim');
+    ctx.fillText(label, lx + 19, y0 + 6);
+    lx += 19 + ctx.measureText(label).width + 16;
+  };
+  key(CSS('--accent'), 'link');
+  key(CSS('--warn'), 'orders');
+  const totals = (f) => {
+    let last = null, sum = 0, n = 0, peak = 0;
+    for (let c = 0; c < cols; c++) {
+      if (!f.n[c]) continue;
+      last = f.sum[c] / f.n[c];
+      sum += f.sum[c];
+      n += f.n[c];
+      if (f.worst[c] > peak) peak = f.worst[c];
+    }
+    return { mean: n ? sum / n : 0, n: n, peak: peak, last: last };
+  };
+  /* The methods come from the core, not from a copy kept here: the two lists
+     are its to decide, and a second copy is a second thing to forget. */
+  const part = (name, methods, k) => name + ' (' + (methods || []).join(', ') + ') ' + (k.n
+    ? Math.round(k.mean) + ' ms mean · ' + k.peak + ' ms worst · last ' +
+      Math.round(k.last) + ' ms · ' + k.n + ' sample(s)'
+    : 'nothing measured yet');
+  const tl = totals(link), to = totals(orders);
+  say($('api_ping_head'), (tl.n || to.n)
+    ? part('link', v.ping.link_methods, tl) + '   ' +
+      part('orders', v.ping.order_methods, to) + ' · log scale' +
+      (level > 0
+        ? ' · the ping breaker stops the strategies at ' + level +
+          ' ms, and it judges the trading thread\'s own round trips, not this link line'
+        : '')
+    : 'Nothing measured yet: the link beats every 10 s, so the first point is seconds away.');
+}
+
+function drawGroups(v) {
+  const cards = v.groups.map(groupCard);
+  $('api_groups').replaceChildren.apply($('api_groups'), cards.map((c) => c.el));
+  for (const c of cards) drawGroup(c.cv, c.g);
+}
+
+function groupCard(g) {
+  const el = document.createElement('div');
+  el.className = 'limit';
+  const peak = g.calls.reduce((m, x) => Math.max(m, x), 0);
+  const now = g.calls.length ? g.calls[g.calls.length - 1] : 0;
+  const errors = (g.errors || []).reduce((a, b) => a + b, 0);
+  const held = (g.held || []).reduce((a, b) => a + b, 0);
+  if (g.per_minute != null && peak >= g.per_minute) el.classList.add('over');
+  const h = document.createElement('h3');
+  const name = document.createElement('b');
+  name.textContent = g.name;
+  const right = document.createElement('span');
+  right.textContent = (g.per_minute != null ? 'peak ' + peak + ' of ' + g.per_minute + '/min'
+                                            : 'peak ' + peak + '/min, no ceiling') +
+    (g.per_second ? ' · ' + g.per_second + '/s' : '') +
+    ' · now ' + now +
+    (errors ? ' · ' + errors + ' refused' : '') +
+    (held ? ' · ' + held + ' never sent' : '');
+  h.append(name, right);
+  const methods = document.createElement('div');
+  methods.className = 'methods';
+  methods.textContent = g.methods.join(', ');
+  methods.title = g.methods.join('\n');
+  const cv = document.createElement('canvas');
+  el.append(h, methods, cv);
+  return { el: el, cv: cv, g: g };
+}
+
+function drawGroup(cv, g) {
+  const H = 120, PAD = { l: 36, r: 6, t: 8, b: 24 };
+  const box = fit(cv, H);
+  if (!box) return;
+  const ctx = box.ctx;
+  const x0 = PAD.l, x1 = box.w - PAD.r, y0 = PAD.t, y1 = H - PAD.b;
+  const cols = Math.max(2, Math.floor(x1 - x0));
+  const calls = peaks(g.calls, cols);
+  const errors = peaks(g.errors || [], cols);
+  const held = peaks(g.held || [], cols);
+  const limit = g.per_minute;
+  const top = Math.max(Math.max.apply(null, calls), limit || 0, 1) * 1.1;
+  const x = (c) => x0 + (cols > 1 ? c / (cols - 1) : 0) * (x1 - x0);
+  const y = (val) => y1 - (val / top) * (y1 - y0);
+  grid(ctx, x0, x1, y, top, 2, CSS('--line'), CSS('--dim'));
+  hours(ctx, x0, x1, y1 + 11, CSS('--dim'));
+  if (limit != null) {
+    // What went over the ceiling, filled: a line crossing a line is easy to
+    // miss, and this is the one thing the card exists to say.
+    ctx.fillStyle = 'rgba(255,143,143,0.22)';
+    const w = Math.max(1, (x1 - x0) / cols);
+    for (let c = 0; c < cols; c++) {
+      /* At or over, the same boundary the card's border uses: a minute that
+         spent the group's last request is the minute the next one would have
+         been refused, and it draws as a mark of its own — an exact hit has no
+         height to fill. */
+      if (calls[c] >= limit) {
+        ctx.fillRect(x(c) - w / 2, y(calls[c]), w, Math.max(2, y(limit) - y(calls[c])));
+      }
+    }
+    line(ctx, cols, x, y, () => limit, () => true, CSS('--bad'), 1.4);
+  }
+  line(ctx, cols, x, y, (c) => calls[c], () => true, CSS('--accent'), 1.3);
+  // The strip: a minute that came back an error, or one the core held back.
+  for (let c = 0; c < cols; c++) {
+    const colour = errors[c] ? CSS('--bad') : held[c] ? CSS('--warn') : null;
+    if (!colour) continue;
+    ctx.fillStyle = colour;
+    ctx.fillRect(x(c) - 0.5, y1 + 3, Math.max(1, (x1 - x0) / cols), 5);
+  }
+}
+
+function say(el, text, cls) {
+  el.className = cls || 'note';
+  el.textContent = text;
+}
+
+/* The bar is the only Save on the page, so it has to be there whenever there
+   is something to save — the field that was edited may be on a tab the
+   operator has since left. */
+const fades = new Map();
+
+function bar() {
+  const waiting = dirty.size > 0 || $('settings').telegram_token.value
+    || $('settings').web_password.value;
+  $('bar').hidden = !waiting && !$('saved').textContent;
+  say($('dirtystate'), waiting ? 'unsaved changes' : '');
+}
+
+/* What a button or a save had to say, and then out of the way. Both bars stay
+   put over every tab, so a verdict left in one pins itself to the page for the
+   rest of the session. An error stays — a change that is live but never
+   reached the disk, or a stop that did not get through, is worth the room. */
+function flash(el, text, cls) {
+  say(el, text, cls);
+  clearTimeout(fades.get(el));
+  if (cls !== 'err' && text) {
+    fades.set(el, setTimeout(() => { say(el, ''); bar(); }, 6000));
+  }
+  bar();
+}
+
+function said(text, cls) {
+  flash($('saved'), text, cls);
+}
+
+async function poll() {
+  try {
+    render(await call('/api/status'));
+    say($('live'), 'live', 'ok');
+  } catch (e) {
+    say($('live'), String(e.message || e), 'err');
+  }
+}
+
+async function pollLog() {
+  if (tab !== 'journal' || !$('follow').checked) return;
+  try {
+    const r = await fetch('/api/log', { headers: HEAD });
+    if (r.status === 401) { location.reload(); return; }
+    const pre = $('log');
+    const bottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+    pre.textContent = await r.text();
+    if (bottom) pre.scrollTop = pre.scrollHeight;
+    say($('logstate'), '');
+  } catch (e) {
+    say($('logstate'), String(e.message || e), 'err');
+  }
+}
+
+async function press(button, path, body, confirmation, halting) {
+  if (confirmation && !confirm(confirmation)) return;
+  const was = button.textContent;
+  button.disabled = true;
+  try {
+    const answer = await call(path, body === undefined ? {} : body);
+    flash($('done'), was + ': ' + JSON.stringify(answer), 'ok');
+  } catch (e) {
+    /* A stop or a restart races its own answer: the core latches the halt in
+       the same step it replies, and the process can be gone before the bytes
+       reach the socket. But a dropped connection is also what a dead tunnel
+       looks like, and on a button that stops the trading those are opposite
+       facts — so ask. An answer means the core is still there and the stop is
+       not what happened. */
+    let verdict = was + ': ' + (e.message || e), cls = 'err';
+    if (halting && e instanceof TypeError) {
+      let alive = false;
+      try { await call('/api/status'); alive = true; } catch (_) { /* gone */ }
+      verdict = was + (alive ? ': the request did not get through — the core is still running'
+                             : ': asked; the core has stopped answering');
+      cls = alive ? 'err' : 'ok';
+    }
+    flash($('done'), verdict, cls);
+  } finally {
+    button.disabled = false;
+    poll();
+  }
+}
+
+/* ---- Screener -------------------------------------------------------- */
+/* The form on this tab is the page's own: the core is asked with whatever it
+   holds, and it holds what the operator typed. The core's answer carries the
+   settings it screened with, and those are written back into the controls
+   only on a load or a Reset — otherwise a reply in flight would take the
+   field out from under the hand, the same way the settings form is left alone
+   while somebody is typing in it. */
+let scr = null;            // the last answer
+let scrShape = '';         // which controls are drawn
+let scrBusy = false;       // a question is out
+let scrAgain = false;      // and another was asked while it was
+let scrReload = false;     // the next answer must refill the form (see askScreen)
+let scrAsked = false;      // `screenPick` asked during this `show` (see show)
+let scrTimer = null;
+let scrAll = false;        // the table is capped until asked otherwise
+const SCR_ROWS = 300;
+const SEATS = {
+  pool: 'watched', ranked: 'past the count', unranked: 'not ranked',
+  dynblack: 'dynamic black list', black: 'black list', notlisted: 'not in the white list',
+  otherclass: 'another class', nopool: 'no pool',
+};
+
+function screenPick(s) {
+  const el = $('scr_strategy');
+  const key = JSON.stringify(s.strategies.map((x) => [x.id, x.name]));
+  if (el.dataset.key === key) return;
+  el.dataset.key = key;
+  const chosen = el.value;
+  el.replaceChildren(...s.strategies.map((x) => option(String(x.id), x.name + ' · ' + x.kind)));
+  if (s.strategies.some((x) => String(x.id) === chosen)) {
+    el.value = chosen;
+    return;
+  }
+  /* What was picked is not in the core's list any more — the terminal deleted
+     it, or nothing was picked yet — and the select has just landed on another
+     strategy, so the table is about to be about a different one. Take its
+     settings, and tell `show` it need not ask as well. */
+  scrReload = true;
+  scrAsked = true;
+  if (tab === 'screen') askScreen(true);
+}
+
+/* USDT, in the unit that keeps a 24-hour turnover readable next to a
+   minute's. The column header carries the USDT, so the number does not. */
+function money(v) {
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+  if (a >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+  if (a >= 1e3) return (v / 1e3).toFixed(0) + 'k';
+  return v.toFixed(0);
+}
+
+function cell(v, usdt) {
+  if (v === null || v === undefined) return '—';
+  return usdt ? money(v) : pct(v);
+}
+
+/* A corridor with the sides it actually has: an open one is null from the
+   core, and «0» would read as a bound at zero. */
+function corridor(c) {
+  const lo = c.lo === null ? '−∞' : cell(c.lo, c.turnover);
+  const hi = c.hi === null ? '+∞' : cell(c.hi, c.turnover);
+  return lo + ' … ' + hi;
+}
+
+function scrBody() {
+  const fields = {};
+  for (const el of $('scr_form').querySelectorAll('[data-field]')) {
+    fields[el.dataset.field] = el.type === 'checkbox' ? (el.checked ? 'YES' : 'NO') : el.value;
+  }
+  return { strategy_id: Number($('scr_strategy').value || 0), fields };
+}
+
+/* `reload` = take the settings from the strategy rather than from the form:
+   the first look at a tab, a strategy picked, a Reset.
+   It is LATCHED, not passed along, because the ask it belongs to may not be
+   the ask that lands: a busy core turns the first one away and the retry is
+   an ordinary one. Carried as an argument, a strategy picked on a busy step
+   came back screened with the PREVIOUS strategy's form — a whole table of the
+   wrong answer, under the right name. The latch clears only when an answer
+   has actually filled the form. */
+async function askScreen(reload) {
+  if (reload) scrReload = true;
+  const id = Number($('scr_strategy').value || 0);
+  if (!id) { say($('scr_state'), 'no strategy in the core', 'note'); return; }
+  /* One question out at a time. Anything asked meanwhile is remembered and
+     asked once this one lands: the core answers one screening per loop step,
+     and a page that fired two would be spending a step of the loop that also
+     places and withdraws orders to have the first answer thrown away. */
+  if (scrBusy) { scrAgain = true; return; }
+  scrBusy = true;
+  say($('scr_state'), 'measuring…');
+  try {
+    const answer = await call('/api/screen',
+      scrReload ? { strategy_id: id, fields: {} } : scrBody());
+    scr = answer;
+    drawScrForm(scrReload);
+    scrReload = false;
+    drawScreen();
+    say($('scr_state'), 'measured ' + new Date().toLocaleTimeString(), 'ok');
+  } catch (e) {
+    const text = String(e.message || e);
+    if (text.includes('ask again')) {
+      /* A second tab, or a client of its own, got the step first. A wait, not
+         a failure: say so and come back — with `scrReload` still standing. */
+      say($('scr_state'), 'the core was busy — measuring again');
+      scrAgain = true;
+    } else {
+      say($('scr_state'), text, 'err');
+    }
+  } finally {
+    scrBusy = false;
+    if (scrAgain) { scrAgain = false; scrLater(); }
+  }
+}
+
+/* Typing moves a corridor, not a setting: nothing is saved, so there is no
+   Save — the table simply catches up once the hand stops. */
+function scrLater() {
+  clearTimeout(scrTimer);
+  scrTimer = setTimeout(() => askScreen(false), 500);
+}
+
+function drawScrForm(fill) {
+  /* The card is part of the shape, not only the name: a core that regroups
+     the controls under a page that is already open would otherwise leave them
+     drawn under the old headings. */
+  const shape = scr.fields.map((f) => f.card + '/' + f.name).join(',');
+  const fresh = shape !== scrShape;
+  if (fresh) {
+    scrShape = shape;
+    const box = $('scr_form');
+    box.replaceChildren();
+    let card = null;
+    for (const f of scr.fields) {
+      if (!card || card.dataset.card !== f.card) {
+        card = document.createElement('div');
+        card.className = 'card group';
+        card.dataset.card = f.card;
+        const h = document.createElement('h3');
+        h.textContent = f.card;
+        const grid = document.createElement('div');
+        grid.className = 'pairs';
+        card.append(h, grid);
+        box.append(card);
+      }
+      const grid = card.lastChild;
+      const label = document.createElement('label');
+      label.textContent = f.name;
+      let el;
+      if (f.ui === 'check') {
+        el = document.createElement('input');
+        el.type = 'checkbox';
+        el.style.width = 'auto';
+        label.style.gridAutoFlow = 'column';
+        label.style.justifyContent = 'start';
+        label.style.alignItems = 'center';
+      } else if (f.ui === 'pick' && f.choices.length) {
+        el = document.createElement('select');
+        el.replaceChildren(...f.choices.map((c) => option(c, c)));
+      } else {
+        el = document.createElement('input');
+      }
+      el.dataset.field = f.name;
+      label.append(el);
+      grid.append(label);
+    }
+  }
+  if (!fresh && !fill) return;
+  for (const f of scr.fields) {
+    const el = $('scr_form').querySelector('[data-field="' + f.name + '"]');
+    if (!el) continue;
+    if (el.type === 'checkbox') el.checked = /^(yes|true|1|-1|on)$/i.test(f.value);
+    else if (el.tagName === 'SELECT' && !f.choices.includes(f.value)) {
+      /* A value the combo does not offer is still the one in force — a
+         strategy file may carry `shares, futures`, which the picklist does
+         not list. Dropping it would screen against something the operator
+         never chose. */
+      el.replaceChildren(...f.choices.map((c) => option(c, c)), option(f.value, f.value + ' — as saved'));
+      el.value = f.value;
+    } else el.value = f.value;
+  }
+}
+
+function drawScreen() {
+  const s = scr;
+  /* Two different statements, and merging them would be a lie either way:
+     `problem` is why there is no pool at all, `unknown` is a word in a list
+     that names nothing — which holds no market back on its own, so it is a
+     warning beside a working table and not an error instead of one. */
+  $('scr_problem').innerHTML =
+    (s.problem ? '<div class="err">' + esc(s.problem) + '</div>' : '') +
+    (s.unknown ? '<div class="warn">' + esc(s.unknown) + '</div>' : '');
+  const sum = $('scr_sum');
+  /* Of the POOL, as the core's own count has it (`filter_counts`): a filter
+     that would also refuse a market the strategy never watches is not holding
+     anything back, and counting those would blame the filters for the
+     screener's work. */
+  const held = s.checks.map((_, i) =>
+    s.markets.filter((m) => m.seat === 'pool' && m.refused === i).length);
+  sum.replaceChildren(
+    chip('watched ' + s.pool + ' of ' + s.markets.length, s.pool ? 'on' : 'off'),
+    chip('filters passed ' + s.entered, s.entered ? 'on' : 'idle'),
+  );
+  if (s.sort_by) sum.append(chip('ranked by ' + s.sort_by + (s.sort_desc ? ' ↓' : ' ↑') + ', top ' + s.count));
+  else sum.append(chip('no dynamic white list', 'idle'));
+  s.checks.forEach((c, i) => { if (held[i]) sum.append(chip(c.what + ' holds ' + held[i], 'idle')); });
+  if (s.warming) {
+    sum.append(chip('warming up: the deltas are not all measured yet', 'idle'));
+  }
+
+  const find = $('scr_find').value.trim().toUpperCase();
+  const only = $('scr_only').value;
+  const keep = (m) => {
+    if (find && !m.symbol.toUpperCase().includes(find)) return false;
+    if (only === 'enters') return m.entered;
+    if (only === 'held') return m.seat === 'pool' && !m.entered;
+    if (only === 'pool') return m.seat === 'pool';
+    if (only === 'out') return m.seat !== 'pool';
+    return true;
+  };
+  const rows = s.markets.filter(keep);
+  const band = (m) => (m.entered ? 0 : m.seat === 'pool' ? 1 : 2);
+  rows.sort((a, b) => band(a) - band(b)
+    || (a.rank === null ? 1e9 : a.rank) - (b.rank === null ? 1e9 : b.rank)
+    || (a.symbol < b.symbol ? -1 : 1));
+  const shown = scrAll ? rows : rows.slice(0, SCR_ROWS);
+  say($('scr_shown'), shown.length < rows.length
+    ? shown.length + ' of ' + rows.length + ' rows'
+    : rows.length + ' rows');
+  $('scr_more').hidden = shown.length >= rows.length;
+
+  const head = ['market', 'class', 'seat', 'rank', s.sort_by || 'key']
+    .concat(s.checks.map((c) => c.what + (c.turnover ? ', USDT' : ', %') + '<br><span class="note">'
+      + esc(corridor(c)) + '</span>'));
+  const body = shown.map((m) => {
+    const cls = m.entered ? 'enters' : m.seat === 'pool' ? 'held' : 'out';
+    const cells = [esc(m.symbol), esc(m.class), SEATS[m.seat] || m.seat,
+                   m.rank === null ? '—' : m.rank,
+                   cell(m.key, s.sort_turnover)];
+    const tds = cells.map((c) => '<td>' + c + '</td>');
+    m.values.forEach((v, i) => {
+      const st = m.states[i];
+      const klass = st === 'r' || st === 'b' ? ' class="refused"' : st === 'w' ? ' class="waits"' : '';
+      tds.push('<td' + klass + '>' + (st === 'b' ? 'cannot ask' : st === 'w' ? 'waiting' : cell(v, s.checks[i].turnover)) + '</td>');
+    });
+    return '<tr class="' + cls + '">' + tds.join('') + '</tr>';
+  });
+  $('scr_table').innerHTML = body.length
+    ? '<table><thead><tr>' + head.map((h) => '<th>' + h + '</th>').join('')
+      + '</tr></thead><tbody>' + body.join('') + '</tbody></table>'
+    : '<div class="empty">no market matches</div>';
+}
+
+$('scr_strategy').addEventListener('change', () => { scrAll = false; askScreen(true); });
+$('scr_reset').onclick = () => askScreen(true);
+$('scr_form').addEventListener('input', scrLater);
+$('scr_form').addEventListener('change', scrLater);
+/* Both put the cap back: «show them all» was asked of ONE view, and a
+   narrowed search cleared again would otherwise pour 2453 rows into the DOM
+   without anyone asking twice. */
+$('scr_find').addEventListener('input', () => { scrAll = false; if (scr) drawScreen(); });
+$('scr_only').addEventListener('change', () => { scrAll = false; if (scr) drawScreen(); });
+$('scr_more').onclick = () => { scrAll = true; if (scr) drawScreen(); };
+
+$('tabs').addEventListener('click', (e) => {
+  const button = e.target.closest('button[data-tab]');
+  if (button) location.hash = button.dataset.tab;
+});
+window.addEventListener('hashchange', () => show(location.hash.slice(1)));
+
+$('start').onclick = (e) => press(e.target, '/api/strategies', { start: true });
+$('stop').onclick = (e) => press(e.target, '/api/strategies', { start: false });
+$('panic').onclick = (e) => press(e.target, '/api/panic', {},
+  'Panic: send every position of the core to a panic exit. Sure?');
+$('halt').onclick = (e) => press(e.target, '/api/stop', {},
+  'Stop the core: strategies off, entry orders withdrawn from the exchange, exits left in place, \
+orders saved, the process exits. Sure?',
+  true);
+$('restart').onclick = (e) => press(e.target, '/api/restart', {},
+  'Restart the core: entry orders withdrawn from the exchange, exits left in place, \
+the process comes back. Sure?', true);
+
+const form = $('settings');
+form.addEventListener('input', (e) => {
+  editing = true;
+  const t = e.target;
+  dirty.add(t.dataset.event ? 'events.' + t.dataset.event
+    : t.dataset.shot ? 'shots.' + t.dataset.shot
+    : t.name);
+  bar();
+});
+$('follow').addEventListener('change', pollLog);
+$('revert').onclick = () => {
+  editing = false;
+  dirty.clear();
+  form.telegram_token.value = '';
+  form.web_password.value = '';
+  if (lastStatus) fill(lastStatus.settings);
+  said('');
+};
+$('forget_token').onclick = async () => {
+  if (!confirm('Forget the bot token: the core stops reporting to the chat. Sure?')) return;
+  try {
+    await call('/api/settings', { telegram_token: '' });
+    said('the token is gone', 'ok');
+    poll();
+  } catch (e) { said(String(e.message || e), 'err'); }
+};
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    const body = await edit();
+    if (!Object.keys(body).length) {
+      // Nothing to send — a field typed into and cleared again. The form goes
+      // back to following the core, or it would stay frozen on this snapshot
+      // until a Revert.
+      editing = false;
+      dirty.clear();
+      said('nothing was changed');
+      return;
+    }
+    const answer = await call('/api/settings', body);
+    editing = false;
+    dirty.clear();
+    form.telegram_token.value = '';
+    form.web_password.value = '';
+    if (answer.logout) { location.reload(); return; }
+    if (answer.unsaved) {
+      /* Live in the core and absent from the file: one restart and it is
+         gone, which is worth more than a green «saved». */
+      said('applied, but NOT saved: ' + answer.unsaved, 'err');
+    } else {
+      said(answer.restart.length
+        ? 'saved; a restart applies: ' + answer.restart.join(', ')
+        : 'saved', 'ok');
+    }
+    poll();
+  } catch (e) {
+    said(String(e.message || e), 'err');
+  }
+});
+
+show(location.hash.slice(1));
+poll();
+pollLog();
+setInterval(poll, 2000);
+setInterval(pollLog, 5000);
+/* One point a minute is what there is to see — finer than the link's own
+   heartbeat, which beats every 10 s: asking faster would only move kilobytes. */
+setInterval(pollApi, 15000);
+/* The charts are drawn at the width the layout gave them, so a resized window
+   is a redraw — from what is already in hand, without asking again. */
+window.addEventListener('resize', () => { if (tab === 'api') drawApi(); });
+</script>
+</body>
+</html>

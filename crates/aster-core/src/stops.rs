@@ -217,7 +217,7 @@ pub struct Pass {
     pub px: f64,
     /// Lowest and highest exchange trade since the last pass.
     pub swing: Option<(f64, f64)>,
-    /// `(bought, sold)` roubles of the BV/SV window, once covered.
+    /// `(bought, sold)` USDT of the BV/SV window, once covered.
     pub volumes: Option<(f64, f64)>,
     pub now: i64,
 }

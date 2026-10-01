@@ -72,6 +72,11 @@ pub struct StreamHealth {
 }
 
 impl StreamHealth {
+    /// Every watched stream and whether it is alive, for the page.
+    pub fn states(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.streams.iter().map(|w| (w.name.as_str(), w.alive))
+    }
+
     /// Register a stream; its thread touches the returned beat on every frame.
     pub fn watch(&mut self, name: impl Into<String>, scope: Scope) -> Beat {
         let beat = Beat::new();

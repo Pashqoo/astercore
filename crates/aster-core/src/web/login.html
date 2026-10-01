@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Astercore</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background: #14171c; color: #d6dae0; font: 14px/1.5 ui-monospace, Menlo, monospace;
+         display: grid; place-items: center; min-height: 100vh; margin: 0; }
+  form { display: grid; gap: 12px; width: min(320px, 88vw); }
+  h1 { font-size: 15px; font-weight: 600; margin: 0; color: #8fb4ff; }
+  input, button { font: inherit; padding: 8px 10px; border-radius: 6px; border: 1px solid #333a45;
+                  background: #1b1f26; color: inherit; }
+  button { background: #2b4f8f; border-color: #2b4f8f; cursor: pointer; }
+  #err { color: #ff8f8f; min-height: 1.5em; }
+</style>
+</head>
+<body>
+<form id="f">
+  <h1>Astercore</h1>
+  <input id="p" type="password" placeholder="password" autocomplete="current-password" autofocus>
+  <button type="submit">Log in</button>
+  <div id="err"></div>
+</form>
+<script>
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = document.getElementById('err');
+  err.textContent = '';
+  try {
+    const r = await fetch('/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Astercore': '1' },
+      body: JSON.stringify({ password: document.getElementById('p').value }),
+    });
+    if (r.ok) { location.reload(); return; }
+    const body = await r.json().catch(() => ({}));
+    err.textContent = body.error || ('HTTP ' + r.status);
+  } catch (e) { err.textContent = String(e); }
+});
+</script>
+</body>
+</html>
