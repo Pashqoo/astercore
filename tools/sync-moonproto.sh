@@ -1,34 +1,27 @@
 #!/usr/bin/env bash
-# Pull crates/moonproto up to the moonproto rev pinned in the terminal's Cargo.lock.
+# Pull crates/moonproto up to the LATEST upstream moonproto (the trader's
+# decision of 01.10: this core always tracks the newest rev, PLAN.md "Открытые
+# решения" п. 7), or to the rev given as the first argument.
 # The expected conflict is the `pub mod server;` hook in src/lib.rs — and upstream
 # edits src/lib.rs too (6a6c419 touched it), so that file is where to look first.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 UPSTREAM=https://github.com/Moonbot-Tech/MoonProtoBeta
-# The sibling terminal checkout on this machine. Verified to exist rather than
-# inherited: TInvestCore's copy defaulted to `../Moonterminal`, which is not
-# what the checkout is called here, and awk under `set -e` then aborted the
-# sync before it pulled anything.
-LOCK=${1:-../moon-terminal/Cargo.lock}
-[[ -f "$LOCK" ]] || { echo "terminal Cargo.lock not found: $LOCK" >&2; exit 1; }
-
-# `f` is reset at each `[[package]]`: without it, a moonproto entry carrying no
-# `source` line (a path dependency) made awk run on into the NEXT crate and
-# print its rev — which the 40-hex guard below would have accepted as valid.
-REV=$(awk '/^\[\[package\]\]/{f=0}
-           /^name = "moonproto"$/{f=1}
-           f&&/^source = /{sub(/.*#/,""); gsub(/"/,""); print; exit}' "$LOCK")
+# Upstream HEAD, not the terminal's Cargo.lock: a terminal checkout on this
+# machine lags its own main (measured 01.10: local lock 6a6c419, terminal main
+# 87c1725, upstream HEAD 9fd0490), and "latest" means upstream.
+REV=${1:-$(git ls-remote "$UPSTREAM" HEAD | cut -f1)}
 # A rev is passed straight to `subtree pull`, so it is checked for shape here:
-# an empty or truncated match would otherwise reach git as a branch name.
-[[ "$REV" =~ ^[0-9a-f]{40}$ ]] || { echo "no 40-hex moonproto rev in $LOCK (got '${REV}')" >&2; exit 1; }
+# an empty or truncated value would otherwise reach git as a branch name.
+[[ "$REV" =~ ^[0-9a-f]{40}$ ]] || { echo "not a 40-hex moonproto rev: '${REV}'" >&2; exit 1; }
 
 CUR=$(cat MOONPROTO_REV)
 if [[ "$CUR" == "$REV" ]]; then
   echo "already at $REV"; exit 0
 fi
 
-echo "syncing $CUR -> $REV (from $LOCK)"
+echo "syncing $CUR -> $REV"
 # A conflicting pull aborts here under `set -e`, BEFORE MOONPROTO_REV moves, and
 # leaves the tree mid-merge. That is recoverable but not obvious, so the way out
 # is printed rather than remembered: upstream edits src/lib.rs too (6a6c419 did),
