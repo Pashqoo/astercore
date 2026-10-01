@@ -267,6 +267,14 @@ impl Session {
         self.out.push(packet);
     }
 
+    /// Nothing left to send: no packet queued, no reliable direct message
+    /// waiting for its ACK, no sliced datagram in flight. A sliced one that
+    /// ran out of retries counts as given up, not as delivered. A core leaving
+    /// waits for this, or the last order images never reach the terminal.
+    pub fn quiet(&self) -> bool {
+        self.out.is_empty() && self.pending_high.is_empty() && self.sending.is_empty()
+    }
+
     /// Plaintext command (public market feed and public API responses).
     pub fn send(&mut self, cmd: u8, payload: &[u8]) {
         let (cmd, data) = maybe_compress(cmd, payload);

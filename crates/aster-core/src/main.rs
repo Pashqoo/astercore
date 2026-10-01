@@ -357,10 +357,10 @@ fn main() -> ExitCode {
         engine::EXCHANGE_CODE
     );
 
-    // Every way out of this loop goes through the stop below: the entries are
-    // withdrawn and the orders written before the process ends. A signal is
-    // not one of them yet — SIGINT/SIGTERM end the process at once, the
-    // entries stay with the exchange (`PLAN.md`, M4: signals).
+    // Every way out of THIS LOOP goes through the stop below: the entries are
+    // withdrawn, the terminals told, the orders written. A signal does not
+    // come through here at all yet — SIGINT/SIGTERM end the process at once,
+    // and the entries stay with the exchange (`PLAN.md`, M4: signals).
     let code = loop {
         server.step();
         // A dead refresher would leave its prices frozen, and nothing else in
@@ -404,6 +404,7 @@ fn main() -> ExitCode {
     // Whatever the reason for leaving, the entries go first and the orders
     // reach the disk last.
     let clean = withdraw_entries(&mut server, &ev_rx);
+    flush_sessions(&mut server, &ev_rx);
     let (handler, _) = server.split();
     handler.finish();
     // A shutdown that left orders with the exchange did not end cleanly.
@@ -411,6 +412,43 @@ fn main() -> ExitCode {
         code
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// How long a leaving core waits for its last messages to reach the
+/// terminals and be acknowledged. On a LAN an ACK takes milliseconds; a second
+/// covers a reliable message's first retries; a terminal that is gone never
+/// answers, and costs the whole second.
+const FLUSH_WAIT: Duration = Duration::from_secs(1);
+
+/// Send what is still queued — the images of the orders the stop withdrew,
+/// its log lines — and wait for their ACKs, up to [`FLUSH_WAIT`]. Without it
+/// the process ends with them in the sessions' queues: they are sent only by
+/// `Server::step`, and the terminal keeps showing an order the exchange no
+/// longer has (01.10: a withdrawn entry stayed on the chart).
+fn flush_sessions(server: &mut Server<CoreHandler>, rx: &mpsc::Receiver<feed::FeedEvent>) {
+    let deadline = Instant::now() + FLUSH_WAIT;
+    loop {
+        // The outbox into the sessions first, then a step: it puts them on the
+        // wire and takes the ACKs in. Judged after both, so nothing the pump
+        // just queued is left behind.
+        {
+            let (handler, sessions) = server.split();
+            handler.pump(sessions, rx);
+        }
+        server.step();
+        let (handler, sessions) = server.split();
+        let unsent = sessions.filter(|s| !s.quiet()).count();
+        if unsent == 0 && handler.outbox_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            log::warn!(
+                "exit: {unsent} terminal session(s) did not acknowledge the last messages in {}s",
+                FLUSH_WAIT.as_secs()
+            );
+            return;
+        }
     }
 }
 

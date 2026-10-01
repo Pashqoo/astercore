@@ -1474,6 +1474,11 @@ impl CoreHandler {
         self.trading.is_some() && !self.worker_lost
     }
 
+    /// Nothing waits in the outbox for the sessions.
+    pub fn outbox_empty(&self) -> bool {
+        self.outbox.is_empty()
+    }
+
     /// The last thing the core does: the orders on disk for the next start.
     pub fn finish(&mut self) {
         self.persist_orders(true, now_ms());
