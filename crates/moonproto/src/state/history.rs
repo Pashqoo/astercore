@@ -1,0 +1,1018 @@
+//! Active-library retained history row types.
+//!
+//! These rows are the typed payloads stored by [`crate::state::seq_ring`].
+//! They intentionally keep the production core's compact storage shape where
+//! the row is a user-visible/history concept rather than only a wire packet.
+
+use crate::state::seq_ring::{SeqRingPriceRow, SeqRingQtyRow, SeqRingTimedRow};
+use crate::MoonTime;
+
+#[cfg(test)]
+const SECONDS_PER_DAY: f64 = 86_400.0;
+pub(crate) const DELPHI_MSECS_PER_DAY: f64 = 86_400_000.0;
+const MINI_CANDLE_SPLIT_MS: i64 = 5_000;
+const ROLLING_VOLUME_BUCKET_SECONDS: i64 = 5;
+pub(crate) const ROLLING_VOLUME_BUCKETS: usize = 5 * 60 / ROLLING_VOLUME_BUCKET_SECONDS as usize;
+const ROLLING_PRICE_SHORT_BUCKET_SECONDS: i64 = 5;
+const ROLLING_PRICE_SHORT_BUCKETS: usize = 5 * 60 / ROLLING_PRICE_SHORT_BUCKET_SECONDS as usize;
+const ROLLING_PRICE_LONG_BUCKET_SECONDS: i64 = 60;
+const ROLLING_PRICE_LONG_BUCKETS: usize = 60 * 60 / ROLLING_PRICE_LONG_BUCKET_SECONDS as usize;
+#[cfg(test)]
+pub(crate) const ROLLING_PRICE_RANGE_BUCKETS: usize =
+    ROLLING_PRICE_SHORT_BUCKETS + ROLLING_PRICE_LONG_BUCKETS;
+
+/// Counts from one full 5m candles snapshot after Active Lib applies the
+/// current trades-retention scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CandlesSnapshotApplySummary {
+    pub received_markets: usize,
+    pub received_candles: usize,
+    pub retained_markets: usize,
+    pub retained_candles: usize,
+}
+
+/// Event emitted when Active Lib's initial full 5m candles snapshot reaches the
+/// retained history worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandlesSnapshotEvent {
+    Ready {
+        #[cfg(any(test, feature = "diagnostics"))]
+        #[doc(hidden)]
+        request_uid: u64,
+        summary: CandlesSnapshotApplySummary,
+    },
+    Failed {
+        #[cfg(any(test, feature = "diagnostics"))]
+        #[doc(hidden)]
+        request_uid: Option<u64>,
+        error: String,
+    },
+}
+
+/// Stable application ticket for one demand-driven market chart archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketHistoryTicket {
+    pub market: String,
+    request_id: u64,
+}
+
+impl MarketHistoryTicket {
+    pub(crate) fn new(market: String, request_id: u64) -> Self {
+        Self { market, request_id }
+    }
+
+    /// Application-level request identity. Wire retries keep this value while
+    /// using a fresh protocol UID.
+    pub fn id(&self) -> u64 {
+        self.request_id
+    }
+}
+
+/// Row counts for the four sections of a market chart archive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MarketHistoryCounts {
+    pub futures_trades: usize,
+    pub mini_candles: usize,
+    pub last_prices: usize,
+    pub liquidations: usize,
+}
+
+/// Result of merging one core chart archive into retained market history.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MarketHistoryApplySummary {
+    /// Rows decoded from the core archive.
+    pub received: MarketHistoryCounts,
+    /// Rows retained after merging the archive with live rows and applying the
+    /// configured ring capacities.
+    pub retained: MarketHistoryCounts,
+    /// Wall time spent only inside the retained-history merge/apply step.
+    #[cfg(any(test, feature = "diagnostics"))]
+    #[doc(hidden)]
+    pub apply_wall_micros: u64,
+}
+
+/// Completion of a demand-driven market chart archive request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarketHistoryEvent {
+    /// The archive has already been merged into the retained readers.
+    /// Consumers should restart their chart cursors from the oldest retained
+    /// row to ingest the newly prepended history.
+    Ready {
+        ticket: MarketHistoryTicket,
+        summary: MarketHistoryApplySummary,
+    },
+    Failed {
+        ticket: MarketHistoryTicket,
+        error: String,
+    },
+}
+
+/// Per-packet time-shift state for compact trades-stream rows.
+///
+/// The first known/stored row in a packet fixes
+/// `TimeShift := round((NowTimeX - RowTime) * 1440) / 1440`; every later row in the
+/// packet uses the same shift. Unknown-market sections skipped by Active Lib do
+/// not fill this value.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct TradesPacketTimeShift {
+    shift_days: Option<f64>,
+}
+
+impl TradesPacketTimeShift {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shift_days(&self) -> Option<f64> {
+        self.shift_days
+    }
+
+    // parity: MoonBot MoonProtoEngine.pas:ProcessTradesStream (per-packet TimeShift)
+    pub(crate) fn shifted_time(
+        &mut self,
+        base_time: f64,
+        time_delta_ms: i16,
+        now_time: f64,
+    ) -> MoonTime {
+        let row_time = base_time + f64::from(time_delta_ms) / DELPHI_MSECS_PER_DAY;
+        let shift = *self
+            .shift_days
+            .get_or_insert_with(|| utc_shift_from_wire_local(now_time, row_time));
+        moon_time_from_delphi_days(row_time + shift)
+    }
+}
+
+#[inline]
+pub(crate) fn utc_shift_from_wire_local(now_time: f64, row_time: f64) -> f64 {
+    ((now_time - row_time) * 1_440.0).round() / 1_440.0
+}
+
+#[inline]
+pub(crate) fn moon_time_from_delphi_days(days: f64) -> MoonTime {
+    MoonTime::from_delphi_days(days).unwrap_or(MoonTime::ZERO)
+}
+
+/// Detailed trade/liquidation row stored in retained market history.
+///
+/// The compact production layout is 16 bytes: time, `f32` price, and signed
+/// `f32` quantity. A clear sign bit means buy, a set sign bit means sell. The
+/// sign-bit check intentionally treats `-0.0` as sell, preserving byte-level
+/// behavior for historical rows and chart/tape calculations.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[repr(C)]
+pub struct TradeHistoryRow {
+    pub time: MoonTime,
+    pub price: f32,
+    pub qty: f32,
+}
+
+impl TradeHistoryRow {
+    #[inline]
+    pub fn time(self) -> MoonTime {
+        self.time
+    }
+
+    #[inline]
+    pub fn unix_millis(self) -> i64 {
+        self.time.unix_millis()
+    }
+
+    #[inline]
+    pub fn quantity(self) -> f32 {
+        self.qty.abs()
+    }
+
+    #[inline]
+    pub fn is_buy(self) -> bool {
+        self.qty.to_bits() & 0x8000_0000 == 0
+    }
+
+    pub fn same_direction(self, other: Self) -> bool {
+        (self.qty.to_bits() ^ other.qty.to_bits()) & 0x8000_0000 == 0
+    }
+
+    #[inline]
+    pub fn traded_value(self) -> f32 {
+        self.price * self.quantity()
+    }
+}
+
+impl SeqRingTimedRow for TradeHistoryRow {
+    fn seq_ring_time_ms(&self) -> i64 {
+        self.time.unix_millis()
+    }
+}
+
+impl SeqRingPriceRow for TradeHistoryRow {
+    fn seq_ring_price_range(&self) -> Option<(f32, f32)> {
+        Some((self.price, self.price))
+    }
+}
+
+impl SeqRingQtyRow for TradeHistoryRow {
+    fn seq_ring_qty(&self) -> Option<f64> {
+        Some(f64::from(self.quantity()))
+    }
+}
+
+/// Main market-maker history row.
+///
+/// The base row stores time, volume, and quantity. Optional taker address and
+/// color are companion data and stay in a separate slot-aligned companion ring,
+/// not silently folded into this base row.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[repr(C)]
+pub struct MMOrderHistoryRow {
+    pub time: MoonTime,
+    pub volume: f64,
+    pub q: f64,
+}
+
+impl MMOrderHistoryRow {
+    #[inline]
+    pub fn time(self) -> MoonTime {
+        self.time
+    }
+
+    #[inline]
+    pub fn unix_millis(self) -> i64 {
+        self.time.unix_millis()
+    }
+}
+
+impl SeqRingTimedRow for MMOrderHistoryRow {
+    fn seq_ring_time_ms(&self) -> i64 {
+        self.time.unix_millis()
+    }
+}
+
+impl SeqRingQtyRow for MMOrderHistoryRow {
+    fn seq_ring_qty(&self) -> Option<f64> {
+        Some(self.q.abs())
+    }
+}
+
+/// Slot-aligned companion data for [`MMOrderHistoryRow`].
+///
+/// The companion stores a 20-byte HyperDex taker address and ARGB color beside
+/// the base MM-order row by slot, not inside the base row.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct MMOrderCompanionData {
+    pub(crate) taker: [u8; 20],
+    pub(crate) color: u32,
+}
+
+impl MMOrderCompanionData {
+    /// HyperDex taker address bytes.
+    pub fn taker(&self) -> &[u8; 20] {
+        &self.taker
+    }
+
+    /// HyperDex taker address formatted as lowercase `0x...` hex.
+    pub fn taker_hex(&self) -> String {
+        hl_address_hex(&self.taker)
+    }
+
+    /// Deterministic ARGB color derived from the taker address.
+    pub fn color_argb(&self) -> u32 {
+        self.color
+    }
+}
+
+// parity: MoonBot HLHelpers.pas:HLAddressColor
+pub fn hl_address_color(taker: [u8; 20]) -> u32 {
+    let mut r = 0u8;
+    let mut g = 0u8;
+    let mut b = 0u8;
+    for (idx, byte) in taker.into_iter().enumerate() {
+        match idx % 3 {
+            0 => r ^= byte,
+            1 => g ^= byte,
+            _ => b ^= byte,
+        }
+    }
+
+    let scale = |x: u8| -> u32 { ((u32::from(x) * 5) >> 3) + 80 };
+    0xFF00_0000 | (scale(r) << 16) | (scale(g) << 8) | scale(b)
+}
+
+// parity: MoonBot HLHelpers.pas:HLAddressToHex(..., true)
+pub fn hl_address_hex(address: &[u8; 20]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(42);
+    out.push_str("0x");
+    for b in address {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Last-price history point used by the retained brown price line.
+///
+/// The retained row is compact: `f32` price plus timestamp. The source value is
+/// the market-list midpoint `(bid + ask) / 2`, not the trades stream last trade
+/// price.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[repr(C)]
+pub struct LastPricePoint {
+    pub(crate) current: f32,
+    pub(crate) time: MoonTime,
+}
+
+impl LastPricePoint {
+    #[inline]
+    pub fn price(self) -> f32 {
+        self.current
+    }
+
+    #[inline]
+    pub fn time(self) -> MoonTime {
+        self.time
+    }
+
+    #[inline]
+    pub fn unix_millis(self) -> i64 {
+        self.time.unix_millis()
+    }
+}
+
+impl SeqRingTimedRow for LastPricePoint {
+    fn seq_ring_time_ms(&self) -> i64 {
+        self.time.unix_millis()
+    }
+}
+
+impl SeqRingPriceRow for LastPricePoint {
+    fn seq_ring_price_range(&self) -> Option<(f32, f32)> {
+        Some((self.current, self.current))
+    }
+}
+
+/// Active Lib retained MarkPrice chart line row.
+///
+/// The source value is `UpdateMarketsList -> MarketPrice.mark_price`. Unlike
+/// `LastPricePoint`, this line is maintained for every retained market when the
+/// server marks the row as present.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[repr(C)]
+pub struct MarkPricePoint {
+    pub(crate) current: f32,
+    pub(crate) time: MoonTime,
+}
+
+impl MarkPricePoint {
+    #[inline]
+    pub fn price(self) -> f32 {
+        self.current
+    }
+
+    #[inline]
+    pub fn time(self) -> MoonTime {
+        self.time
+    }
+
+    #[inline]
+    pub fn unix_millis(self) -> i64 {
+        self.time.unix_millis()
+    }
+}
+
+impl SeqRingTimedRow for MarkPricePoint {
+    fn seq_ring_time_ms(&self) -> i64 {
+        self.time.unix_millis()
+    }
+}
+
+impl SeqRingPriceRow for MarkPricePoint {
+    fn seq_ring_price_range(&self) -> Option<(f32, f32)> {
+        Some((self.current, self.current))
+    }
+}
+
+/// Active Lib retained 5-minute candle row.
+///
+/// The row lives in retained state because applications read it together with
+/// trades and derived analytics. Extra wall-helper fields from the transport
+/// snapshot are deliberately not retained here: the library decision is to
+/// expose candles, not wall UI helpers.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[repr(C)]
+pub struct Candle5mRow {
+    pub(crate) open: f32,
+    pub(crate) close: f32,
+    pub(crate) high: f32,
+    pub(crate) low: f32,
+    pub(crate) volume: f32,
+    pub(crate) time: MoonTime,
+}
+
+impl Candle5mRow {
+    pub fn from_deep_price(row: crate::commands::candles::DeepPrice) -> Self {
+        Self {
+            open: row.open,
+            close: row.close,
+            high: row.high,
+            low: row.low,
+            volume: row.volume,
+            time: moon_time_from_delphi_days(row.time),
+        }
+    }
+
+    #[inline]
+    pub fn open(self) -> f32 {
+        self.open
+    }
+
+    #[inline]
+    pub fn close(self) -> f32 {
+        self.close
+    }
+
+    #[inline]
+    pub fn high(self) -> f32 {
+        self.high
+    }
+
+    #[inline]
+    pub fn low(self) -> f32 {
+        self.low
+    }
+
+    #[inline]
+    pub fn volume(self) -> f32 {
+        self.volume
+    }
+
+    #[inline]
+    pub fn time(self) -> MoonTime {
+        self.time
+    }
+
+    #[inline]
+    pub fn unix_millis(self) -> i64 {
+        self.time.unix_millis()
+    }
+}
+
+impl SeqRingTimedRow for Candle5mRow {
+    fn seq_ring_time_ms(&self) -> i64 {
+        self.time.unix_millis()
+    }
+}
+
+impl SeqRingPriceRow for Candle5mRow {
+    fn seq_ring_price_range(&self) -> Option<(f32, f32)> {
+        Some((self.low, self.high))
+    }
+}
+
+impl SeqRingQtyRow for Candle5mRow {
+    fn seq_ring_qty(&self) -> Option<f64> {
+        Some(f64::from(self.volume))
+    }
+}
+
+/// Mini-candle used to compact evicted detailed trades.
+///
+/// Compact row: time, trade count, min/max price, buy volume, and sell volume.
+/// The native Rust layout is intentionally aligned for fast scans; sizing uses
+/// `size_of::<MiniCandle>()`, so padding is included in memory estimates.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[repr(C)]
+pub struct MiniCandle {
+    pub time: MoonTime,
+    pub cnt: i32,
+    pub min_price: f32,
+    pub max_price: f32,
+    pub buy_vol: f32,
+    pub sell_vol: f32,
+}
+
+impl MiniCandle {
+    #[inline]
+    pub fn time(self) -> MoonTime {
+        self.time
+    }
+
+    #[inline]
+    pub fn unix_millis(self) -> i64 {
+        self.time.unix_millis()
+    }
+
+    #[inline]
+    pub fn low(self) -> f32 {
+        self.min_price
+    }
+
+    #[inline]
+    pub fn high(self) -> f32 {
+        self.max_price
+    }
+
+    #[inline]
+    pub fn buy_volume(self) -> f32 {
+        self.buy_vol
+    }
+
+    #[inline]
+    pub fn sell_volume(self) -> f32 {
+        self.sell_vol
+    }
+}
+
+impl SeqRingTimedRow for MiniCandle {
+    fn seq_ring_time_ms(&self) -> i64 {
+        self.time.unix_millis()
+    }
+}
+
+impl SeqRingPriceRow for MiniCandle {
+    fn seq_ring_price_range(&self) -> Option<(f32, f32)> {
+        Some((self.min_price, self.max_price))
+    }
+}
+
+impl SeqRingQtyRow for MiniCandle {
+    fn seq_ring_qty(&self) -> Option<f64> {
+        Some(f64::from(self.buy_vol + self.sell_vol))
+    }
+}
+
+/// Compact detailed trades into mini-candle groups.
+///
+/// The group anchor is the first trade time. A new candle starts when the next
+/// detailed row is more than five seconds away from that anchor. Split groups
+/// are appended only when newer than `last_mini_time` and older than the resize
+/// `now_time`; the final group only checks `c.time > last_mini_time`.
+// parity: MoonBot MarketsU.pas:TMarket.ResizeOrdersHistory (UseTradesCompression)
+pub(crate) fn compact_trades_to_mini_candles(
+    rows: &[TradeHistoryRow],
+    last_mini_time: MoonTime,
+    now_time: MoonTime,
+    out: &mut Vec<MiniCandle>,
+) {
+    let Some(first) = rows.first() else {
+        return;
+    };
+
+    let mut newest_mini_time = last_mini_time;
+    let mut anchor_time = first.time;
+    let mut candle = empty_mini_candle(anchor_time);
+
+    for row in rows {
+        if (anchor_time.unix_millis() - row.time.unix_millis()).abs() > MINI_CANDLE_SPLIT_MS
+            && candle.cnt > 0
+        {
+            if candle.time > newest_mini_time && candle.time < now_time {
+                out.push(candle);
+                newest_mini_time = candle.time;
+            }
+
+            anchor_time = row.time;
+            candle = empty_mini_candle(anchor_time);
+        }
+
+        if row.is_buy() {
+            candle.buy_vol += row.traded_value();
+        } else {
+            candle.sell_vol += row.traded_value();
+        }
+        if candle.cnt == 0 {
+            candle.min_price = row.price;
+        }
+        candle.max_price = candle.max_price.max(row.price);
+        candle.min_price = candle.min_price.min(row.price);
+        candle.cnt += 1;
+    }
+
+    if candle.cnt > 0 && candle.time > newest_mini_time {
+        out.push(candle);
+    }
+}
+
+fn empty_mini_candle(time: MoonTime) -> MiniCandle {
+    MiniCandle {
+        time,
+        cnt: 0,
+        min_price: 0.0,
+        max_price: 0.0,
+        buy_vol: 0.0,
+        sell_vol: 0.0,
+    }
+}
+
+/// Buy/sell rolling volume totals.
+///
+/// `*_value` is `price * abs(quantity)`. `*_qty` keeps the coin/base quantity
+/// separately for clients that need it.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct TradeVolumeTotals {
+    pub buy_value: f64,
+    pub sell_value: f64,
+    pub buy_qty: f64,
+    pub sell_qty: f64,
+    pub trade_count: u32,
+    pub min_price: f32,
+    pub max_price: f32,
+}
+
+impl TradeVolumeTotals {
+    pub fn total_value(self) -> f64 {
+        self.buy_value + self.sell_value
+    }
+
+    pub fn price_delta_percent(self) -> f64 {
+        if self.min_price <= 0.0 || self.max_price <= 0.0 || self.max_price < self.min_price {
+            return 0.0;
+        }
+        (f64::from(self.max_price) / f64::from(self.min_price) - 1.0) * 100.0
+    }
+
+    fn add_trade_with_quantity(&mut self, row: TradeHistoryRow, quantity: f32) {
+        let qty = f64::from(quantity);
+        let value = row.price as f64 * qty;
+        if row.is_buy() {
+            self.buy_value += value;
+            self.buy_qty += qty;
+        } else {
+            self.sell_value += value;
+            self.sell_qty += qty;
+        }
+        self.add_price(row.price);
+        self.trade_count = self.trade_count.saturating_add(1);
+    }
+
+    fn add_price(&mut self, price: f32) {
+        if price <= 0.0 {
+            return;
+        }
+        if self.min_price <= 0.0 || price < self.min_price {
+            self.min_price = price;
+        }
+        if price > self.max_price {
+            self.max_price = price;
+        }
+    }
+
+    fn add_totals(&mut self, other: Self) {
+        self.buy_value += other.buy_value;
+        self.sell_value += other.sell_value;
+        self.buy_qty += other.buy_qty;
+        self.sell_qty += other.sell_qty;
+        self.trade_count = self.trade_count.saturating_add(other.trade_count);
+        self.add_price(other.min_price);
+        self.add_price(other.max_price);
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct RollingTradeVolumeSnapshot {
+    pub one_minute: TradeVolumeTotals,
+    pub three_minutes: TradeVolumeTotals,
+    pub five_minutes: TradeVolumeTotals,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct DerivedDeltaSnapshot {
+    pub one_minute: f64,
+    pub five_minutes: f64,
+    pub fifteen_minutes: f64,
+    pub thirty_minutes: f64,
+    pub one_hour: f64,
+    pub two_hours: f64,
+    pub three_hours: f64,
+    pub twenty_four_hours: f64,
+    pub seventy_two_hours: f64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct CandleVolumeSnapshot {
+    pub five_minutes: f64,
+    pub fifteen_minutes: f64,
+    pub thirty_minutes: f64,
+    pub one_hour: f64,
+    pub two_hours: f64,
+    pub three_hours: f64,
+    pub twenty_four_hours: f64,
+    pub seventy_two_hours: f64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct MarketDerivedSnapshot {
+    pub trade_volumes: RollingTradeVolumeSnapshot,
+    /// Total quote volume from retained 5m candles plus the current candle.
+    /// Unlike trade volumes, candles do not carry buy/sell split.
+    pub candle_volumes: CandleVolumeSnapshot,
+    /// Deltas from retained/joined futures trades. Currently populated for
+    /// 1m and 5m windows from the same 5-second buckets as volumes.
+    pub trade_deltas: DerivedDeltaSnapshot,
+    /// Deltas from retained 5m candles plus the current candle.
+    ///
+    /// Long candle delta fields use production-core bucket semantics:
+    /// `two_hours` covers the `h <= 2` buckets (roughly three hours),
+    /// `three_hours` covers `h <= 3` (roughly four hours), and
+    /// `twenty_four_hours` covers `h <= 24` (roughly 25 hours).
+    /// Derived calculation uses at most the newest 500 sealed candles even if
+    /// the public chart ring retains more. Consequently `seventy_two_hours`
+    /// covers the available tail, at most about 41h40m at 5m resolution.
+    pub candle_deltas: DerivedDeltaSnapshot,
+    /// Deltas from the retained LastPrice/HistoryPrice line.
+    ///
+    /// Active Lib feeds this line from market-list midpoint updates and uses it
+    /// for the 15m/30m/1h derived windows.
+    pub last_price_deltas: DerivedDeltaSnapshot,
+    /// Combined convenient view. For each field it is the max of the trade and
+    /// retained-history sources for that window, so a hotter short-source delta
+    /// is not lowered by a colder long-source delta.
+    pub deltas: DerivedDeltaSnapshot,
+    /// In-progress (not yet sealed) 5m candle.
+    /// Lives OUTSIDE the sealed `candles_5m` ring; the chart draws it as a
+    /// live bar. `None` while the current period has had no trades yet.
+    ///
+    /// Timestamp convention (sverka #14 V3): this live candle's `time` is the
+    /// period START (its first trade), while sealed candles in the `candles_5m`
+    /// ring are stamped at seal with the period END. OHLC and volume are
+    /// correct in both; a chart that open-aligns its bars should map the live
+    /// candle to the current period's open.
+    pub current_candle: Option<Candle5mRow>,
+}
+
+/// Incremental rolling volumes for the Active Lib trade history.
+///
+/// Buckets are 5 seconds wide and cover 5 minutes total. This intentionally
+/// avoids repeated full scans while preserving the public value being
+/// maintained: fast buy/sell trade volume over 1/3/5 minute windows. The
+/// accepted precision loss is bounded by one bucket width.
+#[derive(Debug, Clone)]
+pub(crate) struct RollingTradeVolumes {
+    buckets: [TradeVolumeBucket; ROLLING_VOLUME_BUCKETS],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TradeVolumeBucket {
+    bucket_id: i64,
+    totals: TradeVolumeTotals,
+}
+
+impl Default for TradeVolumeBucket {
+    fn default() -> Self {
+        Self {
+            bucket_id: i64::MIN,
+            totals: TradeVolumeTotals::default(),
+        }
+    }
+}
+
+impl Default for RollingTradeVolumes {
+    fn default() -> Self {
+        Self {
+            buckets: [TradeVolumeBucket::default(); ROLLING_VOLUME_BUCKETS],
+        }
+    }
+}
+
+impl RollingTradeVolumes {
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(crate) fn add_trade(&mut self, row: TradeHistoryRow) {
+        self.add_trade_with_quantity(row, row.quantity());
+    }
+
+    pub(crate) fn add_trade_with_quantity(&mut self, row: TradeHistoryRow, quantity: f32) {
+        let bucket_id = volume_bucket_id(row.time);
+        let idx = volume_bucket_index(bucket_id);
+        let bucket = &mut self.buckets[idx];
+        if bucket.bucket_id != bucket_id {
+            *bucket = TradeVolumeBucket {
+                bucket_id,
+                totals: TradeVolumeTotals::default(),
+            };
+        }
+        bucket.totals.add_trade_with_quantity(row, quantity);
+    }
+
+    pub(crate) fn snapshot(&self, now_time: MoonTime) -> RollingTradeVolumeSnapshot {
+        let now_bucket = volume_bucket_id(now_time);
+        let one_minute_oldest = oldest_volume_bucket(now_bucket, 60);
+        let three_minutes_oldest = oldest_volume_bucket(now_bucket, 3 * 60);
+        let five_minutes_oldest = oldest_volume_bucket(now_bucket, 5 * 60);
+
+        let mut snapshot = RollingTradeVolumeSnapshot::default();
+        for bucket in &self.buckets {
+            if bucket.bucket_id < five_minutes_oldest || bucket.bucket_id > now_bucket {
+                continue;
+            }
+            snapshot.five_minutes.add_totals(bucket.totals);
+            if bucket.bucket_id >= three_minutes_oldest {
+                snapshot.three_minutes.add_totals(bucket.totals);
+            }
+            if bucket.bucket_id >= one_minute_oldest {
+                snapshot.one_minute.add_totals(bucket.totals);
+            }
+        }
+        snapshot
+    }
+}
+
+/// Hierarchical price baskets for LastPrice-derived windows up to one hour.
+///
+/// Retained LastPrice history is a chart store and may be very large. Derived
+/// ranges only need the latest hour, so they are maintained independently in
+/// 5-second baskets for 1m/5m and 1-minute baskets for 15m/30m/1h. This keeps
+/// short expiry precise while reducing the fixed scan from 720 to 120 baskets.
+#[derive(Debug, Clone)]
+pub(crate) struct RollingPriceRanges {
+    short_buckets: [PriceRangeBucket; ROLLING_PRICE_SHORT_BUCKETS],
+    long_buckets: [PriceRangeBucket; ROLLING_PRICE_LONG_BUCKETS],
+    newest_short_bucket_id: i64,
+    newest_long_bucket_id: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PriceRangeBucket {
+    bucket_id: i64,
+    min_price: f32,
+    max_price: f32,
+}
+
+impl Default for PriceRangeBucket {
+    fn default() -> Self {
+        Self {
+            bucket_id: i64::MIN,
+            min_price: 0.0,
+            max_price: 0.0,
+        }
+    }
+}
+
+impl Default for RollingPriceRanges {
+    fn default() -> Self {
+        Self {
+            short_buckets: [PriceRangeBucket::default(); ROLLING_PRICE_SHORT_BUCKETS],
+            long_buckets: [PriceRangeBucket::default(); ROLLING_PRICE_LONG_BUCKETS],
+            newest_short_bucket_id: i64::MIN,
+            newest_long_bucket_id: i64::MIN,
+        }
+    }
+}
+
+impl RollingPriceRanges {
+    pub(crate) fn add_price(&mut self, time: MoonTime, price: f32) {
+        if time == MoonTime::ZERO || price <= 0.0 || !price.is_finite() {
+            return;
+        }
+        let time_ms = time.unix_millis();
+        add_price_bucket(
+            &mut self.short_buckets,
+            &mut self.newest_short_bucket_id,
+            time_ms.div_euclid(ROLLING_PRICE_SHORT_BUCKET_SECONDS * 1_000),
+            price,
+        );
+        add_price_bucket(
+            &mut self.long_buckets,
+            &mut self.newest_long_bucket_id,
+            time_ms.div_euclid(ROLLING_PRICE_LONG_BUCKET_SECONDS * 1_000),
+            price,
+        );
+    }
+
+    pub(crate) fn snapshot(&self, now_time: MoonTime, eps: f64) -> DerivedDeltaSnapshot {
+        let now_short = price_range_bucket_id(now_time, ROLLING_PRICE_SHORT_BUCKET_SECONDS);
+        let one_minute_oldest =
+            oldest_price_range_bucket(now_short, 60, ROLLING_PRICE_SHORT_BUCKET_SECONDS);
+        let five_minutes_oldest =
+            oldest_price_range_bucket(now_short, 5 * 60, ROLLING_PRICE_SHORT_BUCKET_SECONDS);
+
+        let mut one_minute = PriceRangeTotals::default();
+        let mut five_minutes = PriceRangeTotals::default();
+        for bucket in &self.short_buckets {
+            if bucket.bucket_id < five_minutes_oldest || bucket.bucket_id > now_short {
+                continue;
+            }
+            five_minutes.add_bucket(*bucket);
+            if bucket.bucket_id >= one_minute_oldest {
+                one_minute.add_bucket(*bucket);
+            }
+        }
+
+        let now_long = price_range_bucket_id(now_time, ROLLING_PRICE_LONG_BUCKET_SECONDS);
+        let fifteen_minutes_oldest =
+            oldest_price_range_bucket(now_long, 15 * 60, ROLLING_PRICE_LONG_BUCKET_SECONDS);
+        let thirty_minutes_oldest =
+            oldest_price_range_bucket(now_long, 30 * 60, ROLLING_PRICE_LONG_BUCKET_SECONDS);
+        let one_hour_oldest =
+            oldest_price_range_bucket(now_long, 60 * 60, ROLLING_PRICE_LONG_BUCKET_SECONDS);
+        let mut fifteen_minutes = PriceRangeTotals::default();
+        let mut thirty_minutes = PriceRangeTotals::default();
+        let mut one_hour = PriceRangeTotals::default();
+        for bucket in &self.long_buckets {
+            if bucket.bucket_id < one_hour_oldest || bucket.bucket_id > now_long {
+                continue;
+            }
+            one_hour.add_bucket(*bucket);
+            if bucket.bucket_id >= thirty_minutes_oldest {
+                thirty_minutes.add_bucket(*bucket);
+            }
+            if bucket.bucket_id >= fifteen_minutes_oldest {
+                fifteen_minutes.add_bucket(*bucket);
+            }
+        }
+
+        DerivedDeltaSnapshot {
+            one_minute: one_minute.delta_percent(eps),
+            five_minutes: five_minutes.delta_percent(eps),
+            fifteen_minutes: fifteen_minutes.delta_percent(eps),
+            thirty_minutes: thirty_minutes.delta_percent(eps),
+            one_hour: one_hour.delta_percent(eps),
+            ..DerivedDeltaSnapshot::default()
+        }
+    }
+}
+
+fn add_price_bucket<const N: usize>(
+    buckets: &mut [PriceRangeBucket; N],
+    newest_bucket_id: &mut i64,
+    bucket_id: i64,
+    price: f32,
+) {
+    if *newest_bucket_id != i64::MIN && bucket_id <= *newest_bucket_id - N as i64 {
+        return;
+    }
+    if bucket_id > *newest_bucket_id {
+        *newest_bucket_id = bucket_id;
+    }
+    let idx = bucket_id.rem_euclid(N as i64) as usize;
+    let bucket = &mut buckets[idx];
+    if bucket.bucket_id != bucket_id {
+        *bucket = PriceRangeBucket {
+            bucket_id,
+            min_price: price,
+            max_price: price,
+        };
+    } else {
+        if price < bucket.min_price {
+            bucket.min_price = price;
+        }
+        if price > bucket.max_price {
+            bucket.max_price = price;
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PriceRangeTotals {
+    min_price: f32,
+    max_price: f32,
+}
+
+impl PriceRangeTotals {
+    fn add_bucket(&mut self, bucket: PriceRangeBucket) {
+        if bucket.min_price <= 0.0 || bucket.max_price < bucket.min_price {
+            return;
+        }
+        if self.min_price <= 0.0 || bucket.min_price < self.min_price {
+            self.min_price = bucket.min_price;
+        }
+        if bucket.max_price > self.max_price {
+            self.max_price = bucket.max_price;
+        }
+    }
+
+    fn delta_percent(self, eps: f64) -> f64 {
+        let min_price = f64::from(self.min_price);
+        let max_price = f64::from(self.max_price);
+        if min_price <= eps || max_price <= eps || max_price < min_price {
+            return 0.0;
+        }
+        (max_price / min_price - 1.0) * 100.0
+    }
+}
+
+fn oldest_price_range_bucket(now_bucket: i64, window_seconds: i64, bucket_seconds: i64) -> i64 {
+    let buckets_back = (window_seconds + bucket_seconds - 1) / bucket_seconds;
+    now_bucket - buckets_back + 1
+}
+
+fn price_range_bucket_id(time: MoonTime, bucket_seconds: i64) -> i64 {
+    time.unix_millis().div_euclid(bucket_seconds * 1_000)
+}
+
+fn oldest_volume_bucket(now_bucket: i64, window_seconds: i64) -> i64 {
+    let buckets_back =
+        (window_seconds + ROLLING_VOLUME_BUCKET_SECONDS - 1) / ROLLING_VOLUME_BUCKET_SECONDS;
+    now_bucket - buckets_back + 1
+}
+
+fn volume_bucket_id(time: MoonTime) -> i64 {
+    time.unix_millis()
+        .div_euclid(ROLLING_VOLUME_BUCKET_SECONDS * 1_000)
+}
+
+fn volume_bucket_index(bucket_id: i64) -> usize {
+    bucket_id.rem_euclid(ROLLING_VOLUME_BUCKETS as i64) as usize
+}
+
+#[cfg(test)]
+mod tests;

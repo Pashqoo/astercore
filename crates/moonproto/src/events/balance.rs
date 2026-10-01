@@ -1,0 +1,138 @@
+//! Active `MPC_Balance` dispatch.
+//!
+//! Mirrors Delphi balance/arb receive routing: parse subcommand, apply balances
+//! against known markets, and expose compact arbitrage payload only for known
+//! market indexes.
+
+use super::{ActiveAction, ArbEvent, Event, EventDispatcher};
+use crate::commands::arb::{parse_arb_payload_compact, parse_arb_prices, ArbPayload};
+use crate::commands::balance::{parse_balance, parse_balance_digest, parse_market_session_profits};
+use crate::protocol::Command;
+use crate::state::epoch::epoch_is_ok;
+
+impl EventDispatcher {
+    pub(super) fn client_new_data_balance(
+        &mut self,
+        payload: &[u8],
+        now_time_days: Option<f64>,
+        out: &mut Vec<Event>,
+        actions: &mut Vec<ActiveAction>,
+    ) {
+        if payload.len() < 11 {
+            Self::push_parse_failed(out, Command::Balance, payload);
+            return;
+        }
+        let sub_cmd_id = payload[0];
+        let ver = u16::from_le_bytes([payload[1], payload[2]]);
+        if ver > crate::commands::registry::CURRENT_PROTO_CMD_VER {
+            return;
+        }
+        let body = &payload[11..];
+        match sub_cmd_id {
+            0 | 1 | 2 | 5 => {}
+            3 | 4 => match parse_balance(sub_cmd_id, body) {
+                Some(upd) => {
+                    // Single Delphi-parity apply: per-market into live markets.
+                    if let Some(ev) = self.markets.apply_balance_update(&upd) {
+                        // Account total PnL recomputed from the just-updated markets
+                        // (Delphi `RecalcTotalPnl`), then account globals applied.
+                        let total_pnl = self.markets.sum_btc_total_profit();
+                        self.balances.apply_global(&upd, total_pnl);
+                        out.push(Event::Balance(ev));
+                    }
+                }
+                None => Self::push_parse_failed(out, Command::Balance, payload),
+            },
+            6 => match parse_arb_prices(payload) {
+                Some(arb) => {
+                    if let Some(parsed) = parse_arb_payload_compact(&arb.payload) {
+                        let parsed = self.filter_arb_payload_to_known_markets(parsed);
+                        let wanted = self
+                            .settings
+                            .client_settings
+                            .as_ref()
+                            .map(|settings| &settings.arb_config.wanted);
+                        let summary = self.markets.apply_arb_payload(
+                            &parsed,
+                            wanted,
+                            now_time_days.unwrap_or_default(),
+                        );
+                        out.push(match &parsed {
+                            ArbPayload::Price { version, blocks } => {
+                                #[cfg(not(any(test, feature = "diagnostics")))]
+                                let _ = version;
+                                let price_items =
+                                    blocks.iter().map(|block| block.prices.len()).sum();
+                                Event::Arb(ArbEvent::PricesApplied {
+                                    #[cfg(any(test, feature = "diagnostics"))]
+                                    uid: arb.uid,
+                                    #[cfg(any(test, feature = "diagnostics"))]
+                                    version: *version,
+                                    market_blocks: blocks.len(),
+                                    price_items,
+                                    applied_prices: summary.applied_prices,
+                                })
+                            }
+                            ArbPayload::Isolation { version, entries } => {
+                                #[cfg(not(any(test, feature = "diagnostics")))]
+                                let _ = version;
+                                Event::Arb(ArbEvent::IsolationApplied {
+                                    #[cfg(any(test, feature = "diagnostics"))]
+                                    uid: arb.uid,
+                                    #[cfg(any(test, feature = "diagnostics"))]
+                                    version: *version,
+                                    entries: entries.len(),
+                                    applied_entries: summary.applied_isolation_entries,
+                                })
+                            }
+                        });
+                    }
+                }
+                None => Self::push_parse_failed(out, Command::Balance, payload),
+            },
+            7 => match parse_market_session_profits(body) {
+                Some(upd) => {
+                    if let Some(ev) = self.markets.apply_session_profit_snapshot(&upd) {
+                        out.push(Event::Balance(ev));
+                    }
+                }
+                None => Self::push_parse_failed(out, Command::Balance, payload),
+            },
+            8 => {
+                let (epoch, digest) = parse_balance_digest(body);
+                if !epoch_is_ok(self.balances.last_epoch, epoch) {
+                    return;
+                }
+                self.balances.last_epoch = epoch;
+                let mine = self
+                    .markets
+                    .balance_digest(self.balances.global.balance_hash());
+                if mine != digest {
+                    log::info!(target: "moonproto::balance",
+                        "Balance digest mismatch: kernel {digest:016x}, ours {mine:016x}, requesting full snapshot");
+                    actions.push(ActiveAction::BalanceDigest { digest: mine });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn filter_arb_payload_to_known_markets(&self, payload: ArbPayload) -> ArbPayload {
+        match payload {
+            ArbPayload::Price {
+                version,
+                mut blocks,
+            } => {
+                blocks.retain(|block| self.markets.has_server_market_index(block.market_index));
+                ArbPayload::Price { version, blocks }
+            }
+            ArbPayload::Isolation {
+                version,
+                mut entries,
+            } => {
+                entries.retain(|entry| self.markets.has_server_market_index(entry.market_index));
+                ArbPayload::Isolation { version, entries }
+            }
+        }
+    }
+}
