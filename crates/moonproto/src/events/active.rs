@@ -151,12 +151,14 @@ impl EventDispatcher {
             self.server_time_delta_source = Some(Arc::clone(&ctx.server_time_delta_source));
         }
         self.set_eps_profile(ctx.eps_profile);
-        self.markets
-            .set_copy_max_leverage_from_markets_list(ctx.copy_max_leverage_from_markets_list);
-        self.markets.set_server_base_currency(
-            ctx.server_base_currency_name.as_deref(),
-            ctx.server_base_currency_code,
-        );
+        // Avoid cloning published market metadata for unchanged packet context.
+        if self.markets.copy_max_leverage_from_markets_list() != ctx.copy_max_leverage_from_markets_list {
+            self.markets.set_copy_max_leverage_from_markets_list(ctx.copy_max_leverage_from_markets_list);
+        }
+        let base_name = ctx.server_base_currency_name.as_deref();
+        if !self.markets.server_base_currency_matches(base_name, ctx.server_base_currency_code) {
+            self.markets.set_server_base_currency(base_name, ctx.server_base_currency_code);
+        }
         self.orders.set_route(
             ctx.server_base_currency_code
                 .unwrap_or(BaseCurrency::UNKNOWN),
@@ -206,6 +208,7 @@ impl EventDispatcher {
             // merged after that history by NewsState::apply_history.
             self.news.clear_for_hard_session();
             self.settings.problems = Default::default();
+            self.settings.telegram = None;
             log::info!(target: "moonproto::events",
                 "ServerToken changed ({:#x} -> {:#x}) - trades/orderbook/news session state reset",
                 self.last_known_server_token, current_token);
@@ -217,6 +220,7 @@ impl EventDispatcher {
         {
             self.news.clear_for_new_world();
             self.settings.problems = Default::default();
+            self.settings.telegram = None;
             self.markets.clear_session_profits_for_new_world();
         }
         self.last_known_peer_app_token = ctx.peer_app_token;
@@ -313,8 +317,10 @@ impl EventDispatcher {
             self.last_markets_list_refresh_ms = now_ms;
             actions.push(ActiveAction::RequestMarketsList);
         }
-        let new_markets_need_price_refresh =
-            self.markets.take_new_markets_pending_price_refresh() > 0;
+        let new_markets_need_price_refresh = self.markets.new_markets_need_price_refresh();
+        if new_markets_need_price_refresh {
+            self.markets.take_new_markets_pending_price_refresh();
+        }
         // now_ms is passed through dispatch_into for state.on_packet(now_ms).
         // Delphi `ProcessTradesStream` calls `CheckMissingTradesPackets` at the end;
         // so recovery resend is an after-effect of a successful trades packet, not an
@@ -466,5 +472,6 @@ fn is_pre_init_state_payload(cmd: Command, payload: &[u8]) -> bool {
                 || crate::commands::ui::is_kernel_license_state_payload(payload)
                 || crate::commands::ui::is_news_payload(payload)
                 || crate::commands::ui::is_problems_payload(payload)
+                || crate::commands::ui::is_telegram_state_payload(payload)
     )
 }

@@ -64,6 +64,7 @@ pub(crate) const UK_SHARED_CONFIG: u8 = 28;
 /// `UK_MarketSessionProfit`: singleton per-market session-profit snapshot key.
 pub(crate) const UK_MARKET_SESSION_PROFIT: u8 = 29;
 pub(crate) const UK_PROBLEMS_STATE: u8 = 30;
+pub(crate) const UK_TELEGRAM_STATE: u8 = 31;
 
 /// Send priority as protocol metadata, independent from the concrete client
 /// queue implementation. Conversion to `SendPriority` happens at the send edge.
@@ -377,6 +378,22 @@ pub(crate) const ORDER_COMMANDS: &[CommandDescriptor] = &[
         Command::Order,
         50,
         "TRepAliveMap",
+        base = Base,
+        priority = Sliced,
+        direction = Inbound
+    ),
+    cmd_desc!(
+        Command::Order,
+        51,
+        "TRepTraceRequest",
+        base = Base,
+        priority = High,
+        direction = Outbound
+    ),
+    cmd_desc!(
+        Command::Order,
+        52,
+        "TRepTrace",
         base = Base,
         priority = Sliced,
         direction = Inbound
@@ -761,6 +778,29 @@ pub(crate) const UI_COMMANDS: &[CommandDescriptor] = &[
         priority = High,
         direction = Outbound
     ),
+    cmd_desc!(
+        Command::UI,
+        36,
+        "TTelegramStateCommand",
+        base = Base,
+        priority = Sliced,
+        retries = None,
+        unique = UK_TELEGRAM_STATE,
+        ukey = UKeyRule::Singleton(1),
+        direction = Inbound
+    ),
+    cmd_desc!(Command::UI, 37, "TTelegramStateRequest", base = Base, priority = High, direction = Outbound),
+    cmd_desc!(Command::UI, 38, "TTelegramSetEnabledCommand", base = Base, priority = High, direction = Outbound),
+    cmd_desc!(Command::UI, 39, "TTelegramSetProxyCommand", base = Base, priority = High, direction = Outbound),
+    cmd_desc!(Command::UI, 40, "TTelegramSetLoginModeCommand", base = Base, priority = High, direction = Outbound),
+    cmd_desc!(Command::UI, 41, "TTelegramSetPhoneCommand", base = Base, priority = High, direction = Outbound),
+    cmd_desc!(Command::UI, 42, "TTelegramSetCodeCommand", base = Base, priority = High, direction = Outbound),
+    cmd_desc!(Command::UI, 43, "TTelegramSetPasswordCommand", base = Base, priority = High, direction = Outbound),
+    cmd_desc!(Command::UI, 44, "TTelegramSetEmailCommand", base = Base, priority = High, direction = Outbound),
+    cmd_desc!(Command::UI, 45, "TTelegramSetEmailCodeCommand", base = Base, priority = High, direction = Outbound),
+    cmd_desc!(Command::UI, 46, "TTelegramRegisterCommand", base = Base, priority = High, direction = Outbound),
+    cmd_desc!(Command::UI, 47, "TTelegramResendCodeCommand", base = Base, priority = High, direction = Outbound),
+    cmd_desc!(Command::UI, 48, "TTelegramLogoutCommand", base = Base, priority = High, direction = Outbound),
 ];
 
 pub(crate) const STRAT_COMMANDS: &[CommandDescriptor] = &[
@@ -1087,8 +1127,8 @@ mod tests {
 
     #[test]
     fn descriptor_map_covers_known_typed_domains() {
-        assert_eq!(ORDER_COMMANDS.len(), 24);
-        assert_eq!(UI_COMMANDS.len(), 36);
+        assert_eq!(ORDER_COMMANDS.len(), 26);
+        assert_eq!(UI_COMMANDS.len(), 49);
         assert_eq!(STRAT_COMMANDS.len(), 11);
         assert_eq!(BALANCE_COMMANDS.len(), 9);
         assert_eq!(API_COMMANDS.len(), 5);
@@ -1106,6 +1146,14 @@ mod tests {
 
     #[test]
     fn descriptor_map_keeps_delphi_default_retry_rules() {
+        let trace_request = find_descriptor(Command::Order, 51).unwrap();
+        assert_eq!(trace_request.priority, CommandPriority::High);
+        assert_eq!(trace_request.ukey, UKeyRule::None);
+        let trace_response = find_descriptor(Command::Order, 52).unwrap();
+        assert_eq!(trace_response.priority, CommandPriority::Sliced);
+        assert_eq!(trace_response.max_retries, 6);
+        assert_eq!(trace_response.ukey, UKeyRule::None);
+
         let settings = find_descriptor(Command::UI, 1).unwrap();
         assert_eq!(settings.priority, CommandPriority::Sliced);
         assert_eq!(settings.max_retries, 6);

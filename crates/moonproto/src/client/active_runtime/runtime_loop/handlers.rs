@@ -126,6 +126,7 @@ pub(super) fn handle_command(
         RuntimeCommand::SubscribeTradesFor { want_mm, markets } => {
             client.subscribe_trades_for(want_mm, markets);
             sync_runtime_trade_storage_scope(client, dispatcher);
+            cancel_unselected_market_history(client, dispatcher, pending);
             schedule_auto_candles_snapshot(client, pending);
             false
         }
@@ -134,6 +135,7 @@ pub(super) fn handle_command(
             clear_auto_candles_pending(client, pending);
             pending.auto_candles_scope = None;
             sync_runtime_trade_storage_scope(client, dispatcher);
+            cancel_unselected_market_history(client, dispatcher, pending);
             false
         }
         RuntimeCommand::SubscribeCandles { markets, kind } => {
@@ -198,7 +200,7 @@ pub(super) fn handle_command(
             false
         }
         RuntimeCommand::MarketHistory(ticket) => {
-            schedule_market_history(client, &mut pending.market_history, ticket);
+            schedule_market_history(client, dispatcher, &mut pending.market_history, ticket);
             false
         }
         RuntimeCommand::Ui(cmd) => handle_ui_command(client, dispatcher, cmd),
@@ -206,11 +208,11 @@ pub(super) fn handle_command(
             handle_strat_command(client, cmd);
             false
         }
-        RuntimeCommand::StrategySnapshotBatch(strategies) => {
-            handle_strategy_snapshot_batch(client, dispatcher, Some(strategies), None)
+        RuntimeCommand::StrategySnapshotBatch(strategies, apply_to_orders) => {
+            handle_strategy_snapshot_batch(client, dispatcher, Some(strategies), None, apply_to_orders)
         }
         RuntimeCommand::StrategyFolders { strategies, paths } => {
-            handle_strategy_snapshot_batch(client, dispatcher, strategies, Some(paths))
+            handle_strategy_snapshot_batch(client, dispatcher, strategies, Some(paths), false)
         }
         RuntimeCommand::StrategySetChecked {
             strategy_id,
@@ -306,6 +308,10 @@ pub(super) fn handle_command(
             }
             false
         }
+        RuntimeCommand::ReportTraces(ticket) => {
+            dispatcher.request_report_traces(client, ticket);
+            false
+        }
         RuntimeCommand::ReportCheckOpenRows(rec_ids) => {
             client.set_report_open_rows_intent(Arc::clone(&rec_ids));
             if rec_ids.is_empty() {
@@ -338,6 +344,16 @@ pub(super) fn handle_command(
         #[cfg(any(test, feature = "diagnostics"))]
         RuntimeCommand::DebugOutgoingBlackhole(enabled) => {
             client.debug_set_outgoing_blackhole(enabled);
+            false
+        }
+        #[cfg(any(test, feature = "diagnostics"))]
+        RuntimeCommand::DebugSendTradesSubscription(subscribe) => {
+            let payload = if subscribe {
+                crate::commands::engine_request::subscribe_all_trades(false)
+            } else {
+                crate::commands::engine_request::unsubscribe_all_trades()
+            };
+            client.send_api_request(&payload);
             false
         }
         #[cfg(any(test, feature = "diagnostics"))]
@@ -375,6 +391,9 @@ pub(super) fn handle_command(
 }
 
 pub(super) fn schedule_auto_candles_snapshot(client: &mut Client, pending: &mut RuntimePending) {
+    if client.cfg.market_history.is_compact() {
+        return;
+    }
     let Some(intent) = client.trade_storage_intent() else {
         return;
     };
@@ -399,9 +418,18 @@ pub(super) fn schedule_auto_candles_snapshot(client: &mut Client, pending: &mut 
 
 fn schedule_market_history(
     client: &mut Client,
+    dispatcher: &mut crate::events::EventDispatcher,
     pending: &mut Vec<PendingMarketHistory>,
     ticket: crate::state::MarketHistoryTicket,
 ) {
+    // Validate owned state, not an asynchronously published reader snapshot.
+    if !client.trade_storage_intent().is_some_and(|intent| intent.scope.contains(&ticket.market)) {
+        dispatcher.queue_market_history_event(crate::state::MarketHistoryEvent::Failed {
+            ticket,
+            error: "market is outside the retained trades scope".to_string(),
+        });
+        return;
+    }
     let (uid, rx, progress) = client.api_request_market_history_async_registered(&ticket.market);
     pending.push(PendingMarketHistory {
         ticket,
@@ -411,6 +439,33 @@ fn schedule_market_history(
         progress,
         rx,
     });
+}
+
+fn cancel_unselected_market_history(
+    client: &mut Client,
+    dispatcher: &mut crate::events::EventDispatcher,
+    pending: &mut RuntimePending,
+) {
+    let intent = client.trade_storage_intent();
+    let mut keep = |ticket: &crate::state::MarketHistoryTicket| {
+        if intent.as_ref().is_some_and(|intent| intent.scope.contains(&ticket.market)) {
+            return true;
+        }
+        dispatcher.queue_market_history_event(crate::state::MarketHistoryEvent::Failed {
+            ticket: ticket.clone(),
+            error: "chart request cancelled: market was removed from retained trades".to_string(),
+        });
+        false
+    };
+    pending.market_history.retain(|item| {
+        if keep(&item.ticket) {
+            true
+        } else {
+            client.pending_api.pending_market_history.remove(&item.uid);
+            false
+        }
+    });
+    pending.market_history_apply.retain(|item| keep(&item.ticket));
 }
 
 fn schedule_transfer_assets_refresh(client: &mut Client, pending: &mut RuntimePending) {
@@ -623,6 +678,10 @@ fn handle_ui_command(
             client.ui_problems_clear();
             false
         }
+        UiRuntimeCommand::Telegram(action) => {
+            client.ui_telegram(&action);
+            false
+        }
         UiRuntimeCommand::ProblemsTest(text) => {
             client.ui_problems_test(&text);
             false
@@ -656,6 +715,7 @@ fn handle_strategy_snapshot_batch(
     dispatcher: &mut crate::events::EventDispatcher,
     strategies: Option<Vec<crate::commands::strategy_serializer::StrategySnapshot>>,
     folder_paths: Option<Vec<String>>,
+    apply_to_orders: bool,
 ) -> bool {
     #[cfg(any(test, feature = "diagnostics"))]
     let strategy_count = strategies.as_ref().map_or(0, Vec::len);
@@ -742,6 +802,11 @@ fn handle_strategy_snapshot_batch(
         reply.full,
         &reply.data,
         reply.folders_last_modified,
+        if apply_to_orders {
+            crate::commands::strat::SSF_APPLY_TO_ORDERS
+        } else {
+            0
+        },
     );
     #[cfg(any(test, feature = "diagnostics"))]
     client
@@ -844,6 +909,11 @@ pub(super) fn handle_trade_action(
                 params.size,
                 params.planned_sell_price,
                 params.use_market_stop,
+                params.stops.map(|mut stops| {
+                    // The entire initial block is explicit, including a disabled TP.
+                    stops.take_profit_changed = true.into();
+                    stops
+                }),
             );
             Ok(false)
         }
@@ -860,6 +930,10 @@ pub(super) fn handle_trade_action(
                 params.size,
                 params.planned_sell_price,
                 params.use_market_stop,
+                params.stops.map(|mut stops| {
+                    stops.take_profit_changed = true.into();
+                    stops
+                }),
             );
             Ok(false)
         }

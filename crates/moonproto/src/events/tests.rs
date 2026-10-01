@@ -1,6 +1,7 @@
 use super::*;
 mod balance_digest;
 mod problems;
+mod telegram;
 use crate::commands::arb::build_arb_prices;
 use crate::commands::balance::build_request_balance_refresh;
 use crate::commands::engine_api::EngineMethod;
@@ -1397,6 +1398,50 @@ fn dispatcher_applies_arb_price_to_live_market() {
 }
 
 #[test]
+fn arb_streaming_keeps_complete_blocks_and_stale_index_gate() {
+    let mut d = EventDispatcher::new();
+    seed_event_markets(&mut d, &["BTCUSDT"]);
+    d.markets.apply_markets_indexes(vec!["BTCUSDT".to_owned()]);
+    let mut settings = ClientSettingsCommand::default();
+    settings.arb_config.wanted[7] = true;
+    d.settings.client_settings = Some(settings);
+    let mut compact = vec![3, 1, 0, 0, 1, 7];
+    compact.extend_from_slice(&12.0f32.to_le_bytes());
+    compact.extend_from_slice(&[0, 0, 2, 7]); // Incomplete second block.
+    compact.extend_from_slice(&99.0f32.to_le_bytes());
+    let packet = build_arb_prices(1, &compact);
+    let events = d.dispatch(Command::Balance, &packet, 1000);
+    assert!(matches!(
+        events.as_slice(),
+        [Event::Arb(ArbEvent::PricesApplied {
+            market_blocks: 1,
+            price_items: 1,
+            applied_prices: 1,
+            ..
+        })]
+    ));
+    let market = d.markets.get("BTCUSDT").unwrap();
+    assert_eq!(
+        market
+            .arb_now(crate::commands::market::ArbPlatformCode::ByBit)
+            .unwrap()
+            .price,
+        12.0
+    );
+    d.markets.mark_indexes_stale();
+    let events = d.dispatch(Command::Balance, &packet, 1001);
+    assert!(matches!(
+        events.as_slice(),
+        [Event::Arb(ArbEvent::PricesApplied {
+            market_blocks: 0,
+            price_items: 0,
+            applied_prices: 0,
+            ..
+        })]
+    ));
+}
+
+#[test]
 // parity: MoonBot MoonProtoEngine.pas:ParseArbPayloadCompact (isolation commit pass)
 fn dispatcher_applies_arb_isolation_commit_to_live_market() {
     let mut d = EventDispatcher::new();
@@ -2026,6 +2071,34 @@ fn dispatcher_applies_futures_trades_to_market_tail() {
 }
 
 #[test]
+fn active_packets_keep_market_metadata_shared_without_context_changes() {
+    let mut d = EventDispatcher::new();
+    seed_event_markets(&mut d, &["BTCUSDT"]);
+    d.markets.apply_markets_indexes(vec!["BTCUSDT".into()]);
+    let mut client = crate::client::Client::new(dummy_client_cfg());
+    client.testing_set_domain_ready(true);
+    client.subscribe_all_trades(false);
+    let mut out = Vec::new();
+    let mut actions = Vec::new();
+    for number in [800, 801] {
+        let held = d.snapshot();
+        let ptr = d.markets.arc_ptr();
+        dispatch_active_packet_for_test(
+            &mut d, Command::TradesStream,
+            &trades_payload_with_rows(number, 0, 0, &[(0, 110.0, -3.0)]),
+            8_000, &mut out, &client, &mut actions,
+        );
+        // The first call can initialize history/context; the second is steady state.
+        if number == 801 {
+            assert_eq!(d.markets.arc_ptr(), ptr);
+            assert!(std::ptr::eq(held.markets(), ptr));
+        }
+    }
+    assert_eq!(d.markets.trade_state("BTCUSDT").unwrap().last_trade_price, 110.0);
+    assert!(out.iter().any(|ev| matches!(ev, Event::Trade(TradesEvent::Applied { .. }))));
+}
+
+#[test]
 fn trades_datagram_does_not_clone_markets_state_while_snapshot_held() {
     // Regression guard for the CowState container-clone fix (moonproto cac7451):
     // the live trade tail lives on each per-market `Market`, so a trades datagram
@@ -2202,6 +2275,59 @@ fn default_history_worker_uses_client_sizing_policy() {
         .market_history_readers("BTCUSDT")
         .expect("default worker should be spawned from dispatcher sizing");
     assert_eq!(readers.futures_trades.unwrap().capacity(), 1);
+}
+
+#[test]
+fn inactive_history_configuration_is_cached_and_new_markets_invalidate_it() {
+    let mut d = EventDispatcher::new();
+    seed_event_markets(&mut d, &["BTCUSDT"]);
+    d.sync_market_history_storage();
+    assert_eq!(d.last_market_history_markets_version, Some(d.markets.markets_version()));
+    assert!(d.market_history.is_none());
+
+    let scope = crate::state::TradeStorageScope::from_markets(["ETHUSDT"]);
+    d.set_trade_storage_scope(Some(&scope), 45_000.0);
+    assert_eq!(d.last_market_history_scope, Some(scope.clone()));
+    assert_eq!(d.last_market_history_markets_version, Some(d.markets.markets_version()));
+    assert!(d.market_history.is_none());
+
+    d.markets.markets_list_refresh_needed = true;
+    seed_event_markets(&mut d, &["BTCUSDT", "ETHUSDT"]);
+    d.sync_market_history_storage();
+    assert!(d.flush_market_history(mt(45_000.0)));
+    assert!(d.market_history_readers("ETHUSDT").is_some());
+    assert!(d.market_history_readers("BTCUSDT").is_none());
+
+    d.set_trade_storage_scope(None, 45_000.0);
+    d.sync_market_history_storage();
+    assert!(d.market_history.is_none());
+    assert_eq!(d.last_market_history_scope, None);
+    assert_eq!(d.last_market_history_markets_version, Some(d.markets.markets_version()));
+}
+
+#[test]
+fn unsubscribe_releases_owned_history_worker_and_old_snapshot_index() {
+    for sizing in [crate::state::MarketHistorySizing::Auto, crate::state::MarketHistorySizing::Compact] {
+        let mut d = EventDispatcher::new();
+        d.set_market_history_sizing(sizing);
+        seed_event_markets(&mut d, &["BTCUSDT"]);
+        d.set_trade_storage_scope(Some(&crate::state::TradeStorageScope::All), 45_000.0);
+        assert!(d.flush_market_history(mt(45_000.0)));
+        let snapshot = d.snapshot();
+        assert!(snapshot.market_history_readers("BTCUSDT").is_some());
+        assert!(d.owned_market_history.is_some());
+
+        d.set_trade_storage_scope(None, 45_000.0);
+        assert!(d.owned_market_history.is_none());
+        assert!(d.market_history.is_none());
+        assert!(snapshot.market_history_readers("BTCUSDT").is_none());
+        assert!(d.snapshot().market_history_readers("BTCUSDT").is_none());
+
+        d.set_trade_storage_scope(Some(&crate::state::TradeStorageScope::All), 45_000.0);
+        assert!(d.flush_market_history(mt(45_000.0)));
+        assert_eq!(d.market_history_readers("BTCUSDT").unwrap().futures_trades.unwrap().bounds().len, 0);
+        assert!(snapshot.market_history_readers("BTCUSDT").is_none());
+    }
 }
 
 #[test]
@@ -3953,7 +4079,7 @@ fn snapshot_requested_with_provider_triggers_fresh_reply() {
     for item in drain_client_send_items(&client) {
         if item.cmd == Command::Strat.to_byte() {
             let data = &item.data;
-            if data.len() == 11 + 8 + 8 + 4 + 1 + fresh_snapshot.len() + 8 {
+            if data.len() == 11 + 8 + 8 + 4 + 1 + fresh_snapshot.len() + 8 + 4 {
                 let cmd_subcode = data[0];
                 let server_epoch = u64::from_le_bytes(data[11..19].try_into().unwrap());
                 let client_max_last_date = u64::from_le_bytes(data[19..27].try_into().unwrap());
@@ -4202,7 +4328,7 @@ fn valid_strategy_snapshot_advances_server_epoch_after_decode() {
     client.testing_set_domain_ready(true);
     let mut out = Vec::new();
     let mut actions = Vec::new();
-    let payload = crate::commands::strat::build_snapshot(42, 99, 0, true, &[], 0);
+    let payload = crate::commands::strat::build_snapshot(42, 99, 0, true, &[], 0, 0);
 
     dispatch_active_packet_for_test(
         &mut d,
@@ -4263,6 +4389,40 @@ fn invalid_strategy_snapshot_does_not_advance_server_epoch() {
 }
 
 #[test]
+fn strategy_timeout_checks_preserve_shared_state_until_due() {
+    use crate::commands::strategy_serializer::{StrategyFields, StrategySnapshot};
+    use std::time::{Duration, Instant};
+
+    let mut d = EventDispatcher::new();
+    seed_strategy(&mut d, 1);
+    let held = d.snapshot();
+    let now = Instant::now();
+    let ptr = d.strats.arc_ptr();
+    assert!(!d.tick_strategy_edit_timeouts(now));
+    assert_eq!(d.strats.arc_ptr(), ptr);
+    assert!(std::ptr::eq(held.strats(), ptr));
+
+    let desired = StrategySnapshot {
+        strategy_id: 2, strategy_ver: 1, last_date: 1, checked: true, kind: 1,
+        path: "Test".into(), fields: StrategyFields::new(),
+    };
+    let deadline = now + Duration::from_secs(45);
+    d.stage_local_strategies_owned(vec![desired], crate::MoonTime::now(), deadline);
+    let held = d.snapshot();
+    let ptr = d.strats.arc_ptr();
+    assert!(!d.tick_strategy_edit_timeouts(deadline - Duration::from_nanos(1)));
+    assert_eq!(d.strats.arc_ptr(), ptr);
+    assert!(d.tick_strategy_edit_timeouts(deadline));
+    assert_ne!(d.strats.arc_ptr(), ptr);
+    assert!(std::ptr::eq(held.strats(), ptr));
+    assert!(matches!(d.take_queued_events().as_slice(),
+        [Event::Strat(crate::state::StratEvent::EditTimedOut { strategy_ids })] if strategy_ids == &[2]));
+    let held = d.snapshot();
+    assert!(!d.tick_strategy_edit_timeouts(deadline));
+    assert!(std::ptr::eq(d.strats.arc_ptr(), held.strats()));
+}
+
+#[test]
 fn matching_strategy_snapshot_emits_edit_confirmation_without_optimistic_state() {
     use crate::commands::strategy_serializer::{
         FieldValue, StrategyBatchBuilder, StrategyFields, StrategySnapshot,
@@ -4307,7 +4467,7 @@ fn matching_strategy_snapshot_emits_edit_confirmation_without_optimistic_state()
     let mut builder = StrategyBatchBuilder::new(d.strats.strategy_schema().unwrap());
     builder.write_strategy(&desired);
     let payload =
-        crate::commands::strat::build_snapshot(42, 99, 200, false, &builder.finalize(), 0);
+        crate::commands::strat::build_snapshot(42, 99, 200, false, &builder.finalize(), 0, 0);
     let mut client = crate::client::Client::new(dummy_client_cfg());
     client.testing_set_domain_ready(true);
     let mut out = Vec::new();

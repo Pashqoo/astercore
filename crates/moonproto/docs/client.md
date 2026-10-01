@@ -386,9 +386,11 @@ client.trade().new_order(NewOrderParams::for_market(
 // Existing-order actions normally use &Order from snapshot.orders().
 ```
 
-Omitting `NewOrderParams::with_strategy_id(...)` sends `strategy_id = 0` and
-lets the core apply its configured Manual-strategy fallback. Pass an explicit
-strategy id when the application must bind the order deterministically.
+Omitting `NewOrderParams::with_strategy_id(...)` creates an order without a
+strategy; an explicit id attaches that strategy. Use `with_stops(...)` for
+per-order initial SL, trailing and TP without changing global core settings.
+These guarantees require an updated core; see
+[strategy selection and initial stops](trade_actions.md#strategy-selection-and-initial-stops).
 
 Canonical v4 order commands use market names and server order UIDs rather than
 caller-built route records. The legacy `penalty` helper is the one remaining
@@ -445,6 +447,10 @@ Lost chunked requests or history-worker barriers fail by event and are retried
 for the same active trades scope instead of leaving the scope stuck forever.
 
 ## UI Settings Request
+
+For the core's Telegram login and service controls, use `client.telegram()` and
+`SettingsEvent::TelegramUpdated`. The [Telegram guide](telegram.md) covers phone/QR,
+codes, 2FA, proxy, errors and reconnect. Its snapshots do not block `Ready`.
 
 Confirmed core diagnostics are separate from settings refresh:
 `snapshot.settings().problems` receives its initial list automatically without

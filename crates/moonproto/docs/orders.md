@@ -205,6 +205,11 @@ the typed constants, `name()`, and `is_terminal()`.
 
 ## Actions
 
+To set SL, trailing and TP at creation, use `NewOrderParams::with_stops(...)`
+or `PendingOrderParams::with_stops(...)`. Unlike a later update, the initial
+settings travel together with the order. See
+[initial stops and core compatibility](trade_actions.md#strategy-selection-and-initial-stops).
+
 Order actions go through `client.orders()`:
 
 ```rust
@@ -271,6 +276,13 @@ expose a raw inbound packet history. Long trace lines are shrunk with the same
 For chart timestamps, use `OrderTraceChartPoint::time()` or `unix_millis()`.
 When a sell trace carries a stop line, `OrderTraceLine::stop_price` and
 `stop_time` give the price and time endpoint for that dotted stop segment.
+
+These are live-order overlays, not a durable historical archive. To display a
+closed report trade, use `client.reports().request_traces(report_uid)` and store
+the result in the terminal. Report rows also carry optional
+[entry placement time and saved corridor prices](reports.md#report-chart-fields).
+See [archived order traces](reports.md#archived-order-traces)
+for the request timing, inherited lines, rendering, and local-cache contract.
 
 ## Lifecycle Notes
 

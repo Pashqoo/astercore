@@ -166,6 +166,7 @@ cargo run --release --example history_bars   -- "<key>" "HOST:PORT" BTCUSDT 1h
 | [`order_snapshot`](examples/order_snapshot.rs) | Fresh order snapshot through `MoonClient`. |
 | [`cancel_open_order`](examples/cancel_open_order.rs) | Tracked cancel intent through `client.orders()`. |
 | [`multi_client_test`](examples/multi_client_test.rs) | Two independent `MoonClient` runtimes. |
+| [`runtime_bench`](examples/runtime_bench.rs) | Windows CPU, memory, traffic and allocation measurements; see [method](docs/performance.md). |
 | [`shutdown_core`](examples/shutdown_core.rs) | Guarded core shutdown request; takes `MOONPROTO_KEY` from the environment. Verify process exit separately. |
 
 ## Documentation
@@ -183,6 +184,7 @@ Public API notes live in [`docs/`](docs). Start here:
 | [orders](docs/orders.md) · [candles](docs/candles.md) · [reports](docs/reports.md) | Orders, candle history, reports. |
 | [news](docs/news.md) | Retained/live news JSON and the tags catalog. |
 | [problems](docs/problems.md) | Confirmed core diagnostics, notifications, clear and test actions. |
+| [Telegram](docs/telegram.md) | Core Telegram reader setup: phone/QR login, codes, 2FA, proxy and logout. |
 | [engine_api](docs/engine_api.md) · [strats](docs/strats.md) | Server/exchange mutations and strategies. |
 | [time](docs/time.md) · [multi_server](docs/multi_server.md) | Clock handling and multi-server setups. |
 
