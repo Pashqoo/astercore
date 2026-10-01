@@ -1,0 +1,1660 @@
+//! High-level Active Lib intent handles.
+
+use super::{
+    commands::{RuntimeCommand, RuntimeCommandKind, RuntimeTradeCommandKind, UiRuntimeCommand},
+    CoinCardCandlesTicket, EngineActionTicket, MoonClient, MoonClientError, NewOrderParams,
+    NewOrderTicket, OrderSide, OrderTarget, PendingOrderParams, SellOrderParams, SplitOrderParams,
+    TradesStreamMode, VStopParams,
+};
+use std::sync::mpsc;
+
+/// Order intent handle.
+///
+/// UI code can keep immutable order snapshots for rendering, but all stateful
+/// order actions go through this handle so the runtime applies them to the live
+/// `Orders` model before queueing protocol commands.
+#[derive(Clone)]
+pub struct MoonOrders {
+    pub(super) tx: mpsc::Sender<RuntimeCommand>,
+}
+
+/// Report database replication handle.
+///
+/// The handle only submits non-blocking intent. Typed schema/page/row results
+/// arrive through [`crate::Event::Report`].
+#[derive(Clone)]
+pub struct MoonReports {
+    pub(super) tx: mpsc::Sender<RuntimeCommand>,
+}
+
+impl MoonReports {
+    /// Request the latest append-only report schema.
+    pub fn refresh_schema(&self) -> Result<(), MoonClientError> {
+        self.tx
+            .send(RuntimeCommand::ReportSchemaRefresh)
+            .map_err(|_| MoonClientError::RuntimeStopped)
+    }
+
+    /// Start or replace report catch-up intent and return immediately.
+    ///
+    /// Each page must be committed by the application and acknowledged with
+    /// [`Self::page_applied`] before Active Lib requests the next page.
+    pub fn sync(
+        &self,
+        request: crate::state::ReportSyncRequest,
+    ) -> Result<crate::state::ReportSyncTicket, MoonClientError> {
+        if !request.is_valid() {
+            return Err(MoonClientError::InvalidReportSyncRequest);
+        }
+        let ticket = crate::state::ReportSyncTicket {
+            sync_id: random_nonzero_u64(),
+        };
+        self.tx
+            .send(RuntimeCommand::ReportSync {
+                ticket,
+                request,
+                expected_epoch: None,
+            })
+            .map_err(|_| MoonClientError::RuntimeStopped)?;
+        Ok(ticket)
+    }
+
+    /// Resume from a cursor committed atomically with the local report replica.
+    ///
+    /// If the core reports another database epoch, Active Lib emits one
+    /// `database_recreated` page. After the application clears its replica and
+    /// acknowledges that page, catch-up restarts from zero automatically.
+    pub fn sync_from(
+        &self,
+        checkpoint: crate::state::ReportSyncCheckpoint,
+    ) -> Result<crate::state::ReportSyncTicket, MoonClientError> {
+        if !checkpoint.is_valid() {
+            return Err(MoonClientError::InvalidReportSyncCheckpoint);
+        }
+        let ticket = crate::state::ReportSyncTicket {
+            sync_id: random_nonzero_u64(),
+        };
+        self.tx
+            .send(RuntimeCommand::ReportSync {
+                ticket,
+                request: crate::state::ReportSyncRequest::resume(checkpoint.next_from_rec_id),
+                expected_epoch: Some(checkpoint.epoch),
+            })
+            .map_err(|_| MoonClientError::RuntimeStopped)?;
+        Ok(ticket)
+    }
+
+    /// Confirm that one report page was durably applied to the local database.
+    ///
+    /// This is the catch-up backpressure boundary. The runtime sends no next
+    /// page request until this non-blocking intent reaches the runtime thread.
+    pub fn page_applied(&self, page: &crate::state::ReportSyncPage) -> Result<(), MoonClientError> {
+        self.tx
+            .send(RuntimeCommand::ReportPageApplied(page.clone()))
+            .map_err(|_| MoonClientError::RuntimeStopped)
+    }
+
+    /// Reconcile visible rows after a completed normal report catch-up.
+    ///
+    /// The returned map covers `1..=completed.max_rec_id`. A set bit means the
+    /// row exists on the core and has `deleted=0`; a clear bit means the local
+    /// row must be hidden. Active Lib retries across packet loss/reconnect and
+    /// emits [`crate::ReportEvent::AliveMapComplete`].
+    pub fn reconcile_alive(
+        &self,
+        completed: &crate::state::ReportSyncComplete,
+    ) -> Result<crate::state::ReportAliveMapTicket, MoonClientError> {
+        let request = crate::state::ReportAliveMapRequest {
+            epoch: completed.epoch,
+            up_to_rec_id: completed.max_rec_id,
+        };
+        let ticket = crate::state::ReportAliveMapTicket {
+            sync_id: random_nonzero_u64(),
+        };
+        self.tx
+            .send(RuntimeCommand::ReportAliveMap { ticket, request })
+            .map_err(|_| MoonClientError::RuntimeStopped)?;
+        Ok(ticket)
+    }
+
+    /// Reconcile the newest open report rows and retain the set for hard-reconnect recovery.
+    ///
+    /// IDs are sorted, deduplicated, and capped to the newest 100 `newRecID`
+    /// values. Passing an empty slice clears the retained check intent.
+    pub fn check_open_rows(&self, rec_ids: &[i64]) -> Result<(), MoonClientError> {
+        if rec_ids.iter().any(|rec_id| *rec_id <= 0) {
+            return Err(MoonClientError::InvalidReportOpenRows);
+        }
+        let mut rec_ids = rec_ids.to_vec();
+        rec_ids.sort_unstable();
+        rec_ids.dedup();
+        if rec_ids.len() > crate::commands::report::MAX_CHECK_ROW_IDS {
+            rec_ids.drain(..rec_ids.len() - crate::commands::report::MAX_CHECK_ROW_IDS);
+        }
+        self.tx
+            .send(RuntimeCommand::ReportCheckOpenRows(rec_ids.into()))
+            .map_err(|_| MoonClientError::RuntimeStopped)
+    }
+
+    /// Set or clear the report `deleted` flag and return the number of queued batches.
+    ///
+    /// The runtime keeps each Sliced command near 1 KiB. The core echoes
+    /// every non-empty committed batch as [`crate::ReportEvent::RowsDeleted`]
+    /// to all report subscribers, including this client. A zero return means the
+    /// selection was empty, so no packet or echo exists.
+    pub fn set_rows_deleted(
+        &self,
+        deleted: bool,
+        ranges: &[crate::state::ReportRecIdRange],
+        singles: &[i64],
+    ) -> Result<usize, MoonClientError> {
+        let change = crate::state::ReportRowsDeleted::new(
+            deleted,
+            ranges.iter().copied(),
+            singles.iter().copied(),
+        );
+        let batches = change.wire_batches();
+        let batch_count = batches.len();
+        if batch_count == 0 {
+            return Ok(0);
+        }
+        self.tx
+            .send(RuntimeCommand::ReportSetRowsDeleted(batches.into()))
+            .map_err(|_| MoonClientError::RuntimeStopped)?;
+        Ok(batch_count)
+    }
+
+    /// Soft-delete report rows. This never physically deletes database rows.
+    pub fn delete_rows(
+        &self,
+        ranges: &[crate::state::ReportRecIdRange],
+        singles: &[i64],
+    ) -> Result<usize, MoonClientError> {
+        self.set_rows_deleted(true, ranges, singles)
+    }
+
+    /// Restore report rows previously hidden by the soft-delete flag.
+    pub fn restore_rows(
+        &self,
+        ranges: &[crate::state::ReportRecIdRange],
+        singles: &[i64],
+    ) -> Result<usize, MoonClientError> {
+        self.set_rows_deleted(false, ranges, singles)
+    }
+}
+
+impl MoonOrders {
+    /// Request a fresh order snapshot and return immediately.
+    pub fn request_snapshot(&self) -> Result<(), MoonClientError> {
+        self.tx
+            .send(RuntimeCommand::OrderSnapshotRefresh)
+            .map_err(|_| MoonClientError::RuntimeStopped)
+    }
+
+    /// Ask the core to execute its orders-history flow for one retained market.
+    ///
+    /// This mirrors the MoonBot UI action: it is a fire-and-forget request, not
+    /// a paired snapshot response. The core decides where/how the history is
+    /// written or refreshed.
+    pub fn request_history_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+    ) -> Result<(), MoonClientError> {
+        self.request_history(market.name())
+    }
+
+    /// Ask the core to execute its orders-history flow for one market name.
+    pub fn request_history(&self, market_name: impl Into<String>) -> Result<(), MoonClientError> {
+        self.tx
+            .send(RuntimeCommand::Ui(UiRuntimeCommand::OrdersHistoryRequest(
+                market_name.into(),
+            )))
+            .map_err(|_| MoonClientError::RuntimeStopped)
+    }
+
+    /// Move/replace one tracked order.
+    pub fn move_order(
+        &self,
+        order: impl Into<OrderTarget>,
+        new_price: f64,
+    ) -> Result<(), MoonClientError> {
+        let uid = order.into().uid();
+        self.send_intent(RuntimeCommandKind::MoveOrder { uid, new_price })
+    }
+
+    /// Cancel one tracked order.
+    pub fn cancel(&self, order: impl Into<OrderTarget>) -> Result<(), MoonClientError> {
+        let uid = order.into().uid();
+        self.send_intent(RuntimeCommandKind::CancelOrder { uid })
+    }
+
+    /// Update Stops for one tracked order.
+    ///
+    /// Set the stop-loss / trailing / take-profit values you want; the runtime
+    /// only sends a command when they differ from the order's current stops
+    /// (send-if-changed semantics). Build settings with
+    /// `StopSettings::disabled().with_stop_loss_percent(...).with_take_profit_price(...)`;
+    /// the internal take-profit latch is computed by the runtime on send, so
+    /// application code does not maintain it.
+    pub fn update_stops(
+        &self,
+        order: impl Into<OrderTarget>,
+        stops: crate::commands::trade::StopSettings,
+    ) -> Result<(), MoonClientError> {
+        let uid = order.into().uid();
+        self.send_intent(RuntimeCommandKind::UpdateStops { uid, stops })
+    }
+
+    /// Update VStop for one tracked order.
+    pub fn update_vstop(
+        &self,
+        order: impl Into<OrderTarget>,
+        params: VStopParams,
+    ) -> Result<(), MoonClientError> {
+        let uid = order.into().uid();
+        self.send_intent(RuntimeCommandKind::UpdateVStop { uid, params })
+    }
+
+    /// Apply click-immune intent to selected orders.
+    ///
+    /// The UI passes visible order rows (or their UIDs) plus the desired flag.
+    /// Active Lib resolves the live order state and sends only orders that are
+    /// still active.
+    pub fn set_immune_for_orders<I, T>(&self, orders: I, value: bool) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OrderTarget>,
+    {
+        let items = orders
+            .into_iter()
+            .map(|order| crate::commands::trade::ImmuneItem {
+                uid: order.into().uid(),
+                value,
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.set_immune(items)
+    }
+
+    fn set_immune(
+        &self,
+        items: Vec<crate::commands::trade::ImmuneItem>,
+    ) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeCommandKind::SetImmune { items })
+    }
+
+    /// Toggle panic sell for one tracked order.
+    pub fn turn_panic_sell(
+        &self,
+        order: impl Into<OrderTarget>,
+        turn_on: bool,
+    ) -> Result<(), MoonClientError> {
+        let uid = order.into().uid();
+        self.send_intent(RuntimeCommandKind::TurnOrderPanicSell { uid, turn_on })
+    }
+
+    /// Request a fresh status for one tracked order.
+    pub fn request_status(&self, order: impl Into<OrderTarget>) -> Result<(), MoonClientError> {
+        let uid = order.into().uid();
+        self.send_intent(RuntimeCommandKind::RequestOrderStatus { uid })
+    }
+
+    /// Apply market-level panic sell button semantics.
+    pub fn switch_panic_sell_by_market(
+        &self,
+        market_name: impl Into<String>,
+        turn_on: bool,
+    ) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeCommandKind::SwitchPanicSellByMarket {
+            market_name: market_name.into(),
+            turn_on,
+        })
+    }
+
+    /// Apply market-level panic sell button semantics for a retained market.
+    ///
+    /// This is the terminal UI path: the chart/order panel already owns a
+    /// `MarketHandle`, so it should not re-search the selected market by name.
+    pub fn switch_panic_sell_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+        turn_on: bool,
+    ) -> Result<(), MoonClientError> {
+        self.switch_panic_sell_by_market(market.name(), turn_on)
+    }
+
+    fn send_intent(&self, kind: RuntimeCommandKind) -> Result<(), MoonClientError> {
+        self.tx
+            .send(RuntimeCommand::OrderAction(kind))
+            .map_err(|_| MoonClientError::RuntimeStopped)
+    }
+}
+
+/// Market-level trade intent handle.
+///
+/// These actions create or manage orders by selected market. Terminal UI can
+/// pass its retained `MarketHandle` through `*_for_market` helpers; scripts can
+/// still use market-name helpers. Canonical v4 actions encode that market name;
+/// the caller never builds protocol envelopes, action ids, or route records.
+#[derive(Clone)]
+pub struct MoonTrade {
+    pub(super) tx: mpsc::Sender<RuntimeCommand>,
+}
+
+impl MoonTrade {
+    /// Queue a new order intent.
+    pub fn new_order(&self, params: NewOrderParams) -> Result<NewOrderTicket, MoonClientError> {
+        let request_uid = random_nonzero_u64();
+        self.send_intent(RuntimeTradeCommandKind::NewOrder {
+            params,
+            request_uid,
+        })?;
+        Ok(NewOrderTicket {
+            client_order_id: request_uid,
+            #[cfg(any(test, feature = "diagnostics"))]
+            request_uid,
+        })
+    }
+
+    /// Queue a pending order intent.
+    ///
+    /// The core publishes the pending immediately in the normal order stream.
+    /// Move or cancel that retained order through `client.orders()`. An
+    /// optional strategy candidate is attached only after the trigger fires.
+    pub fn new_pending_order(
+        &self,
+        params: PendingOrderParams,
+    ) -> Result<NewOrderTicket, MoonClientError> {
+        let request_uid = random_nonzero_u64();
+        self.send_intent(RuntimeTradeCommandKind::NewPendingOrder {
+            params,
+            request_uid,
+        })?;
+        Ok(NewOrderTicket {
+            client_order_id: request_uid,
+            #[cfg(any(test, feature = "diagnostics"))]
+            request_uid,
+        })
+    }
+
+    /// Join matching orders for a market and side.
+    pub fn join_orders(
+        &self,
+        market_name: impl Into<String>,
+        side: OrderSide,
+    ) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeTradeCommandKind::JoinOrders {
+            market_name: market_name.into(),
+            side,
+        })
+    }
+
+    /// Join matching orders for a retained selected market.
+    pub fn join_orders_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+        side: OrderSide,
+    ) -> Result<(), MoonClientError> {
+        self.join_orders(market.name(), side)
+    }
+
+    /// Split the selected order according to `params`.
+    pub fn split_order(&self, params: SplitOrderParams) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeTradeCommandKind::SplitOrder(params))
+    }
+
+    /// Move all matching sell orders.
+    ///
+    /// Build `params` with `MoveAllSellsParams` named constructors; the runtime
+    /// still performs the live-order pre-send gate before queuing.
+    pub fn move_all_sells(
+        &self,
+        market_name: impl Into<String>,
+        params: crate::commands::trade::MoveAllSellsParams,
+    ) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeTradeCommandKind::MoveAllSells {
+            market_name: market_name.into(),
+            params,
+        })
+    }
+
+    /// Move all matching sell orders for a retained selected market.
+    pub fn move_all_sells_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+        params: crate::commands::trade::MoveAllSellsParams,
+    ) -> Result<(), MoonClientError> {
+        self.move_all_sells(market.name(), params)
+    }
+
+    /// Move all matching buy orders.
+    ///
+    /// Build `params` with `MoveAllBuysParams` named constructors; the runtime
+    /// still performs the live-order pre-send gate before queuing.
+    pub fn move_all_buys(
+        &self,
+        market_name: impl Into<String>,
+        params: crate::commands::trade::MoveAllBuysParams,
+    ) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeTradeCommandKind::MoveAllBuys {
+            market_name: market_name.into(),
+            params,
+        })
+    }
+
+    /// Move all matching buy orders for a retained selected market.
+    pub fn move_all_buys_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+        params: crate::commands::trade::MoveAllBuysParams,
+    ) -> Result<(), MoonClientError> {
+        self.move_all_buys(market.name(), params)
+    }
+
+    /// Close the current position according to `params`.
+    pub fn close_position(
+        &self,
+        params: super::ClosePositionParams,
+    ) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeTradeCommandKind::ClosePosition(params))
+    }
+
+    /// Close the current position by placing closing limit orders.
+    pub fn limit_close_position(
+        &self,
+        market_name: impl Into<String>,
+        side: OrderSide,
+    ) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeTradeCommandKind::LimitClosePosition {
+            market_name: market_name.into(),
+            side,
+        })
+    }
+
+    /// Close the current retained selected-market position by limit orders.
+    pub fn limit_close_position_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+        side: OrderSide,
+    ) -> Result<(), MoonClientError> {
+        self.limit_close_position(market.name(), side)
+    }
+
+    /// Split the current position for a market and side.
+    pub fn split_position(
+        &self,
+        market_name: impl Into<String>,
+        side: OrderSide,
+    ) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeTradeCommandKind::SplitPosition {
+            market_name: market_name.into(),
+            side,
+        })
+    }
+
+    /// Split the current position for a retained selected market.
+    pub fn split_position_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+        side: OrderSide,
+    ) -> Result<(), MoonClientError> {
+        self.split_position(market.name(), side)
+    }
+
+    /// Place a sell order according to `params`.
+    pub fn sell_order(&self, params: SellOrderParams) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeTradeCommandKind::SellOrder(params))
+    }
+
+    /// Split the current position using market-order semantics.
+    pub fn market_split_position(
+        &self,
+        market_name: impl Into<String>,
+        side: OrderSide,
+    ) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeTradeCommandKind::MarketSplitPosition {
+            market_name: market_name.into(),
+            side,
+        })
+    }
+
+    /// Split the current retained selected-market position using market-order semantics.
+    pub fn market_split_position_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+        side: OrderSide,
+    ) -> Result<(), MoonClientError> {
+        self.market_split_position(market.name(), side)
+    }
+
+    /// Apply the core penalty action for a market.
+    pub fn penalty(&self, market_name: impl Into<String>) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeTradeCommandKind::Penalty {
+            market_name: market_name.into(),
+        })
+    }
+
+    /// Apply the core penalty action for a retained selected market.
+    pub fn penalty_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+    ) -> Result<(), MoonClientError> {
+        self.penalty(market.name())
+    }
+
+    /// Trigger the core's one-shot panic-sell-all action.
+    pub fn panic_sell_all(&self) -> Result<(), MoonClientError> {
+        self.send_intent(RuntimeTradeCommandKind::PanicSellAll)
+    }
+
+    fn send_intent(&self, kind: RuntimeTradeCommandKind) -> Result<(), MoonClientError> {
+        self.tx
+            .send(RuntimeCommand::TradeAction(kind))
+            .map_err(|_| MoonClientError::RuntimeStopped)
+    }
+}
+
+fn random_nonzero_u64() -> u64 {
+    loop {
+        let value = rand::random::<u64>();
+        if value != 0 {
+            return value;
+        }
+    }
+}
+
+/// Stream subscription handle for orderbooks and trades.
+///
+/// This is the user-facing Active Lib shape for market streams: the runtime
+/// remembers these intents and restores them after reconnects.
+pub struct MoonStreams<'a> {
+    pub(super) client: &'a MoonClient,
+}
+
+impl MoonStreams<'_> {
+    /// Subscribe to one orderbook by market name.
+    pub fn subscribe_orderbook(
+        &self,
+        market_name: impl Into<String>,
+    ) -> Result<(), MoonClientError> {
+        self.client.subscribe_orderbook(market_name)
+    }
+
+    /// Subscribe to several orderbooks by market name.
+    pub fn subscribe_orderbooks<I, S>(&self, market_names: I) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.client.subscribe_orderbooks(market_names)
+    }
+
+    /// Unsubscribe from one orderbook by market name.
+    pub fn unsubscribe_orderbook(
+        &self,
+        market_name: impl Into<String>,
+    ) -> Result<(), MoonClientError> {
+        self.client.unsubscribe_orderbook(market_name)
+    }
+
+    /// Unsubscribe from several orderbooks by market name.
+    pub fn unsubscribe_orderbooks<I, S>(&self, market_names: I) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.client.unsubscribe_orderbooks(market_names)
+    }
+
+    /// Unsubscribe from all remembered orderbooks.
+    pub fn unsubscribe_all_orderbooks(&self) -> Result<(), MoonClientError> {
+        self.client.unsubscribe_all_orderbooks()
+    }
+
+    /// Subscribe to all trades and retain Active Lib data for all markets.
+    pub fn subscribe_all_trades(&self, mode: TradesStreamMode) -> Result<(), MoonClientError> {
+        self.client.subscribe_all_trades(mode)
+    }
+
+    /// Subscribe to all trades on the wire and retain Active Lib data only for
+    /// the listed markets. An empty list means all markets.
+    pub fn subscribe_trades_for<I, S>(
+        &self,
+        mode: TradesStreamMode,
+        market_names: I,
+    ) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.client.subscribe_trades_for(mode, market_names)
+    }
+
+    /// Keep the all-trades stream disabled across reconnects.
+    pub fn unsubscribe_all_trades(&self) -> Result<(), MoonClientError> {
+        self.client.unsubscribe_all_trades()
+    }
+
+    /// Use raw trade extrema for short derived deltas.
+    ///
+    /// Default is `false`, matching the core's normal mode: retained 1m/5m
+    /// deltas come from the robust candle/last-price derived paths. Set this to
+    /// `true` only for the legacy "DeltasByTrades" terminal mode where short
+    /// deltas intentionally follow raw trade ticks.
+    pub fn set_deltas_by_trades(&self, enabled: bool) -> Result<(), MoonClientError> {
+        self.client.set_deltas_by_trades(enabled)
+    }
+
+    /// Subscribe to live TF candle updates for several markets.
+    ///
+    /// This is the chart live-update stream. Load the initial chart history
+    /// with `client.candles().request_coin_card...` first when the UI needs a
+    /// full ring; live pushes then replace/append the current bar in that
+    /// retained history using the core's candle-window rules.
+    pub fn subscribe_candles<I, S>(
+        &self,
+        market_names: I,
+        kind: crate::commands::candles::DeepHistoryKind,
+    ) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.client.subscribe_candles(market_names, kind)
+    }
+
+    /// Subscribe to live TF candle updates for retained market handles.
+    pub fn subscribe_candles_for<'a, I>(
+        &self,
+        markets: I,
+        kind: crate::commands::candles::DeepHistoryKind,
+    ) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = &'a crate::state::MarketHandle>,
+    {
+        self.subscribe_candles(markets.into_iter().map(|m| m.name().to_string()), kind)
+    }
+
+    /// Unsubscribe from live TF candle updates for several markets.
+    pub fn unsubscribe_candles<I, S>(&self, market_names: I) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.client.unsubscribe_candles(market_names)
+    }
+
+    /// Unsubscribe from live TF candle updates for retained market handles.
+    pub fn unsubscribe_candles_for<'a, I>(&self, markets: I) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = &'a crate::state::MarketHandle>,
+    {
+        self.unsubscribe_candles(markets.into_iter().map(|m| m.name().to_string()))
+    }
+
+    /// Reload orderbook data through Engine API.
+    pub fn reload_order_book(&self) -> Result<EngineActionTicket, MoonClientError> {
+        self.client.reload_order_book()
+    }
+}
+
+/// Balance, position, and transferable-assets refresh handle.
+pub struct MoonBalances<'a> {
+    pub(super) client: &'a MoonClient,
+}
+
+impl MoonBalances<'_> {
+    /// Request a fresh balance/position snapshot and return immediately.
+    pub fn refresh(&self) -> Result<(), MoonClientError> {
+        self.client.refresh_balances()
+    }
+
+    /// Request transferable asset refresh for Spot, Futures, and Quarterly.
+    ///
+    /// Full-refresh intents are coalesced for five seconds, so repeated UI reads
+    /// cannot multiply exchange API requests while the first refresh is pending.
+    pub fn refresh_transfer_assets(&self) -> Result<(), MoonClientError> {
+        self.client.refresh_transfer_assets()
+    }
+
+    /// Request transferable asset refresh for one wallet kind.
+    pub fn refresh_transfer_assets_kind(
+        &self,
+        kind: crate::state::ExchangeKind,
+    ) -> Result<(), MoonClientError> {
+        self.client.refresh_transfer_assets_kind(kind)
+    }
+
+    /// Transfer an asset between exchange wallets through Engine API.
+    pub fn transfer_asset(
+        &self,
+        asset: impl AsRef<str>,
+        qty: f64,
+        from: crate::state::ExchangeKind,
+        to: crate::state::ExchangeKind,
+    ) -> Result<EngineActionTicket, MoonClientError> {
+        self.client.transfer_asset(asset, qty, from, to)
+    }
+
+    /// Convert dust to BNB through Engine API.
+    pub fn convert_dust_bnb(&self) -> Result<EngineActionTicket, MoonClientError> {
+        self.client.convert_dust_bnb()
+    }
+}
+
+/// Account metadata and account-level Engine API handle.
+pub struct MoonAccount<'a> {
+    pub(super) client: &'a MoonClient,
+}
+
+impl MoonAccount<'_> {
+    /// Request a fresh hedge-mode value and return immediately.
+    pub fn refresh_hedge_mode(&self) -> Result<(), MoonClientError> {
+        self.client.refresh_hedge_mode()
+    }
+
+    /// Request fresh API-key expiration metadata and return immediately.
+    pub fn refresh_api_expiration_time(&self) -> Result<(), MoonClientError> {
+        self.client.refresh_api_expiration_time()
+    }
+
+    /// Set leverage for a market through Engine API.
+    pub fn set_leverage(
+        &self,
+        market: impl AsRef<str>,
+        new_leverage: i32,
+    ) -> Result<EngineActionTicket, MoonClientError> {
+        self.client.set_leverage(market, new_leverage)
+    }
+
+    /// Set leverage for a retained selected market through Engine API.
+    ///
+    /// This is the normal terminal path: the UI finds a `MarketHandle` once and
+    /// reuses it for chart/actions instead of resolving a market name again.
+    pub fn set_leverage_for(
+        &self,
+        market: &crate::state::MarketHandle,
+        new_leverage: i32,
+    ) -> Result<EngineActionTicket, MoonClientError> {
+        self.set_leverage(market.name(), new_leverage)
+    }
+
+    /// Set account hedge mode through Engine API.
+    pub fn set_hedge_mode(&self, hedge_mode: bool) -> Result<EngineActionTicket, MoonClientError> {
+        self.client.set_hedge_mode(hedge_mode)
+    }
+
+    /// Cancel all exchange orders through Engine API.
+    pub fn cancel_all_orders(&self) -> Result<EngineActionTicket, MoonClientError> {
+        self.client.cancel_all_orders()
+    }
+
+    /// Change position type for a market through Engine API.
+    pub fn change_position_type(
+        &self,
+        market: impl AsRef<str>,
+        position_type: crate::commands::market::PositionType,
+    ) -> Result<EngineActionTicket, MoonClientError> {
+        self.client.change_position_type(market, position_type)
+    }
+
+    /// Change position type for a retained selected market through Engine API.
+    pub fn change_position_type_for(
+        &self,
+        market: &crate::state::MarketHandle,
+        position_type: crate::commands::market::PositionType,
+    ) -> Result<EngineActionTicket, MoonClientError> {
+        self.change_position_type(market.name(), position_type)
+    }
+
+    /// Confirm risk limit for a market through Engine API.
+    pub fn confirm_risk_limit(
+        &self,
+        market: impl AsRef<str>,
+    ) -> Result<EngineActionTicket, MoonClientError> {
+        self.client.confirm_risk_limit(market)
+    }
+
+    /// Confirm risk limit for a retained selected market through Engine API.
+    pub fn confirm_risk_limit_for(
+        &self,
+        market: &crate::state::MarketHandle,
+    ) -> Result<EngineActionTicket, MoonClientError> {
+        self.confirm_risk_limit(market.name())
+    }
+
+    /// Set MA mode through Engine API.
+    pub fn set_ma_mode(&self, ma_mode: bool) -> Result<EngineActionTicket, MoonClientError> {
+        self.client.set_ma_mode(ma_mode)
+    }
+}
+
+/// UI/settings command handle.
+pub struct MoonSettings<'a> {
+    pub(super) client: &'a MoonClient,
+}
+
+impl MoonSettings<'_> {
+    /// Request a fresh UI/settings snapshot and return immediately.
+    pub fn refresh(&self) -> Result<(), MoonClientError> {
+        self.client.request_client_settings()
+    }
+
+    /// Set the market-maker orders subscription flag.
+    pub fn set_mm_orders_subscription(&self, subscribe: bool) -> Result<(), MoonClientError> {
+        self.client.set_mm_orders_subscription(subscribe)
+    }
+
+    /// Set AutoDetect active/passive-mode state in the core.
+    ///
+    /// Completion is observed through `SettingsEvent::RuntimeStateUpdated` and
+    /// `snapshot().settings().runtime_state.auto_detect_active`.
+    pub fn set_auto_detect_active(&self, active: bool) -> Result<(), MoonClientError> {
+        self.client.set_auto_detect_active(active)
+    }
+
+    /// Send a full client-settings snapshot.
+    pub fn send(
+        &self,
+        settings: crate::commands::ui::ClientSettingsCommand,
+    ) -> Result<(), MoonClientError> {
+        self.client.send_settings(settings)
+    }
+
+    /// Request the kernel's current safe-share config and return immediately.
+    ///
+    /// Completion arrives as `Event::Settings(SettingsEvent::SharedConfigUpdated)`;
+    /// the latest snapshot is readable through `snapshot().settings().shared_config`.
+    pub fn refresh_shared_config(&self) -> Result<(), MoonClientError> {
+        self.client.request_shared_config()
+    }
+
+    /// Send a safe-share config for the kernel to apply.
+    ///
+    /// After applying, the kernel re-broadcasts both the fresh shared config
+    /// and the client-settings snapshot; retained state catches up through the
+    /// normal event path — do not overlay local state manually.
+    pub fn send_shared_config(
+        &self,
+        cfg: &crate::shared_config::SharedConfig,
+    ) -> Result<(), MoonClientError> {
+        let payload = crate::shared_config::serialize_payload(cfg)
+            .map_err(MoonClientError::InvalidSharedConfig)?;
+        let blob = crate::shared_config::gzip_compress(&payload)
+            .map_err(MoonClientError::InvalidSharedConfig)?;
+        self.client.send_shared_config_blob(blob)
+    }
+
+    /// Build an editable [`crate::shared_config::SharedConfig`] from the latest
+    /// full snapshot received from the core.
+    ///
+    /// The runtime requests that snapshot in the background after `Ready` and
+    /// retries every five seconds until it arrives. This method returns
+    /// [`MoonClientError::StateUnavailable`] before the first valid full
+    /// snapshot instead of inventing defaults that could overwrite live core
+    /// settings. Compact settings received after the full snapshot are overlaid
+    /// before the value is returned.
+    ///
+    /// `manual_strategy` is not resolved from `manual_strategy_id` here (the
+    /// share format stores the strategy name); the base value is kept.
+    pub fn build_shared_config(
+        &self,
+    ) -> Result<crate::shared_config::SharedConfig, MoonClientError> {
+        let snapshot = self
+            .client
+            .snapshot()
+            .ok_or(MoonClientError::StateUnavailable("snapshot is not ready"))?;
+        snapshot
+            .settings()
+            .build_shared_config()
+            .ok_or(MoonClientError::StateUnavailable(
+                "shared config has not been received yet",
+            ))
+    }
+
+    /// Exclude globally blacklisted coins from `markets().global_deltas()`.
+    ///
+    /// This is the local terminal checkbox "Exclude blacklisted markets from
+    /// the market delta calculation". It is not a server settings field; Active
+    /// Lib applies it locally to the retained market analytics state.
+    pub fn set_exclude_blacklisted_markets_from_exchange_delta(
+        &self,
+        exclude: bool,
+    ) -> Result<(), MoonClientError> {
+        self.client
+            .set_exclude_blacklisted_markets_from_exchange_delta(exclude)
+    }
+
+    /// Request the normal release update flow.
+    pub fn request_release_update(&self) -> Result<(), MoonClientError> {
+        self.client.request_version_update("", true)
+    }
+
+    /// Request a named beta/test version update.
+    pub fn request_version_update(
+        &self,
+        version_name: impl Into<String>,
+    ) -> Result<(), MoonClientError> {
+        self.client.request_version_update(version_name, false)
+    }
+
+    /// Switch DEX mode.
+    pub fn switch_dex(&self, dex_name: impl Into<String>) -> Result<(), MoonClientError> {
+        self.client.switch_dex(dex_name)
+    }
+
+    /// Switch spot mode.
+    pub fn switch_spot(
+        &self,
+        spot: crate::commands::ui::SpotMarketKind,
+    ) -> Result<(), MoonClientError> {
+        self.client.switch_spot(spot)
+    }
+
+    /// Update leverage-management settings.
+    ///
+    /// Set the behavioural fields on `cmd` (auto max-order, auto lev-up,
+    /// isolated/cross, fix-lev, telegram report, lev-control text). Its `uid`
+    /// and `cmd_ver` fields are ignored on send: the runtime assigns a fresh UID
+    /// and always writes the current leverage command version.
+    pub fn manage_leverage(
+        &self,
+        cmd: &crate::commands::ui::LevManage,
+    ) -> Result<(), MoonClientError> {
+        self.client.manage_leverage(cmd.clone())
+    }
+
+    /// Ask the MoonBot core to start/restart the market runtime now.
+    ///
+    /// The server starts the market runtime if it is stopped, leaves passive
+    /// mode if needed, starts checked strategies, and then broadcasts an updated
+    /// runtime-state snapshot. Completion is observed through
+    /// `SettingsEvent::RuntimeStateUpdated` and
+    /// `snapshot().settings().runtime_state`.
+    pub fn restart_now(&self) -> Result<(), MoonClientError> {
+        self.client.restart_now()
+    }
+
+    /// Request a graceful shutdown of the connected MoonBot core.
+    ///
+    /// This is a one-shot request. The core ignores it while an active
+    /// take/sell order exists; otherwise it follows its normal shutdown path.
+    /// No protocol acknowledgement is sent. Unlike
+    /// [`MoonClient::disconnect`](crate::MoonClient::disconnect), this targets
+    /// the core process rather than only the local Rust client.
+    pub fn request_core_shutdown(&self) -> Result<(), MoonClientError> {
+        self.client.request_core_shutdown()
+    }
+
+    /// Clear all confirmed problems and pending detector hypotheses on the core.
+    /// All terminals receive a fresh list. Local state changes only on that reply;
+    /// a still-present cause can subsequently produce a new problem.
+    pub fn clear_problems(&self) -> Result<(), MoonClientError> {
+        self.client
+            .send_no_reply(RuntimeCommand::Ui(UiRuntimeCommand::ProblemsClear))
+    }
+
+    /// Publish a test problem through the core's normal detector worker.
+    ///
+    /// The worker processes signals about every two seconds. Only the first
+    /// confirmation of the `test` kind sends a notification; further calls
+    /// update the existing core row until problems are cleared. The core's
+    /// signal buffer keeps at most 200 characters in its legacy text encoding;
+    /// short ASCII text is recommended for an exact test marker.
+    pub fn test_problem(&self, text: impl Into<String>) -> Result<(), MoonClientError> {
+        self.client
+            .send_no_reply(RuntimeCommand::Ui(UiRuntimeCommand::ProblemsTest(
+                text.into(),
+            )))
+    }
+
+    /// Request the latest license/module/MoonCredits state from the core.
+    ///
+    /// The server also sends this state after connect. Use this method for a
+    /// manual refresh; completion is observed through
+    /// `SettingsEvent::KernelLicenseStateUpdated` and
+    /// `snapshot().settings().kernel_license_state`.
+    pub fn request_kernel_license_state(&self) -> Result<(), MoonClientError> {
+        self.client.request_kernel_license_state()
+    }
+
+    fn manage_triggers_for_markets_inner<I, S>(
+        &self,
+        action: crate::commands::ui::TriggerAction,
+        market_names: I,
+        keys: &[u16],
+    ) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let indexes = resolve_market_indexes(self.client, market_names)?;
+        self.client
+            .manage_triggers(action.to_byte(), false, indexes, keys.to_vec())
+    }
+
+    /// Arm trigger keys for selected markets.
+    pub fn set_triggers_for_markets<I, S>(
+        &self,
+        market_names: I,
+        keys: &[u16],
+    ) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.manage_triggers_for_markets_inner(
+            crate::commands::ui::TriggerAction::Set,
+            market_names,
+            keys,
+        )
+    }
+
+    /// Clear trigger keys for selected markets.
+    pub fn clear_triggers_for_markets<I, S>(
+        &self,
+        market_names: I,
+        keys: &[u16],
+    ) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.manage_triggers_for_markets_inner(
+            crate::commands::ui::TriggerAction::Clear,
+            market_names,
+            keys,
+        )
+    }
+
+    /// Arm trigger keys for all current markets.
+    pub fn set_triggers_for_all(&self, keys: &[u16]) -> Result<(), MoonClientError> {
+        self.client.manage_triggers(
+            crate::commands::ui::TriggerAction::Set.to_byte(),
+            true,
+            Vec::new(),
+            keys.to_vec(),
+        )
+    }
+
+    /// Clear trigger keys for all current markets.
+    pub fn clear_triggers_for_all(&self, keys: &[u16]) -> Result<(), MoonClientError> {
+        self.client.manage_triggers(
+            crate::commands::ui::TriggerAction::Clear.to_byte(),
+            true,
+            Vec::new(),
+            keys.to_vec(),
+        )
+    }
+
+    /// Low-level diagnostic helper for callers that already have server market
+    /// indexes. Regular terminal code should use the market-name helpers above.
+    #[cfg(any(test, feature = "diagnostics"))]
+    #[doc(hidden)]
+    pub fn manage_triggers(
+        &self,
+        action: crate::commands::ui::TriggerAction,
+        all_markets: bool,
+        markets: &[u16],
+        keys: &[u16],
+    ) -> Result<(), MoonClientError> {
+        self.client.manage_triggers(
+            action.to_byte(),
+            all_markets,
+            markets.to_vec(),
+            keys.to_vec(),
+        )
+    }
+
+    /// Reset the current-session or all-time profit counter on the server.
+    pub fn reset_profit(
+        &self,
+        kind: crate::commands::ui::ResetProfitKind,
+    ) -> Result<(), MoonClientError> {
+        self.client.reset_profit(kind.to_byte())
+    }
+
+    /// Tell the server arbitrage is valid until `valid_until`.
+    pub fn notify_arb_activation(
+        &self,
+        valid_until: crate::MoonTime,
+    ) -> Result<(), MoonClientError> {
+        self.client
+            .notify_arb_activation(valid_until.to_delphi_days())
+    }
+}
+
+/// Chart-alert command handle.
+///
+/// The MoonProto core is the authoritative owner of armed chart alerts. UI code
+/// sends user edits here; accepted state arrives through `Event::ChartAlert` and
+/// `snapshot().chart_alerts()`.
+pub struct MoonChartAlerts<'a> {
+    pub(super) client: &'a MoonClient,
+}
+
+impl MoonChartAlerts<'_> {
+    /// Ask the core to resend all currently armed chart alerts.
+    pub fn request_snapshot(&self) -> Result<(), MoonClientError> {
+        self.client.request_alert_snapshot()
+    }
+
+    /// Upsert a chart alert object for a retained market handle.
+    ///
+    /// `blob` must be the MoonBot chart-object payload. The core is
+    /// authoritative: after it accepts the object, clients receive
+    /// `Event::ChartAlert`, and the retained copy is available from
+    /// `snapshot().chart_alerts()`.
+    pub fn upsert_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+        obj_uid: u64,
+        blob: Vec<u8>,
+    ) -> Result<(), MoonClientError> {
+        self.upsert(market.name(), obj_uid, blob)
+    }
+
+    /// Upsert a chart alert object by market name.
+    pub fn upsert(
+        &self,
+        market_name: impl Into<String>,
+        obj_uid: u64,
+        blob: Vec<u8>,
+    ) -> Result<(), MoonClientError> {
+        self.client
+            .sync_alert_object(crate::commands::ui::AlertObjectCommand::new_upsert(
+                market_name,
+                obj_uid,
+                blob,
+            ))
+    }
+
+    /// Delete/dearm a chart alert object for a retained market handle.
+    pub fn delete_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+        obj_uid: u64,
+    ) -> Result<(), MoonClientError> {
+        self.delete(market.name(), obj_uid)
+    }
+
+    /// Delete/dearm a chart alert object by market name.
+    pub fn delete(
+        &self,
+        market_name: impl Into<String>,
+        obj_uid: u64,
+    ) -> Result<(), MoonClientError> {
+        self.client
+            .sync_alert_object(crate::commands::ui::AlertObjectCommand::new_delete(
+                market_name,
+                obj_uid,
+            ))
+    }
+}
+
+/// Core-built chart-text command handle.
+///
+/// This is not a local strategy calculator. The UI tells the core which chart
+/// is visible and which text blocks it needs; ready rows arrive through
+/// `Event::ChartText` and `snapshot().chart_text()`.
+pub struct MoonChartText<'a> {
+    pub(super) client: &'a MoonClient,
+}
+
+impl MoonChartText<'_> {
+    /// Tell the core which market currently needs chart filter/debug rows.
+    pub fn set_visible_market_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+        need_filters: bool,
+        need_debug_lines: bool,
+    ) -> Result<(), MoonClientError> {
+        self.set_visible_market(market.name(), need_filters, need_debug_lines)
+    }
+
+    /// Tell the core which market currently needs chart filter/debug rows.
+    pub fn set_visible_market(
+        &self,
+        market_name: impl Into<String>,
+        need_filters: bool,
+        need_debug_lines: bool,
+    ) -> Result<(), MoonClientError> {
+        self.client
+            .send_chart_text_state(crate::commands::ui::ChartTextStateCommand::new(
+                market_name,
+                need_filters,
+                need_debug_lines,
+            ))
+    }
+
+    /// Disable chart text relay for this client.
+    pub fn clear_visible_market(&self) -> Result<(), MoonClientError> {
+        self.set_visible_market("", false, false)
+    }
+}
+
+/// Chart-trade emulator command handle.
+///
+/// This is the high-level path for MoonBot's draw-tool emulator: terminal code
+/// selects a market, builds `EmuTradePoint` values from chart points, and Active
+/// Lib resolves the current server index before sending the emulator intent.
+pub struct MoonEmulator<'a> {
+    pub(super) client: &'a MoonClient,
+}
+
+impl MoonEmulator<'_> {
+    /// Send chart-pencil points for a retained market handle.
+    ///
+    /// The UI passes absolute chart points, Active Lib starts from the market's
+    /// current `LastAsk`, converts falling points to sell ticks, skips points
+    /// outside the compact millisecond window, and queues one emulator intent.
+    pub fn send_pencil_prices_for_market<I>(
+        &self,
+        market: &crate::state::MarketHandle,
+        base_time: crate::MoonTime,
+        points: I,
+    ) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = crate::EmuPencilPoint>,
+    {
+        let initial_price = market.price().last_ask as f32;
+        let emu_points = emu_trade_points_from_pencil(base_time, initial_price, points)?;
+        self.send_trades_for_market(market, base_time, &emu_points)
+    }
+
+    /// Send chart-pencil points by terminal market name.
+    ///
+    /// Prefer [`Self::send_pencil_prices_for_market`] when UI code already
+    /// keeps a stable `MarketHandle` for the selected chart.
+    pub fn send_pencil_prices<I>(
+        &self,
+        market_name: impl AsRef<str>,
+        base_time: crate::MoonTime,
+        points: I,
+    ) -> Result<(), MoonClientError>
+    where
+        I: IntoIterator<Item = crate::EmuPencilPoint>,
+    {
+        let market_name = market_name.as_ref();
+        let snapshot = self
+            .client
+            .snapshot()
+            .ok_or(MoonClientError::StateUnavailable(
+                "market map is not published yet",
+            ))?;
+        let market = snapshot
+            .markets()
+            .get(market_name)
+            .ok_or_else(|| MoonClientError::UnknownMarket(market_name.to_string()))?;
+        self.send_pencil_prices_for_market(&market, base_time, points)
+    }
+
+    /// Send emulated trades for a retained market handle.
+    pub fn send_trades_for_market(
+        &self,
+        market: &crate::state::MarketHandle,
+        base_time: crate::MoonTime,
+        points: &[crate::EmuTradePoint],
+    ) -> Result<(), MoonClientError> {
+        self.send_trades(market.name(), base_time, points)
+    }
+
+    /// Send emulated trades by terminal market name.
+    ///
+    /// Empty `points` is a no-op: the command is sent only after a drawn pencil
+    /// produced at least one valid point. Sell side is encoded by
+    /// `EmuTradePoint::sell`.
+    pub fn send_trades(
+        &self,
+        market_name: impl AsRef<str>,
+        base_time: crate::MoonTime,
+        points: &[crate::EmuTradePoint],
+    ) -> Result<(), MoonClientError> {
+        if points.is_empty() {
+            return Ok(());
+        }
+        if points.len() > usize::from(u16::MAX) {
+            return Err(MoonClientError::TooManyEmuTradePoints(points.len()));
+        }
+        let market_index = resolve_market_index(self.client, market_name.as_ref())?;
+        self.client
+            .send_emulated_trades(market_index, base_time.to_delphi_days(), points.to_vec())
+    }
+}
+
+fn emu_trade_points_from_pencil<I>(
+    base_time: crate::MoonTime,
+    initial_price: f32,
+    points: I,
+) -> Result<Vec<crate::EmuTradePoint>, MoonClientError>
+where
+    I: IntoIterator<Item = crate::EmuPencilPoint>,
+{
+    let mut out = Vec::new();
+    let mut prev_price = initial_price;
+    let base_time_ms = base_time.unix_millis();
+    for point in points {
+        let delta_ms = point.time.unix_millis().saturating_sub(base_time_ms);
+        if !(0..=i64::from(u16::MAX)).contains(&delta_ms) {
+            continue;
+        }
+        if out.len() >= usize::from(u16::MAX) {
+            return Err(MoonClientError::TooManyEmuTradePoints(
+                usize::from(u16::MAX) + 1,
+            ));
+        }
+        let price = point.price;
+        let emu_point = if price < prev_price {
+            crate::EmuTradePoint::sell(delta_ms as u16, price)
+        } else {
+            crate::EmuTradePoint::buy(delta_ms as u16, price)
+        };
+        prev_price = emu_point.abs_price();
+        out.push(emu_point);
+    }
+    Ok(out)
+}
+
+fn resolve_market_index(client: &MoonClient, market_name: &str) -> Result<u16, MoonClientError> {
+    let snapshot = client.snapshot().ok_or(MoonClientError::StateUnavailable(
+        "market map is not published yet",
+    ))?;
+    let markets = snapshot.markets();
+    if !markets.indexes_synchronized() {
+        return Err(MoonClientError::StateUnavailable(
+            "market indexes are not synchronized",
+        ));
+    }
+    markets
+        .market_index_by_name(market_name)
+        .ok_or_else(|| MoonClientError::UnknownMarket(market_name.to_string()))
+}
+
+fn resolve_market_indexes<I, S>(
+    client: &MoonClient,
+    market_names: I,
+) -> Result<Vec<u16>, MoonClientError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let snapshot = client.snapshot().ok_or(MoonClientError::StateUnavailable(
+        "market map is not published yet",
+    ))?;
+    let markets = snapshot.markets();
+    if !markets.indexes_synchronized() {
+        return Err(MoonClientError::StateUnavailable(
+            "market indexes are not synchronized",
+        ));
+    }
+
+    let mut indexes = Vec::new();
+    for market in market_names {
+        let market = market.as_ref();
+        let index = markets
+            .market_index_by_name(market)
+            .ok_or_else(|| MoonClientError::UnknownMarket(market.to_string()))?;
+        indexes.push(index);
+    }
+    Ok(indexes)
+}
+
+/// Demand-driven candle request handle.
+pub struct MoonCandles<'a> {
+    pub(super) client: &'a MoonClient,
+}
+
+/// Demand-driven retained chart-history requests.
+pub struct MoonHistory<'a> {
+    pub(super) client: &'a MoonClient,
+}
+
+impl MoonHistory<'_> {
+    /// Request the core's accumulated chart archive for a retained market.
+    pub fn request_chart_for(
+        &self,
+        market: &crate::state::MarketHandle,
+    ) -> Result<crate::state::MarketHistoryTicket, MoonClientError> {
+        self.request_chart(market.name())
+    }
+
+    /// String-keyed chart archive request for scripts and tools.
+    ///
+    /// The market must already belong to the retained trades scope. Completion
+    /// arrives as [`crate::Event::MarketHistory`].
+    pub fn request_chart(
+        &self,
+        market: impl Into<String>,
+    ) -> Result<crate::state::MarketHistoryTicket, MoonClientError> {
+        self.client.request_market_history(market.into())
+    }
+}
+
+impl MoonCandles<'_> {
+    /// Request CoinCard deep-history candles for a retained market handle.
+    ///
+    /// Prefer this in terminal UI code that already keeps a selected
+    /// `MarketHandle` for the current chart.
+    pub fn request_coin_card_for(
+        &self,
+        market: &crate::state::MarketHandle,
+        ticks: crate::commands::candles::DeepHistoryKind,
+    ) -> Result<CoinCardCandlesTicket, MoonClientError> {
+        self.request_coin_card(market.name(), ticks)
+    }
+
+    /// Request CoinCard deep-history candles and return immediately.
+    ///
+    /// This string-keyed path is convenient for scripts and one-shot tools.
+    /// Terminal UI code that already keeps a selected `MarketHandle` should use
+    /// [`Self::request_coin_card_for`].
+    pub fn request_coin_card(
+        &self,
+        market: impl Into<String>,
+        ticks: crate::commands::candles::DeepHistoryKind,
+    ) -> Result<CoinCardCandlesTicket, MoonClientError> {
+        self.client.request_coin_card_candles(market, ticks)
+    }
+}
+
+/// Strategy-state command handle.
+pub struct MoonStrategies<'a> {
+    pub(super) client: &'a MoonClient,
+}
+
+impl MoonStrategies<'_> {
+    /// Send a strategy sell-price update.
+    pub fn sell_price_update(
+        &self,
+        strategy_id: u64,
+        sell_price: f64,
+    ) -> Result<(), MoonClientError> {
+        self.client.strat_sell_price_update(strategy_id, sell_price)
+    }
+
+    /// Delete one strategy or folder.
+    pub fn delete(
+        &self,
+        strategy_id: u64,
+        folder_path: impl Into<String>,
+    ) -> Result<(), MoonClientError> {
+        self.client.strat_delete(strategy_id, folder_path)
+    }
+
+    /// Synchronize the application's current local strategy list.
+    /// The vector defines global order. A changed sequence is sent as one Full
+    /// snapshot with a library-assigned order date; row edit dates remain separate.
+    /// Without a reorder, only changed strategies are sent; an unchanged confirmed list is a no-op.
+    ///
+    /// Core-confirmed snapshots remain unchanged until the core echoes an
+    /// accepted revision. Use `snapshot.strategy_edit(id)` and `StratEvent`'s
+    /// edit lifecycle events to render pending, confirmed, superseded, and
+    /// timed-out edits honestly.
+    pub fn sync_local_strategies(
+        &self,
+        strategies: Vec<crate::commands::strategy_serializer::StrategySnapshot>,
+    ) -> Result<(), MoonClientError> {
+        self.client.send_strategy_snapshot_batch(strategies)
+    }
+
+    /// Submit the complete desired folder tree without changing strategy contents/order.
+    /// Omitted empty folders are removed. Parents and occupied folders are preserved.
+    /// Requires a first versioned folder snapshot from the core; confirmation
+    /// arrives through `SnapshotFull` and `snapshot.strats().folder_paths()`.
+    pub fn sync_local_folders(&self, paths: Vec<String>) -> Result<(), MoonClientError> {
+        self.send_folders(None, paths)
+    }
+
+    /// Submit strategy edits and the complete desired folder tree in one Full.
+    /// Use for renames/moves: update each affected strategy's path and edit date,
+    /// and replace the old folder paths in `paths`. Strategy deletion remains explicit.
+    pub fn sync_local_strategies_with_folders(
+        &self,
+        strategies: Vec<crate::commands::strategy_serializer::StrategySnapshot>,
+        paths: Vec<String>,
+    ) -> Result<(), MoonClientError> {
+        self.send_folders(Some(strategies), paths)
+    }
+
+    fn send_folders(
+        &self,
+        strategies: Option<Vec<crate::commands::strategy_serializer::StrategySnapshot>>,
+        paths: Vec<String>,
+    ) -> Result<(), MoonClientError> {
+        let snapshot = self
+            .client
+            .snapshot()
+            .ok_or(MoonClientError::StateUnavailable(
+                "strategy state is not ready",
+            ))?;
+        if snapshot.strats().folders_last_modified() == 0 {
+            return Err(MoonClientError::StateUnavailable(
+                "a versioned strategy folder tree has not arrived",
+            ));
+        }
+        let folder_paths = paths.iter().map(String::as_str);
+        if let Some(rows) = &strategies {
+            validate_strategy_folder_paths(
+                folder_paths.chain(rows.iter().map(|s| s.path.as_ref())),
+            )?;
+        } else {
+            validate_strategy_folder_paths(
+                folder_paths.chain(snapshot.strats().snapshots().map(|s| s.path.as_ref())),
+            )?;
+        }
+        self.client
+            .send_no_reply(RuntimeCommand::StrategyFolders { strategies, paths })
+    }
+
+    /// Change a local strategy checked flag in the active runtime state.
+    pub fn set_checked(&self, strategy_id: u64, checked: bool) -> Result<(), MoonClientError> {
+        self.client.set_strategy_checked(strategy_id, checked)
+    }
+
+    /// Send checked-state delta if any local strategy changed.
+    pub fn send_checked_delta(&self) -> Result<(), MoonClientError> {
+        self.client.send_strategy_checked_delta()
+    }
+
+    /// Start checked strategies.
+    pub fn start(&self) -> Result<(), MoonClientError> {
+        self.client.strategy_start_stop(true)
+    }
+
+    /// Stop checked strategies.
+    pub fn stop(&self) -> Result<(), MoonClientError> {
+        self.client.strategy_start_stop(false)
+    }
+}
+
+fn validate_strategy_folder_paths<'a>(
+    paths: impl Iterator<Item = &'a str>,
+) -> Result<(), MoonClientError> {
+    let mut unique = std::collections::HashSet::new();
+    for path in paths {
+        if path.len() > usize::from(u8::MAX) || path.contains(['\r', '\n', '\0', '"']) {
+            return Err(MoonClientError::InvalidStrategyFolders(
+                "paths must fit 255 UTF-8 bytes and contain no quotes/control characters",
+            ));
+        }
+        if path.is_empty() {
+            continue;
+        }
+        let mut prefix = String::new();
+        for part in path.split('/') {
+            if part.is_empty() || part.trim() != part {
+                return Err(MoonClientError::InvalidStrategyFolders(
+                    "folder names must be nonempty and have no surrounding whitespace",
+                ));
+            }
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            unique.insert(prefix.to_lowercase());
+        }
+    }
+    // The root path also occupies a dictionary entry when it contains strategies.
+    if unique.len() >= usize::from(u16::MAX) {
+        return Err(MoonClientError::InvalidStrategyFolders(
+            "too many folder paths for the snapshot dictionary",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strategy_folder_paths_validate_wire_bytes_and_delphi_path_syntax() {
+        assert!(validate_strategy_folder_paths(["", "A/B", "a/b"].into_iter()).is_ok());
+        let max = "a".repeat(255);
+        assert!(validate_strategy_folder_paths([max.as_str()].into_iter()).is_ok());
+        for path in [
+            "a".repeat(256),
+            "\u{e9}".repeat(128),
+            "a//b".into(),
+            "a/".into(),
+            " spaced".into(),
+            "a\"b".into(),
+            "a\nb".into(),
+            "a\0b".into(),
+        ] {
+            assert!(
+                validate_strategy_folder_paths([path.as_str()].into_iter()).is_err(),
+                "{path:?}"
+            );
+        }
+    }
+
+    fn at_ms(base: crate::MoonTime, delta_ms: i64) -> crate::MoonTime {
+        crate::MoonTime::from_unix_millis(base.unix_millis() + delta_ms)
+    }
+
+    #[test]
+    fn pencil_points_follow_delphi_prev_price_signing_and_delta_filter() {
+        let base = crate::MoonTime::from_unix_millis(1_678_780_800_000);
+        let points = [
+            crate::EmuPencilPoint::new(at_ms(base, -1), 111.0),
+            crate::EmuPencilPoint::new(at_ms(base, 0), 101.0),
+            crate::EmuPencilPoint::new(at_ms(base, 500), 99.0),
+            crate::EmuPencilPoint::new(at_ms(base, 1_000), 100.0),
+            crate::EmuPencilPoint::new(at_ms(base, 70_000), 120.0),
+        ];
+
+        let out = emu_trade_points_from_pencil(base, 100.0, points).unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                crate::EmuTradePoint::buy(0, 101.0),
+                crate::EmuTradePoint::sell(500, 99.0),
+                crate::EmuTradePoint::buy(1000, 100.0),
+            ]
+        );
+    }
+}

@@ -1,0 +1,651 @@
+# UI Channel
+
+The UI channel carries bot settings and UI-originated control commands:
+settings snapshots, strategy start/stop, market-maker subscription, version
+update control, leverage management, trigger management, DEX/spot switching, and
+arb activation notifications. It also carries retained runtime, license, and
+profit-counter state and [confirmed core diagnostics](problems.md).
+
+Applications normally receive UI updates through `Event::Settings` and send
+user intents through `MoonClient` settings/update/switch helpers.
+
+## Receiving Settings
+
+```rust
+use moonproto::Event;
+use moonproto::state::SettingsEvent;
+
+for event in client.drain_events() {
+    if let Event::Settings(settings_event) = event {
+        match settings_event {
+            SettingsEvent::ClientSettingsUpdated => {
+                let Some(state) = client.snapshot() else { continue; };
+                if let Some(settings) = &state.settings().client_settings {
+                    redraw_settings(settings);
+                }
+            }
+            SettingsEvent::ArbActivated { arb_valid, .. } => show_arb_valid_until(arb_valid),
+            SettingsEvent::VersionUpdate { version_name, is_release, .. } => {
+                handle_remote_update(version_name, is_release);
+            }
+            SettingsEvent::LevManageUpdated => {
+                let Some(state) = client.snapshot() else { continue; };
+                if let Some(lev_manage) = &state.settings().lev_manage {
+                    redraw_leverage_management(lev_manage);
+                }
+            }
+            SettingsEvent::RuntimeStateUpdated => {
+                let Some(state) = client.snapshot() else { continue; };
+                if let Some(runtime) = state.settings().runtime_state {
+                    redraw_runtime_controls(runtime.is_started, runtime.auto_detect_active);
+                }
+            }
+            SettingsEvent::KernelLicenseStateUpdated => {
+                let Some(state) = client.snapshot() else { continue; };
+                if let Some(license) = state.settings().kernel_license_state {
+                    redraw_license_panel(license.paid_version, license.moon_credits);
+                }
+            }
+            SettingsEvent::ProfitStateUpdated => {
+                let Some(state) = client.snapshot() else { continue; };
+                if let Some(profit) = state.settings().profit_state {
+                    redraw_profit_counters(profit);
+                }
+            }
+            SettingsEvent::HyperliquidRequestLimitUpdated => {
+                let Some(state) = client.snapshot() else { continue; };
+                redraw_hyperliquid_requests_left(
+                    state.settings().hyperliquid_requests_left,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+`SettingsState` stores the latest settings snapshot and small derived fields:
+leverage management, runtime state, kernel license/MoonCredits state, profit
+counters, HyperLiquid request quota, and arb validity time. Client-originated UI
+commands such as MM-orders subscription, emulator ticks, trigger management,
+reset-profit, restart-now, and DEX/spot switching are sent through high-level
+handles; they are not inbound settings state.
+
+The separate full portable settings snapshot is documented in
+[shared configuration](shared_config.md). It is requested in the background and
+does not delay `Ready`.
+
+## Requesting Current Settings
+
+For UI code, use `client.settings().refresh()`. It queues a settings refresh
+request and returns immediately. The server answers by sending a
+full settings snapshot; Active Lib applies it, emits
+`Event::Settings(SettingsEvent::ClientSettingsUpdated)`, and stores the latest
+value in `snapshot().settings().client_settings`.
+
+```rust
+client.settings().refresh()?;
+
+for event in client.drain_events() {
+    if matches!(
+        event,
+        moonproto::Event::Settings(moonproto::state::SettingsEvent::ClientSettingsUpdated)
+    ) {
+        if let Some(snapshot) = client.snapshot() {
+            if let Some(settings) = &snapshot.settings().client_settings {
+                println!(
+                    "sell target = {:.4}%",
+                    settings.effective_take_profit_percent()
+                );
+            }
+        }
+    }
+}
+```
+
+## Sending UI Commands
+
+Regular applications send UI commands through `MoonClient`:
+
+```rust
+use moonproto::SpotMarketKind;
+
+client.settings().refresh()?;
+if let Some(mut settings) = client
+    .snapshot()
+    .and_then(|state| state.settings().client_settings.clone())
+{
+    settings.set_main_take_profit_percent(50.0);
+    client.settings().send(settings)?;
+}
+client.settings().set_mm_orders_subscription(true)?;
+client.settings().request_release_update()?;             // release update button
+client.settings().request_version_update("MoonBot-7")?;  // test/beta version name
+client.settings().switch_dex("Main")?;
+client.settings().switch_spot(SpotMarketKind::Crypto)?;
+client.settings().restart_now()?;
+client.settings().request_kernel_license_state()?;
+client.settings().set_triggers_for_markets(["BTCUSDT", "ETHUSDT"], &[1, 7])?;
+client.settings().clear_triggers_for_all(&[3])?;
+```
+
+`settings().send(...)` sends a full settings snapshot. Normal UI code edits the
+latest snapshot received from the server; constructing a fresh
+`ClientSettingsCommand::default()` is useful for tests/tools, not for an already
+configured terminal session. Normal application code should use the high-level
+method names above.
+
+For strategy start/stop with an explicit checked-state delta, normal UI code
+uses `MoonClient`. The runtime owns strategy checked-state and sends only items
+whose checked value changed:
+
+```rust
+client.strategies().set_checked(strategy_id, true)?;
+client.strategies().start()?;
+```
+
+`set_mm_orders_subscription` is registry-aware: it records the latest MM-orders
+value in the reconnect registry immediately. Before Init it sends nothing; the
+one-time Init normally derives the initial MM state from
+`InitConfig::subscribe_trades`, or uses this queued value when Init does not
+request a trades stream. After Init, this method changes the MM sections without
+restarting the trades stream, and reconnect restores the latest value
+automatically.
+
+### Version Update
+
+`request_release_update()` asks the server to start the normal release update
+flow. `request_version_update(version_name)` asks for a named beta/test build.
+
+This is a remote-update command, not a passive "current client version"
+notification. The two normal UI uses are:
+
+- update button: call `request_release_update()`;
+- beta/test install command: call `request_version_update("MoonBot-7")` after
+  application-side validation/normalization.
+
+When the server accepts this command, it also broadcasts the update request back
+to connected clients. The Rust library does not download or restart the
+application; it sends/parses the command and exposes an inbound request as
+`SettingsEvent::VersionUpdate`.
+
+Version update, `switch_dex`, and `switch_spot` are typed UI domain commands
+and are gated by Init. Low-level diagnostic tools that send the same payload by
+hand are responsible for preserving the matching `ServerUpdateSent` side
+effect.
+
+Low-level builders remain internal diagnostics/compatibility machinery; normal
+applications should use the typed methods above.
+
+### Runtime State
+
+The server sends runtime state after connect and whenever the market runtime or
+passive-mode state changes. Read it from
+`snapshot().settings().runtime_state` after
+`SettingsEvent::RuntimeStateUpdated`.
+
+```rust
+if let Some(runtime) = client
+    .snapshot()
+    .and_then(|state| state.settings().runtime_state)
+{
+    set_start_button(runtime.is_started);
+    set_auto_detect_indicator(runtime.auto_detect_active);
+}
+```
+
+`runtime.is_started` is the core market runtime state. `runtime.auto_detect_active`
+means automatic detection is active; if it is false, the core is in passive
+mode.
+
+To switch AutoDetect/passive mode, send the typed settings intent and wait for
+the next runtime-state update:
+
+```rust
+client.settings().set_auto_detect_active(true)?;
+```
+
+The call does not optimistically mutate local state. The server either changes
+the mode or echoes the current runtime state, and the terminal updates after
+`SettingsEvent::RuntimeStateUpdated`.
+
+`client.settings().restart_now()?` queues the normal MoonBot restart-now action:
+start the market runtime if needed, leave passive mode if needed, and start
+checked strategies. The call returns after the intent is queued; the observable
+result is a later `RuntimeStateUpdated` event and updated retained state.
+
+`client.settings().request_core_shutdown()?` asks the connected core process to
+shut down through its normal close path. The request is ignored while the core
+has an active take/sell order, and there is no protocol acknowledgement. It is
+an administrative one-shot command; retry only after retained order state shows
+that the active take/sell is gone. This is different from
+`client.disconnect()`, which stops only the local Rust client.
+For deployment, verify that the process actually exited before replacing its
+executable; a disconnected client does not prove shutdown. The
+[`shutdown_core` example](../examples/shutdown_core.rs) sends this request using
+`MOONPROTO_KEY` and a `HOST:PORT` argument; it does not confirm process exit.
+
+### License And MoonCredits State
+
+The server sends license/module/MoonCredits state after connect and when a
+client asks for it. Read it from
+`snapshot().settings().kernel_license_state` after
+`SettingsEvent::KernelLicenseStateUpdated`.
+
+```rust
+client.settings().request_kernel_license_state()?;
+
+if let Some(license) = client
+    .snapshot()
+    .and_then(|state| state.settings().kernel_license_state)
+{
+    set_paid_badge(license.paid_version);
+    set_moon_credits(license.moon_credits, license.moon_credits_hold);
+    set_watcher_enabled(license.can_use_watcher);
+}
+```
+
+`news_valid_until` and `arb_valid_until` are `Option<MoonTime>` values converted
+from the wire timestamp at parse time. A missing/invalid timestamp reads as
+`None`; application code should compare valid timestamps with `MoonTime::now()`
+when it needs an active/expired indicator.
+
+### Profit State
+
+The server sends the current report-profit counters after connect and whenever
+its calculated values change. Read them from `snapshot().settings().profit_state`
+after `SettingsEvent::ProfitStateUpdated`:
+
+```rust
+if let Some(profit) = client
+    .snapshot()
+    .and_then(|state| state.settings().profit_state)
+{
+    show_time_window_profit(profit.rep_total_profit, profit.rep_total_trades);
+    show_last_trades_profit(profit.rep_trades_total, profit.rep_count_trades);
+}
+```
+
+`rep_total_profit` / `rep_total_trades` are the core's configured time-window
+profit and row count. `rep_trades_total` / `rep_count_trades` are the configured
+last-trades window. These are report-database counters, not account balance and
+not a live per-order PnL stream.
+
+Reset either counter through the typed intent and wait for the next
+`ProfitStateUpdated` event instead of changing the retained value locally:
+
+```rust
+use moonproto::ResetProfitKind;
+
+client.settings().reset_profit(ResetProfitKind::CurrentProfit)?;
+client.settings().reset_profit(ResetProfitKind::AllProfit)?;
+```
+
+### HyperLiquid Request Quota
+
+HyperLiquid limits action requests per user address. The core sends its latest
+remaining count after connect, after each successful quota refresh, and when it
+first observes that the quota is exhausted. Read the retained value after
+`SettingsEvent::HyperliquidRequestLimitUpdated`:
+
+```rust
+if let Some(snapshot) = client.snapshot() {
+    set_requests_left(snapshot.settings().hyperliquid_requests_left);
+
+    // For HyperLiquid this legacy AuthCheck field contains the user address
+    // expected by the request-purchase page.
+    let user_address = snapshot
+        .auth_info()
+        .map(|auth| auth.btc_address.as_str())
+        .filter(|address| !address.is_empty());
+}
+```
+
+`None` means that the connected core has not published a quota value yet or is
+not a HyperLiquid core. The count is core-owned state; terminal code should not
+decrement it optimistically from local order activity.
+
+### Leverage Management
+
+Leverage management is a separate settings snapshot, just like in MoonBot. A
+terminal normally edits the latest retained leverage settings and sends the
+whole snapshot back:
+
+```rust
+if let Some(mut lev) = client
+    .snapshot()
+    .and_then(|state| state.settings().lev_manage.clone())
+{
+    lev.auto_fix_lev = true;
+    lev.fix_lev = 5;
+    client.settings().manage_leverage(&lev)?;
+}
+```
+
+Internal command UID/version fields are not user input. The runtime writes fresh
+bookkeeping values when it queues the leverage update.
+
+Leverage-management fields are UI controls, not protocol switches:
+
+| Field | UI meaning |
+|---|---|
+| `auto_max_order` | Auto-calculate leverage from the configured maximum order size / market leverage brackets. |
+| `auto_lev_up` | Allow automatic leverage increases; when off, automatic management only lowers leverage. |
+| `auto_isolated` | Force isolated margin where supported. |
+| `auto_cross` | Force cross margin where supported. |
+| `auto_fix_lev` / `fix_lev` | Force a fixed target leverage value. |
+| `tlg_report` | Send leverage-change reports to Telegram. |
+| `lev_control` | Text config for the markets-table `MaxPos` values and auto-leverage worker. |
+
+Active Lib parses `lev_control` when `LevManage` arrives and applies the
+per-market values to retained markets. Terminal code should read
+`MarketHandle::max_pos_limit()` for the `MaxPos` column instead of parsing this
+text itself. The `def` fallback is not copied into every market; it is available
+as `LevManage::default_max_pos_limit()`, matching the core worker model where a
+market with `MaxPos = 0` can still use the global fallback.
+
+### Arbitrage Activation
+
+`notify_arb_activation(...)` is the MoonBot arb-valid-until notification path.
+Incoming notifications update `snapshot().settings().arb_valid_until_time()` and
+emit `SettingsEvent::ArbActivated { arb_valid }`, where `arb_valid` is a
+`MoonTime`.
+
+For UI gating, use `snapshot().settings().arb_is_active_now()` or
+`arb_is_active_at(now)`. Active Lib exposes the ready boolean/time helpers
+instead of making terminal code compare raw wire-day values.
+
+### Chart Trade Emulator
+
+The chart emulator is a normal UI feature, matching MoonBot's pencil
+`EmulateTrades` mode. Terminal code builds emulated trade points from drawn
+chart points and sends them through `client.emulator()`. The caller uses a
+market name or a retained `MarketHandle`; Active Lib resolves the current server
+market index internally.
+
+```rust
+use moonproto::{EmuPencilPoint, MoonTime};
+
+let Some(state) = client.snapshot() else { return Ok(()); };
+let Some(sol) = state.markets().get("SOLUSDT") else { return Ok(()); };
+
+let base_time = MoonTime::now();
+let at = |seconds: i64| MoonTime::from_unix_millis(base_time.unix_millis() + seconds * 1000);
+let points = [
+    EmuPencilPoint::new(base_time, 142.10),
+    EmuPencilPoint::new(at(1), 142.05),
+    EmuPencilPoint::new(at(2), 142.22),
+];
+
+client
+    .emulator()
+    .send_pencil_prices_for_market(&sol, base_time, points)?;
+```
+
+`send_pencil_prices_for_market` follows MoonBot's pencil-trade algorithm: it
+starts from the market's current `LastAsk`, converts falling pencil points to
+sell ticks, skips points outside the `0..=65535` millisecond command window, and
+ignores an empty result. `EmuTradePoint::buy` / `EmuTradePoint::sell` remain
+available for explicit low-level tick injection, but chart tools should usually
+pass `EmuPencilPoint` values and let Active Lib encode the trade side.
+
+### Trigger Management
+
+Terminal code selects markets by name or by a retained `MarketHandle`; it should
+not pass server `mIndex` values. The high-level trigger helpers resolve current
+market indexes inside Active Lib when the command is queued:
+
+```rust
+client
+    .settings()
+    .set_triggers_for_markets(["BTCUSDT", "ETHUSDT"], &[1, 2, 3])?;
+
+client
+    .settings()
+    .clear_triggers_for_markets(["SOLUSDT"], &[7])?;
+
+client.settings().set_triggers_for_all(&[1])?;
+client.settings().clear_triggers_for_all(&[1, 2])?;
+```
+
+The hidden raw-index helper exists only for protocol diagnostics and parity
+tests.
+
+Inbound listing notifications are internal to the active library. They force an
+immediate listing refresh, but they are not emitted as settings events. User
+code gets the listing signal from the market domain only after the refreshed
+market list actually inserts new markets:
+`Event::Markets(MarketsEvent::NewMarketsAdded { names })`.
+
+Normal application code does not parse inbound UI packets directly. It reads the
+applied `SettingsState` and sends changes through the typed `client.settings()`
+handle.
+
+## ClientSettings
+
+`ClientSettingsCommand` is the full settings snapshot. It contains sell settings,
+stop/trailing/take-profit settings, iceberg flags, order-signing flag, coin
+blacklist fields, manual strategy id, stop-market settings, AutoStart settings,
+fixed-sell button presets, multi-order join mode, and `ArbConfigCompact`.
+
+Normal UI code clones the retained snapshot, changes the fields behind one UI
+page/control, and sends the whole snapshot back:
+
+```rust
+if let Some(current) = &snapshot.settings().client_settings {
+    let mut settings = current.clone();
+    settings.set_main_take_profit_percent(25.0);
+    settings.use_g_take_profit = true;
+    settings.g_take_profit = 2.5;
+    client.settings().send(settings)?;
+}
+```
+
+Useful helpers:
+
+| UI area | API |
+|---|---|
+| Main sell / scalp / fixed-sell display value | `effective_take_profit_percent()`, `set_main_take_profit_percent(...)`, `set_scalp_take_profit_percent(...)` |
+| Six fixed sell buttons | `fixed_sell_presets()`, `fixed_sell_preset_percent(slot)`, `selected_fixed_sell_slot()`, `selected_fixed_sell_percent()`, `set_selected_fixed_sell_slot(...)`, `set_fixed_sell_preset_price(...)` |
+| Temporary blacklist rows | `temp_blacklist_entries()` returns symbol + `Duration`; `set_temp_blacklist_entries(...)` accepts symbol + `Duration` |
+| Multi-order sell join combo | `JoinSellKind`, `join_sell_mode()`, `set_join_sell_mode(...)` |
+| AutoStart settings page | `auto_start_config()`, `set_auto_start_config(...)`, `update_auto_start_config(...)` |
+| AutoStart recovery/session page | `auto_start_config2()`, `set_auto_start_config2(...)`, `update_auto_start_config2(...)` |
+
+### Global Blacklist And TempBL
+
+The global coin blacklist and `TempBL` are core-wide "do not buy" controls.
+They block new strategy entries for matching coins. They do not block selling
+or closing positions that already exist.
+
+- The global blacklist remains active until settings change. Edit
+  `use_coins_black_list` and `coins_black_list_text`.
+- `TempBL` stores a remaining duration per symbol. Read rows with
+  `temp_blacklist_entries()`.
+- `set_temp_blacklist_entries(...)` replaces the complete TempBL list. Include
+  every row that must remain, then send the edited settings snapshot.
+
+```rust
+use std::time::Duration;
+
+let Some(mut settings) = client
+    .snapshot()
+    .and_then(|state| state.settings().client_settings.clone())
+else {
+    return Ok(());
+};
+
+settings.set_temp_blacklist_entries([
+    ("ETHUSDT", Duration::from_secs(6 * 60 * 60)),
+    ("SOLUSDT", Duration::from_secs(60 * 60)),
+]);
+client.settings().send(settings)?;
+```
+
+Per-strategy `CoinsWhiteList` / `CoinsBlackList` are different: they affect only
+that strategy and are edited through its typed strategy object or
+`StrategyEditor`.
+
+Common settings controls:
+
+| UI meaning | Suggested control | Fields/helpers |
+|---|---|---|
+| Main take-profit target | numeric percent input/slider | `set_main_take_profit_percent(...)`, `set_scalp_take_profit_percent(...)`, `effective_take_profit_percent()` |
+| Fixed-sell mode | segmented control or toggle | `fixed_sell_mode`, fixed-sell read/set helpers; helpers keep `fixed_sell_price` synchronized like MoonBot `UpdateFixedButtons` |
+| Stop-loss / trailing / global take-profit | numeric percent inputs + enable checkbox | `price_drop_level`, `trailing_drop`, `trailing_stop`, `use_g_take_profit`, `g_take_profit` |
+| Panic-on-price-drop protection | checkbox | `panic_if_price_drop` |
+| Emulator mode | checkbox/toggle | `emu_mode` |
+| Buy/sell iceberg flags | two checkboxes | `buy_iceberg`, `sell_iceberg` |
+| Signed order ids | checkbox | `sign_orders` |
+| Global coin blacklist | multiline/token text editor + enable checkbox | `coins_black_list_text`, `use_coins_black_list` |
+| Exclude blacklist from market delta | checkbox | `client.settings().set_exclude_blacklisted_markets_from_exchange_delta(...)` |
+| Temporary coin blacklist | editable table | `temp_blacklist_entries()` / `set_temp_blacklist_entries(...)` with normal Rust `Duration` values |
+| Manual strategy override | checkbox + strategy selector | `use_manual_strategy`, `manual_strategy_id` |
+| Position/stop-market options | checkboxes + small numeric input | `free_position_check`, `use_stop_market`, `vol_drop_level` |
+| Multi-order join-sell mode | combo/segmented control | `JoinSellKind`, `join_sell_mode()`, `set_join_sell_mode(...)` |
+| Arbitrage display options | platform checklist + display toggles | `arb_config.is_wanted(...)`, `set_wanted(...)`, `wanted_platforms()`, plus display flags |
+| AutoStart pages | settings sub-panels | `auto_start_config()`, `auto_start_config2()` typed views |
+
+The arb platform mask is deliberately exposed through `ArbPlatformCode`
+helpers, not as a public `[bool; 256]` table. UI code should label and edit
+platform rows by code/metadata instead of indexing a raw protocol byte.
+
+`fixed_sell_price` is not the best source for drawing the selected fixed-sell
+button: MoonBot derives the active fixed price from the selected fixed-sell
+preset after applying settings. Use the fixed-sell helpers for UI display and
+edits; setter helpers keep `fixed_sell_price` synchronized.
+
+`x_sell`, `x_tmode`, and `x_sell_scalp` are preserved field names from the
+MoonBot settings snapshot. Prefer the take-profit helpers above in UI code:
+they write the same fields while hiding the historic `x_tmode` scale flag and
+the scalp-mode `x_sell=0` convention.
+
+`set_exclude_blacklisted_markets_from_exchange_delta` is local Active Lib
+policy, not a server setting field. When enabled, markets whose currency appears
+in `coins_black_list_text` are skipped from `MarketsState::global_deltas()`
+exchange-delta aggregation.
+
+AutoStart is stored on the wire as two fixed compact blobs, but Active Lib keeps
+that detail inside the retained settings snapshot. Normal UI code edits typed
+views:
+
+```rust
+if let Some(current) = &snapshot.settings().client_settings {
+    let mut settings = current.clone();
+    settings.update_auto_start_config(|auto| {
+        auto.auto_start = true;
+        auto.strategies_on = true;
+        auto.auto_update = true;
+    });
+    settings.update_auto_start_config2(|auto| {
+        auto.restart_on_market = true;
+        auto.rs_hours = 6;
+    });
+    client.settings().send(settings)?;
+}
+```
+
+The hidden wire blobs are preserved for exact roundtrip and version
+compatibility when the typed views are written back.
+
+### AutoStart
+
+`AutoStartConfig` and `AutoStartConfig2` are the core's unattended-operation
+policy, not client-side timers:
+
+| Policy | Fields |
+|---|---|
+| Start automatically, restore the previous mode, enable detection, and start checked strategies | `auto_start`, `remember_state`, `auto_detect_on`, `strategies_on` |
+| Restrict operation to a daily time window | `work_time`, `work_time_from`, `work_time_to` |
+| Install updates automatically and optionally wait for sells to finish | `auto_update`, `dont_wait_sells` |
+| Stop after session loss and an optional minimum trade count; optionally sell positions | `auto_stop_if_loss`, `auto_stop_loss`, `stop_trades`, `sell_if_loss` |
+| Stop by loss over the last N hours | `auto_stop_if_loss_hours`, `auto_stop_hours_val`, `stop_hours`, `stop_hours_trades` |
+| Stop on BTC/exchange delta thresholds | `panic_btc`, `panic_btc_delta`, `panic_btc_delta_up`, `panic_market`, `panic_market_delta` |
+| Stop, sell, or restart after API-error or ping thresholds | `auto_stop_on_errors`, `errors_level`, `sell_all_on_errors`, `restart_after_err`, `restart_err_time`, `auto_stop_on_ping`, `ping_level`, `sell_all_on_ping`, `restart_after_ping`, `restart_ping_time` |
+| Exclude emulator trades from stop/loss accounting | `ignore_emulator` |
+| Restart after market deltas return to the configured range | `restart_on_market`, `btc_higher_than`, `btc_lower_than`, `market_higher_than` |
+| Listing/session policy | `show_old_listing`, `reset_session`, `rs_hours`, `max_session_cap` |
+
+Edit these values through `update_auto_start_config(...)` and
+`update_auto_start_config2(...)`, then send the full retained settings
+snapshot.
+
+## Pending Deduplication
+
+Some UI commands intentionally collapse older pending commands before they are
+sent, while others always keep the latest user action as a distinct command:
+
+| Command | Pending behavior |
+|---|---|
+| `send_settings` | Only the latest pending settings snapshot is kept. |
+| leverage-management settings snapshot | Only the latest pending snapshot is kept. |
+| `set_mm_orders_subscription` | Rapid live subscribe/unsubscribe commands are queued as distinct commands. The reconnect registry still remembers the latest desired value. |
+| `switch_dex` | Switch commands are queued as distinct commands. |
+| `switch_spot` | Switch commands are queued as distinct commands. |
+
+This matters for UI code that can emit rapid changes: settings and leverage are
+"latest wins"; MM-orders, DEX, and Spot commands preserve the user's command
+sequence.
+
+## Chart Alerts And Chart Text
+
+Chart alerts and chart text are core-owned UI facts, not settings. Use
+`client.chart_alerts()` for chart-alert user edits, `client.chart_text()` for
+the currently visible chart-text request, and the matching snapshot domains for
+retained state.
+
+Chart-alert objects are authoritative on the core side. The terminal sends an
+armed object snapshot when the user creates/changes an alert, sends delete when
+the object is removed, and asks for a snapshot after reconnect or screen reload:
+
+```rust
+let Some(state) = client.snapshot() else { return Ok(()); };
+let Some(market) = state.markets().get("BTCUSDT") else { return Ok(()); };
+
+client
+    .chart_alerts()
+    .upsert_for_market(&market, obj_uid, object_blob)?;
+
+client
+    .chart_alerts()
+    .delete_for_market(&market, obj_uid)?;
+
+client.chart_alerts().request_snapshot()?;
+```
+
+Inbound accepted alert objects are exposed as `Event::ChartAlert` and retained
+in `snapshot().chart_alerts()`. The blob is the accepted chart-object binary
+snapshot; UI code that owns the chart-object editor can load it into its local
+object model.
+
+Chart text rows are also built by the core. When a chart becomes fullscreen or
+changes market/filter needs, tell the runtime which rows are wanted:
+
+```rust
+client
+    .chart_text()
+    .set_visible_market_for_market(&market, need_filters, need_debug_lines)?;
+
+client.chart_text().clear_visible_market()?;
+```
+
+`Event::ChartText` arrives only after the core has built ready strings.
+It is a full replacement for the currently requested market. If the user has
+already switched the fullscreen chart, the late snapshot is ignored. The latest
+accepted value is available from
+`snapshot().chart_text().get("BTCUSDT")`.
+
+## Low-Level Parsing
+
+Inside the owned `MoonClient` runtime, UI payloads are parsed and applied to
+`SettingsState` automatically for known, supported UI commands. Applications
+normally read the resulting snapshot/events and do not instantiate protocol
+state machinery themselves.
+
+Unknown/future UI payloads are diagnostic forward-compatibility cases. The
+active runtime ignores them: they do not mutate `SettingsState` and do not emit
+`Event::Settings`.
+
+`ClientSettingsCommand` is tolerant to old append-only settings snapshots:
+missing optional tail fields keep the current settings fallback when possible.
+Malformed UTF-8 strings remain a parse-failure path.

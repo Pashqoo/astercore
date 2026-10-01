@@ -1,0 +1,234 @@
+# Trade Actions
+
+`MoonClient` provides the normal order-intent API. UI code reads immutable
+order snapshots and sends user actions back to the runtime by passing the
+visible `&Order`:
+
+OrdersProto packet structs are not trading API. Do not import similarly named
+types from the diagnostic-only `moonproto::commands` module; retired packet
+commands are removed when the wire protocol changes while these typed handles
+remain the application boundary.
+
+```rust
+use moonproto::{StopSettings, VStopParams};
+
+let Some(snapshot) = client.snapshot() else { return; };
+let Some(order) = snapshot.orders().get(ui_state.selected_order_uid()) else { return; };
+let Some(market) = snapshot.markets().find("BTC") else { return; };
+let stops = StopSettings::disabled()
+    .with_stop_loss_percent(2.5, 0.1)
+    .with_take_profit_price(50_500.0);
+
+client.orders().move_order(order, new_price)?;
+client.orders().cancel(order)?;
+client.orders().update_stops(order, stops)?;
+client.orders().update_vstop(
+    order,
+    VStopParams::percent(50_000.0, 12.0),
+)?;
+client.orders().set_immune_for_orders([order], true)?;
+client.orders().turn_panic_sell(order, true)?;
+client.orders().request_status(order)?;
+client.orders().switch_panic_sell_for_market(&market, true)?;
+```
+
+The runtime owner applies the intent to the live `Orders` state first, then
+queues the protocol command only when the current order state allows it. This is
+the Active Lib order model: the application does not mutate a snapshot and does
+not pass `&mut Orders` around.
+
+## UI Pattern
+
+```rust
+if let Some(snapshot) = client.snapshot() {
+    if let Some(order) = snapshot.orders().get(ui_state.selected_order_uid()) {
+        println!(
+            "buy_actual={} buy_qty={} sell_actual={} sell_qty={}",
+            order.buy_order.actual_price,
+            order.buy_order.quantity,
+            order.sell_order.actual_price,
+            order.sell_order.quantity
+        );
+        client.orders().move_order(order, new_price)?;
+    }
+}
+```
+
+Snapshots are display/read models. They are safe to keep in UI state, but they
+are not the live order-worker state. The live state remains inside the runtime,
+where replace-in-flight, pending cancel, previous Stops/VStop, panic, and immune
+flags are checked exactly once before sending.
+
+`move_order` is safe to call again while an earlier move is still in flight.
+The runtime keeps the newest UI target, and the protocol send queue coalesces an
+older move that has not yet been copied by the writer.
+
+## Market Trade Intents
+
+New orders and market-level actions use `client.trade()`. User code supplies a
+retained market handle (or a market name in scripts); canonical v4 commands
+serialize that market name directly:
+
+```rust
+use moonproto::{
+    ClosePositionParams, NewOrderParams, OrderSide, PendingOrderParams, SplitOrderParams,
+};
+
+let Some(snapshot) = client.snapshot() else { return; };
+let Some(market) = snapshot.markets().find("BTC") else { return; };
+
+let _ticket = client.trade().new_order(
+    NewOrderParams::for_market(&market, OrderSide::Long, 50_000.0, 250.0)
+        .with_strategy_id(strategy_id),
+)?;
+
+let _pending_ticket = client.trade().new_pending_order(
+    PendingOrderParams::for_market(&market, OrderSide::Long, 49_000.0, 250.0)
+        .with_strategy_id(strategy_id),
+)?;
+
+client.trade().join_orders_for_market(&market, OrderSide::Long)?;
+if let Some(order) = snapshot.orders().iter().find(|order| {
+    order.market_name == market.name()
+}) {
+    client.trade().split_order(SplitOrderParams::new(order, 3))?;
+}
+client.trade().close_position(ClosePositionParams::for_market(&market))?;
+client.trade().close_position(ClosePositionParams::market_order_for_market(&market))?;
+client.trade().limit_close_position_for_market(&market, OrderSide::Long)?;
+client.trade().penalty_for_market(&market)?;
+```
+
+Position and bulk actions have explicit meanings:
+
+| Action | API |
+|---|---|
+| Split the current position with limit-order semantics | `split_position_for_market(&market, side)` |
+| Split the current position with market-order semantics | `market_split_position_for_market(&market, side)` |
+| Place the normal closing limit flow | `close_position(ClosePositionParams::for_market(&market))` |
+| Force a market close | `close_position(ClosePositionParams::market_order_for_market(&market))` |
+| Move all matching buys or sells | `move_all_buys_for_market(...)` / `move_all_sells_for_market(...)` |
+| Trigger the one-shot global panic-sell action | `panic_sell_all()` |
+
+Bulk buy/sell moves use named constructors for the trader-visible mode. The
+runtime still serializes the matching core packet internally:
+
+```rust
+use moonproto::{BulkMoveKind, MoveAllBuysParams, PositionFilter};
+
+client.trade().move_all_buys_for_market(
+    &market,
+    MoveAllBuysParams::replace_kind(BulkMoveKind::TopVolume, 50_100.0, PositionFilter::Long),
+)?;
+```
+
+The legacy `penalty` command is the sole public trade helper that still needs
+the BaseCheck currency/exchange route. It returns
+`MoonClientError::TradeContext` when those fields are unavailable. Canonical v4
+order actions do not depend on those route bytes.
+
+Manual strategy mode is an application decision, matching MoonBot UI behavior.
+When settings say `use_manual_strategy` and the trader selected
+`manual_strategy_id`, pass that id with `NewOrderParams::with_strategy_id`.
+Leaving the strategy id empty sends zero and delegates to the core: when its
+manual-strategy mode is enabled, the core can attach the configured Manual
+strategy. Pass an explicit id when the terminal needs deterministic strategy
+ownership.
+If the manual strategy sell-percent control changes, send the retained strategy
+update through `client.strategies().sell_price_update(...)`.
+
+`new_pending_order` creates a pending inside the core. Its
+`trigger_price` is the watched condition, not the final exchange-order price;
+the core applies its configured pending spread when the trigger fires. The
+`size` uses the core account's balance currency (normally USD/USDT for a
+USD/USDT core), just like `new_order`.
+
+Without `with_strategy_id`, this command creates a bare pending and does not
+inherit the core's configured Manual strategy. With an explicit strategy id,
+the core retains that strategy as a candidate while the pending waits and
+attaches it only when the trigger fires. Consequently, the waiting order can
+still expose `strat_id = 0` in the order snapshot; the attached strategy becomes
+visible after the order enters its normal buy phase. `with_market_stop` affects
+only compatible candidates: Manual strategies use their own retained setting,
+UDP strategies use the command flag, and bare pending orders ignore it.
+
+The pending is published immediately with normal order state, so the terminal
+reads it from `snapshot().orders()`, then uses
+`client.orders().move_order(...)` or `cancel(...)` exactly as it does for any
+other retained order. A long trigger above the current price is a breakout
+pending; below the current price it is a pullback pending. Short triggers are
+mirrored.
+
+`new_order` returns a client-side ticket with an outbound/local
+`client_order_id`. The typed order stream does not echo this value, so it is not
+a reliable click-to-order UID mapping. Normal order tables should treat the
+order snapshot as the source of truth, key real orders by server `uid`, and
+redraw from `snapshot().orders()`.
+
+Order intent handles also accept a raw UID for CLI tools and scripts that only
+have an identifier. Desktop UI should prefer the visible `&Order` it already
+draws; the runtime still resolves that selector against the live order state
+before sending.
+
+Market-level helpers have the same split: terminal UI should keep the selected
+`MarketHandle` and call `*_for_market` methods or `...Params::for_market`.
+String-keyed methods remain for scripts and one-shot tools.
+
+`SplitOrderParams::new(order, parts)` means the normal equal-parts split of one
+selected retained order. The small strategy-piece buttons use
+`strategy_piece(order, parts)` or `strategy_piece_and_sell(order, parts)`, so
+application code does not pass raw split-mode booleans.
+
+`ClosePositionParams::for_market` means the normal default: place closing limit
+orders for the current position. Use `market_order_for_market` only for the
+explicit force-market-close button.
+
+## Init Gate
+
+`MoonClient::connect` starts the runtime immediately, while the one-time
+connect/init sequence finishes in that runtime thread. UI code may enqueue order
+intents during startup; the runtime handles them only after the retained state is
+ready. If the live order no longer exists or its current state does not allow the
+requested action, the action becomes a no-op. Normal UI code keeps rendering the
+retained order snapshot; low-level rejected-action telemetry is available only
+in `test`/`diagnostics` builds.
+
+After Init, actions are non-blocking: the runtime owns packet construction,
+send/retry state, and reconnect handling. An intent may still become a no-op if
+the referenced live order disappears or changes to an incompatible phase before
+the runtime applies it.
+
+## Command Semantics
+
+- `move_order` derives the active leg, current status, target size, and dedup key
+  from live `Orders`; the wire action addresses the order by server `uid`.
+- `cancel` derives the current status from live `Orders`: an active buy/sell leg
+  gets the matching cancel command, while a still-pending order gets the
+  addressed pending-cancel command and keeps a local `pending_cancel` mark until
+  the server confirms the phase change.
+- `update_stops` and `update_vstop` compare against previous local values and
+  send only when something changed.
+- `set_immune_for_orders` updates only found active local orders and sends
+  nothing if no target order exists.
+- panic-sell methods update live local panic flags before sending. Turning off
+  an auto-activated market panic also disables local stop-loss, trailing-stop,
+  and VStop toggles while preserving their numeric settings.
+- `client.trade().new_order`, `new_pending_order`, join/split/close/sell and MoveAll commands encode
+  canonical market-name payloads. Only the legacy `penalty` command derives a
+  `TradeCtx` from the session route.
+- `move_all_sells` and `move_all_buys` read the live order state and send only
+  when the active-client pre-send gates find a candidate order. The
+  replace-kind and price-zone variants skip click-immune orders; the percent
+  variant intentionally includes them, matching the core.
+
+Protocol action IDs and current order status are intentionally not
+caller-supplied in the normal API. Active Lib owns action-ID generation and
+resolves status from the live retained order.
+
+## Retry Counts
+
+Most trade/order actions use the MoonBot retry policy for the matching command.
+Position-changing commands that must not be duplicated by retries use the lower
+retry count from the core command profile. The high-level API selects this
+automatically; applications should not choose retry counts for normal trading
+actions.

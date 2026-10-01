@@ -1,0 +1,2108 @@
+//! Runtime-owner loop and command handlers for `MoonClient`.
+//!
+//! The loop driver lives here; its two halves are split out:
+//!   - `handlers` — draining the command channel and dispatching each
+//!     [`RuntimeCommand`], plus scheduling the async Engine API requests.
+//!   - `pending`  — the in-flight request state and the per-tick `poll_*`
+//!     helpers that drain it.
+
+use super::commands::{
+    RuntimeCommand, RuntimeCommandKind, RuntimeTradeCommandKind, StratRuntimeCommand,
+    UiRuntimeCommand,
+};
+use super::*;
+use crate::client::init::{RuntimeInitMachine, RuntimeInitPoll, RuntimeInitStatus};
+use parking_lot::RwLock;
+use std::collections::VecDeque;
+
+mod handlers;
+mod pending;
+
+use handlers::*;
+use pending::*;
+
+pub(super) fn runtime_loop(
+    mut client: Client,
+    mut dispatcher: crate::events::EventDispatcher,
+    rx: &mpsc::Receiver<RuntimeCommand>,
+    event_sink: MoonEventSink,
+    snapshot: Arc<RwLock<Option<MoonClientSnapshot>>>,
+    startup_status: Arc<RwLock<StartupStatus>>,
+    connect: ConnectConfig,
+    ready_tx: Option<mpsc::Sender<Result<(), ConnectError>>>,
+    deferred_commands: &mut VecDeque<RuntimeCommand>,
+) {
+    let api_pending = Arc::clone(&client.pending_api.api_pending);
+    let mut pending = RuntimePending::default();
+    let mut startup = Some(RuntimeInitMachine::new(connect, &mut dispatcher));
+    let startup_started_at = Instant::now();
+    let mut dispatch_buffers = InlineDispatchBuffers::default();
+    let mut shared_config_refresh = SharedConfigRefresh::default();
+    let mut startup_publisher = StartupStatusPublisher::new(startup_status);
+    startup_publisher.publish(
+        &client,
+        startup.as_ref().map(RuntimeInitMachine::startup_status),
+        true,
+    );
+    loop {
+        #[cfg(any(test, feature = "diagnostics"))]
+        let command_drain_start = Instant::now();
+        let (stop, changed) = if startup.is_some() {
+            drain_commands_during_startup(rx, deferred_commands)
+        } else {
+            drain_deferred_and_live_commands(
+                &mut client,
+                &mut dispatcher,
+                rx,
+                &mut pending,
+                deferred_commands,
+            )
+        };
+        #[cfg(any(test, feature = "diagnostics"))]
+        client
+            .metrics
+            .protocol_metrics
+            .record_profile_phase_labeled(
+                ProfilePhase::RuntimeCommandDrain,
+                command_drain_start.elapsed(),
+                u8::MAX,
+                u8::MAX,
+                0,
+            );
+        if changed {
+            publish_snapshot_profiled(&client, &dispatcher, &snapshot);
+        }
+        if stop {
+            break;
+        }
+
+        if !run_protocol_step(&mut client, &mut dispatcher, &mut dispatch_buffers) {
+            break;
+        }
+
+        let state_changed = if let Some(startup_machine) = startup.as_mut() {
+            #[cfg(any(test, feature = "diagnostics"))]
+            let init_poll_start = Instant::now();
+            #[cfg(any(test, feature = "diagnostics"))]
+            let (init_cmd, init_api_method) = startup_machine.profile_source();
+            let init_poll = startup_machine.poll(&mut client, &mut dispatcher);
+            #[cfg(any(test, feature = "diagnostics"))]
+            client
+                .metrics
+                .protocol_metrics
+                .record_profile_phase_labeled(
+                    ProfilePhase::InitStep,
+                    init_poll_start.elapsed(),
+                    init_cmd,
+                    init_api_method,
+                    0,
+                );
+            match init_poll {
+                RuntimeInitPoll::Pending { changed } => changed,
+                RuntimeInitPoll::Ready(_result) => {
+                    // History sizing depends on the connected exchange, so
+                    // publish session identity before creating the auto worker.
+                    dispatcher.set_session_identity(
+                        client.server_info().clone(),
+                        client.auth_info().cloned(),
+                    );
+                    if client.trade_storage_intent().is_some() {
+                        sync_runtime_trade_storage_scope(&client, &mut dispatcher);
+                        schedule_auto_candles_snapshot(&mut client, &mut pending);
+                    }
+                    publish_snapshot_profiled(&client, &dispatcher, &snapshot);
+                    client.fire_lifecycle(LifecycleEvent::InitStepCompleted {
+                        step: "StartupSnapshot",
+                        elapsed_ms: startup_started_at.elapsed().as_millis() as u64,
+                    });
+                    publish_queued_events(&mut dispatcher, &event_sink);
+                    client.fire_lifecycle(LifecycleEvent::InitStepCompleted {
+                        step: "StartupEvents",
+                        elapsed_ms: startup_started_at.elapsed().as_millis() as u64,
+                    });
+                    startup_publisher.mark_ready(&client, startup_machine.startup_status());
+                    client.fire_lifecycle(LifecycleEvent::Ready);
+                    if let Some(tx) = ready_tx.as_ref() {
+                        let _ = tx.send(Ok(()));
+                    }
+                    startup = None;
+                    true
+                }
+                RuntimeInitPoll::Failed(err) => {
+                    startup_publisher.mark_failed(&client, startup_machine.startup_status());
+                    client.fire_lifecycle(LifecycleEvent::ConnectFailed { error: err.clone() });
+                    if let Some(tx) = ready_tx.as_ref() {
+                        let _ = tx.send(Err(err));
+                    }
+                    break;
+                }
+            }
+        } else {
+            #[cfg(any(test, feature = "diagnostics"))]
+            let pending_start = Instant::now();
+            #[cfg(any(test, feature = "diagnostics"))]
+            let auto_candles_start = Instant::now();
+            let candles_changed = poll_auto_candles(&mut client, &mut pending, &mut dispatcher);
+            #[cfg(any(test, feature = "diagnostics"))]
+            client
+                .metrics
+                .protocol_metrics
+                .record_profile_phase_labeled(
+                    ProfilePhase::PendingAutoCandles,
+                    auto_candles_start.elapsed(),
+                    u8::MAX,
+                    u8::MAX,
+                    pending.auto_candles.len() + pending.auto_candles_apply.len(),
+                );
+            if !pending.auto_candles_requested && client.trade_storage_intent().is_some() {
+                schedule_auto_candles_snapshot(&mut client, &mut pending);
+            }
+            let market_history_changed =
+                poll_market_history(&mut client, &mut pending, &mut dispatcher);
+            #[cfg(any(test, feature = "diagnostics"))]
+            let coin_card_start = Instant::now();
+            let coin_card_changed = poll_coin_card_candles(
+                &mut pending.coin_card_candles,
+                &mut dispatcher,
+                &api_pending,
+            );
+            #[cfg(any(test, feature = "diagnostics"))]
+            client
+                .metrics
+                .protocol_metrics
+                .record_profile_phase_labeled(
+                    ProfilePhase::PendingCoinCard,
+                    coin_card_start.elapsed(),
+                    u8::MAX,
+                    u8::MAX,
+                    pending.coin_card_candles.len(),
+                );
+            #[cfg(any(test, feature = "diagnostics"))]
+            let transfer_assets_start = Instant::now();
+            let transfer_assets_changed =
+                poll_transfer_assets(&mut pending, &mut dispatcher, &api_pending);
+            #[cfg(any(test, feature = "diagnostics"))]
+            client
+                .metrics
+                .protocol_metrics
+                .record_profile_phase_labeled(
+                    ProfilePhase::PendingTransferAssets,
+                    transfer_assets_start.elapsed(),
+                    u8::MAX,
+                    u8::MAX,
+                    pending.transfer_assets.len() + pending.transfer_assets_batches.len(),
+                );
+            #[cfg(any(test, feature = "diagnostics"))]
+            let account_start = Instant::now();
+            let account_changed = poll_account_refreshes(
+                &mut pending.account_refreshes,
+                &mut dispatcher,
+                &api_pending,
+            );
+            #[cfg(any(test, feature = "diagnostics"))]
+            client
+                .metrics
+                .protocol_metrics
+                .record_profile_phase_labeled(
+                    ProfilePhase::PendingAccount,
+                    account_start.elapsed(),
+                    u8::MAX,
+                    u8::MAX,
+                    pending.account_refreshes.len(),
+                );
+            #[cfg(any(test, feature = "diagnostics"))]
+            let engine_actions_start = Instant::now();
+            poll_engine_actions(&mut pending.engine_actions, &mut dispatcher, &api_pending);
+            #[cfg(any(test, feature = "diagnostics"))]
+            client
+                .metrics
+                .protocol_metrics
+                .record_profile_phase_labeled(
+                    ProfilePhase::PendingEngineActions,
+                    engine_actions_start.elapsed(),
+                    u8::MAX,
+                    u8::MAX,
+                    pending.engine_actions.len(),
+                );
+            #[cfg(any(test, feature = "diagnostics"))]
+            client
+                .metrics
+                .protocol_metrics
+                .record_profile_phase_labeled(
+                    ProfilePhase::RuntimePending,
+                    pending_start.elapsed(),
+                    u8::MAX,
+                    u8::MAX,
+                    pending.auto_candles.len()
+                        + pending.auto_candles_apply.len()
+                        + pending.market_history.len()
+                        + pending.market_history_apply.len()
+                        + pending.coin_card_candles.len()
+                        + pending.account_refreshes.len()
+                        + pending.transfer_assets.len()
+                        + pending.engine_actions.len(),
+                );
+            let strategy_edits_changed = dispatcher.tick_strategy_edit_timeouts(Instant::now());
+            candles_changed
+                || market_history_changed
+                || coin_card_changed
+                || transfer_assets_changed
+                || account_changed
+                || strategy_edits_changed
+        };
+        startup_publisher.publish(
+            &client,
+            startup.as_ref().map(RuntimeInitMachine::startup_status),
+            false,
+        );
+        if startup.is_none() {
+            shared_config_refresh.poll(&client, &dispatcher);
+        }
+        if state_changed && startup.is_none() {
+            publish_snapshot_profiled(&client, &dispatcher, &snapshot);
+        }
+
+        if startup.is_none() {
+            let events =
+                take_queued_events_and_publish_snapshot(&client, &mut dispatcher, &snapshot);
+            // Snapshot was published before events were emitted, while the
+            // runtime still held the state that produced those events. Event
+            // delivery itself runs after state apply and snapshot publish, not
+            // inline inside user callbacks.
+            emit_domain_events(events, &event_sink);
+        }
+
+        #[cfg(any(test, feature = "diagnostics"))]
+        let command_drain_start = Instant::now();
+        let (stop, changed) = if startup.is_some() {
+            drain_commands_during_startup(rx, deferred_commands)
+        } else {
+            drain_deferred_and_live_commands(
+                &mut client,
+                &mut dispatcher,
+                rx,
+                &mut pending,
+                deferred_commands,
+            )
+        };
+        #[cfg(any(test, feature = "diagnostics"))]
+        client
+            .metrics
+            .protocol_metrics
+            .record_profile_phase_labeled(
+                ProfilePhase::RuntimeCommandDrain,
+                command_drain_start.elapsed(),
+                u8::MAX,
+                u8::MAX,
+                0,
+            );
+        if changed {
+            publish_snapshot_profiled(&client, &dispatcher, &snapshot);
+        }
+        if stop {
+            break;
+        }
+    }
+    if client.shutdown_requested() {
+        startup_publisher.mark_disconnected();
+    }
+}
+
+const STARTUP_STATUS_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
+const STARTUP_RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+
+struct StartupStatusPublisher {
+    shared: Arc<RwLock<StartupStatus>>,
+    cached: StartupStatus,
+    elapsed_offset_ms: u64,
+    started_at: Instant,
+    bytes_offset: u64,
+    blocks_offset: u64,
+    duplicates_offset: u64,
+    last_publish_at: Instant,
+    last_rate_sample_at: Instant,
+    last_rate_bytes: u64,
+    last_authorized: bool,
+    ever_authorized: bool,
+    startup_finished: bool,
+}
+
+impl StartupStatusPublisher {
+    fn new(shared: Arc<RwLock<StartupStatus>>) -> Self {
+        let cached = *shared.read();
+        let now = Instant::now();
+        Self {
+            shared,
+            cached,
+            elapsed_offset_ms: cached.elapsed_ms,
+            started_at: now,
+            bytes_offset: cached.received_sliced_bytes,
+            blocks_offset: cached.received_sliced_blocks,
+            duplicates_offset: cached.duplicate_sliced_blocks,
+            last_publish_at: now
+                .checked_sub(STARTUP_STATUS_PUBLISH_INTERVAL)
+                .unwrap_or(now),
+            last_rate_sample_at: now,
+            last_rate_bytes: cached.received_sliced_bytes,
+            last_authorized: false,
+            ever_authorized: matches!(
+                cached.state,
+                StartupState::Initializing | StartupState::Ready | StartupState::Reconnecting
+            ),
+            startup_finished: cached.state == StartupState::Ready,
+        }
+    }
+
+    fn publish(&mut self, client: &Client, init: Option<RuntimeInitStatus>, force: bool) {
+        let authorized = client.is_authorized();
+        if self.last_authorized && !authorized {
+            self.cached.reconnect_count = self.cached.reconnect_count.saturating_add(1);
+        }
+        self.last_authorized = authorized;
+        self.ever_authorized |= authorized;
+
+        let state = if self.startup_finished {
+            if authorized {
+                StartupState::Ready
+            } else {
+                StartupState::Reconnecting
+            }
+        } else if authorized {
+            StartupState::Initializing
+        } else if self.ever_authorized || self.cached.reconnect_count > 0 {
+            StartupState::Reconnecting
+        } else {
+            StartupState::Connecting
+        };
+
+        let now = Instant::now();
+        let init_changed = init.is_some_and(|value| {
+            self.cached.current_step != value.current_step
+                || self.cached.completed_steps != value.completed_steps
+                || self.cached.current_step_retries != value.current_step_retries
+                || self.cached.total_init_retries != value.total_retries
+        });
+        let state_changed = self.cached.state != state;
+        if !force
+            && !init_changed
+            && !state_changed
+            && now.duration_since(self.last_publish_at) < STARTUP_STATUS_PUBLISH_INTERVAL
+        {
+            return;
+        }
+
+        self.cached.state = state;
+        self.cached.current_local_udp_port = client.transport.current_local_port;
+        self.cached.current_port_sent_packets = client.transport.current_sent_packets;
+        self.cached.current_port_received_packets = client.transport.current_received_packets;
+        self.cached.previous_local_udp_port = client.transport.previous_local_port;
+        self.cached.sent_packets_before_last_port_change = client.transport.previous_sent_packets;
+        self.cached.received_packets_before_last_port_change =
+            client.transport.previous_received_packets;
+        self.cached.local_port_change_count = client.transport.rebind_count;
+        if self.startup_finished {
+            self.store(now);
+            return;
+        }
+
+        if let Some(init) = init {
+            self.cached.current_step = init.current_step;
+            self.cached.completed_steps = init.completed_steps;
+            self.cached.current_step_retries = init.current_step_retries;
+            self.cached.total_init_retries = init.total_retries;
+        }
+
+        let progress = client.transport.recv_slicer.progress_snapshot();
+        self.cached.elapsed_ms = self
+            .elapsed_offset_ms
+            .saturating_add(self.started_at.elapsed().as_millis() as u64);
+        self.cached.received_sliced_bytes = self
+            .bytes_offset
+            .saturating_add(progress.unique_payload_bytes);
+        self.cached.received_sliced_blocks =
+            self.blocks_offset.saturating_add(progress.unique_blocks);
+        self.cached.duplicate_sliced_blocks = self
+            .duplicates_offset
+            .saturating_add(progress.duplicate_blocks);
+        self.cached.active_sliced_transfers =
+            u16::try_from(progress.active_transfers).unwrap_or(u16::MAX);
+        self.cached.active_received_blocks =
+            u32::try_from(progress.active_received_blocks).unwrap_or(u32::MAX);
+        self.cached.active_expected_blocks =
+            u32::try_from(progress.active_expected_blocks).unwrap_or(u32::MAX);
+        self.cached.idle_for_ms = progress.last_progress_ms.map(|last| {
+            u64::try_from(client.now_ms().saturating_sub(last).max(0)).unwrap_or(u64::MAX)
+        });
+
+        let rate_interval = now.duration_since(self.last_rate_sample_at);
+        if rate_interval >= STARTUP_RATE_SAMPLE_INTERVAL {
+            let bytes = self.cached.received_sliced_bytes;
+            let elapsed_ms = rate_interval.as_millis().max(1) as u64;
+            self.cached.receive_rate_bytes_per_sec = bytes
+                .saturating_sub(self.last_rate_bytes)
+                .saturating_mul(1000)
+                / elapsed_ms;
+            self.last_rate_bytes = bytes;
+            self.last_rate_sample_at = now;
+        }
+
+        if client.ping_count > 0 {
+            self.cached.round_trip_ms = u32::try_from(client.round_trip_delay)
+                .ok()
+                .filter(|value| *value > 0);
+            self.cached.path_mtu_bytes = Some(client.actual_pmtu);
+            self.cached.downlink_delivery_percent =
+                Some((client.rs * 100.0).round().clamp(0.0, 100.0) as u8);
+        }
+        self.store(now);
+    }
+
+    fn mark_ready(&mut self, client: &Client, init: RuntimeInitStatus) {
+        self.publish(client, Some(init), true);
+        self.cached
+            .completed_steps
+            .insert(InitStep::StartupSnapshot);
+        self.cached.completed_steps.insert(InitStep::StartupEvents);
+        self.cached.current_step = None;
+        self.cached.current_step_retries = 0;
+        self.cached.state = StartupState::Ready;
+        self.startup_finished = true;
+        self.store(Instant::now());
+    }
+
+    fn mark_failed(&mut self, client: &Client, init: RuntimeInitStatus) {
+        self.publish(client, Some(init), true);
+        self.cached.state = StartupState::Failed;
+        self.store(Instant::now());
+    }
+
+    fn mark_disconnected(&mut self) {
+        self.cached.state = StartupState::Disconnected;
+        self.store(Instant::now());
+    }
+
+    fn store(&mut self, now: Instant) {
+        *self.shared.write() = self.cached;
+        self.last_publish_at = now;
+    }
+}
+
+#[cfg(test)]
+mod startup_status_tests {
+    use super::*;
+    use crate::protocol::slicing::SliceHeader;
+
+    fn test_client() -> Client {
+        Client::new(ClientConfig::new("127.0.0.1", 3000, [0; 16], [0; 16]))
+    }
+
+    fn receive_partial_sliced(client: &mut Client, datagram_num: u16) {
+        let mut payload = Vec::new();
+        SliceHeader {
+            datagram_num,
+            block_num: 0,
+            max_block_num: 1,
+        }
+        .write_to(&mut payload);
+        payload.extend_from_slice(&[Command::API.to_byte(), 0xAA]);
+        client
+            .transport
+            .recv_slicer
+            .set_last_online(client.now_ms());
+        let _ = client.transport.recv_slicer.on_new_sliced(&payload);
+    }
+
+    #[test]
+    fn publisher_reports_live_transfer_and_channel_state() {
+        let shared = Arc::new(RwLock::new(StartupStatus::default()));
+        let mut publisher = StartupStatusPublisher::new(Arc::clone(&shared));
+        let mut client = test_client();
+        client.authorized = true;
+        client.ping_count = 1;
+        client.round_trip_delay = 321;
+        client.actual_pmtu = 1200;
+        client.rs = 0.91;
+        client.transport.current_local_port = Some(31000);
+        client.transport.current_sent_packets = 17;
+        client.transport.current_received_packets = 23;
+        client.transport.previous_local_port = Some(30999);
+        client.transport.previous_sent_packets = 11;
+        client.transport.previous_received_packets = 13;
+        client.transport.rebind_count = 1;
+        receive_partial_sliced(&mut client, 7);
+        publisher.last_rate_sample_at = Instant::now() - Duration::from_secs(1);
+
+        publisher.publish(
+            &client,
+            Some(RuntimeInitStatus {
+                current_step: Some(InitStep::GetMarketsList),
+                ..RuntimeInitStatus::default()
+            }),
+            true,
+        );
+
+        let status = *shared.read();
+        assert_eq!(status.state, StartupState::Initializing);
+        assert_eq!(status.current_step, Some(InitStep::GetMarketsList));
+        assert_eq!(status.received_sliced_bytes, 2);
+        assert_eq!(status.received_sliced_blocks, 1);
+        assert_eq!(status.active_sliced_transfers, 1);
+        assert_eq!(status.active_received_blocks, 1);
+        assert_eq!(status.active_expected_blocks, 2);
+        assert!(status.receive_rate_bytes_per_sec > 0);
+        assert_eq!(status.round_trip_ms, Some(321));
+        assert_eq!(status.path_mtu_bytes, Some(1200));
+        assert_eq!(status.downlink_delivery_percent, Some(91));
+        assert_eq!(status.current_local_udp_port, Some(31000));
+        assert_eq!(status.current_port_sent_packets, 17);
+        assert_eq!(status.current_port_received_packets, 23);
+        assert_eq!(status.previous_local_udp_port, Some(30999));
+        assert_eq!(status.sent_packets_before_last_port_change, 11);
+        assert_eq!(status.received_packets_before_last_port_change, 13);
+        assert_eq!(status.local_port_change_count, 1);
+    }
+
+    #[test]
+    fn reconnect_is_counted_once_and_ready_freezes_startup_transfer_totals() {
+        let shared = Arc::new(RwLock::new(StartupStatus::default()));
+        let mut publisher = StartupStatusPublisher::new(Arc::clone(&shared));
+        let mut client = test_client();
+        client.authorized = true;
+        receive_partial_sliced(&mut client, 7);
+        let mut init = RuntimeInitStatus::default();
+        init.completed_steps.insert(InitStep::PostInitFlush);
+        publisher.mark_ready(&client, init);
+        let bytes_at_ready = shared.read().received_sliced_bytes;
+
+        client.authorized = false;
+        publisher.publish(&client, None, true);
+        publisher.publish(&client, None, true);
+        assert_eq!(shared.read().state, StartupState::Reconnecting);
+        assert_eq!(shared.read().reconnect_count, 1);
+
+        receive_partial_sliced(&mut client, 8);
+        client.authorized = true;
+        publisher.publish(&client, None, true);
+        let status = *shared.read();
+        assert_eq!(status.state, StartupState::Ready);
+        assert_eq!(status.reconnect_count, 1);
+        assert_eq!(status.received_sliced_bytes, bytes_at_ready);
+        assert!(status.completed_steps.contains(InitStep::StartupSnapshot));
+        assert!(status.completed_steps.contains(InitStep::StartupEvents));
+    }
+}
+
+const SHARED_CONFIG_RETRY_MS: i64 = 5_000;
+
+#[derive(Default)]
+struct SharedConfigRefresh {
+    observed_revision: u64,
+    received_server_token: u64,
+    requested_server_token: u64,
+    last_request_ms: i64,
+}
+
+impl SharedConfigRefresh {
+    fn observe(&mut self, revision: u64, server_token: u64) {
+        if revision != 0 && revision != self.observed_revision {
+            self.observed_revision = revision;
+            self.received_server_token = server_token;
+        }
+    }
+
+    fn request_due(&self, server_token: u64, now_ms: i64) -> bool {
+        server_token != 0
+            && self.received_server_token != server_token
+            && (self.requested_server_token != server_token
+                || (now_ms - self.last_request_ms).abs() >= SHARED_CONFIG_RETRY_MS)
+    }
+
+    fn mark_requested(&mut self, server_token: u64, now_ms: i64) {
+        self.requested_server_token = server_token;
+        self.last_request_ms = now_ms;
+    }
+
+    fn poll(&mut self, client: &Client, dispatcher: &crate::events::EventDispatcher) {
+        self.observe(
+            dispatcher.settings.shared_config_revision(),
+            client.server_token,
+        );
+        let now_ms = client.now_ms();
+        if self.request_due(client.server_token, now_ms) {
+            client.ui_shared_config_request();
+            self.mark_requested(client.server_token, now_ms);
+        }
+    }
+}
+
+#[derive(Default)]
+struct InlineDispatchBuffers {
+    event_buf: Vec<crate::events::Event>,
+    payload_buf: Vec<(Command, Vec<u8>)>,
+    active_actions_buf: Vec<crate::events::ActiveAction>,
+}
+
+fn run_protocol_step(
+    client: &mut Client,
+    dispatcher: &mut crate::events::EventDispatcher,
+    buffers: &mut InlineDispatchBuffers,
+) -> bool {
+    let mut mode = RunMode::with_buffers(
+        dispatcher,
+        std::mem::take(&mut buffers.event_buf),
+        std::mem::take(&mut buffers.payload_buf),
+        std::mem::take(&mut buffers.active_actions_buf),
+    );
+    let keep_running = (ProtocolCore { client }).run_step(&mut mode);
+    let (event_buf, payload_buf, active_actions_buf) = mode.into_buffers();
+    buffers.event_buf = event_buf;
+    buffers.payload_buf = payload_buf;
+    buffers.active_actions_buf = active_actions_buf;
+    keep_running
+}
+
+pub(super) fn publish_queued_events(
+    dispatcher: &mut crate::events::EventDispatcher,
+    event_sink: &MoonEventSink,
+) -> bool {
+    let events = dispatcher.take_queued_events();
+    let changed = !events.is_empty();
+    emit_domain_events(events, event_sink);
+    changed
+}
+
+pub(super) fn take_queued_events_and_publish_snapshot(
+    client: &Client,
+    dispatcher: &mut crate::events::EventDispatcher,
+    snapshot: &RwLock<Option<MoonClientSnapshot>>,
+) -> Vec<crate::events::Event> {
+    let events = dispatcher.take_queued_events();
+    if !events.is_empty() {
+        publish_snapshot_profiled(client, dispatcher, snapshot);
+    }
+    events
+}
+
+pub(super) fn emit_domain_events(events: Vec<crate::events::Event>, event_sink: &MoonEventSink) {
+    for event in events {
+        event_sink.emit_domain(event);
+    }
+}
+
+pub(super) fn publish_snapshot(
+    dispatcher: &crate::events::EventDispatcher,
+    snapshot: &RwLock<Option<MoonClientSnapshot>>,
+) {
+    let next = Arc::new(dispatcher.snapshot());
+    let mut guard = snapshot.write();
+    let revision = guard
+        .as_ref()
+        .map(|snapshot| snapshot.revision().saturating_add(1))
+        .unwrap_or(1);
+    *guard = Some(MoonClientSnapshot::new(revision, next));
+}
+
+fn publish_snapshot_profiled(
+    client: &Client,
+    dispatcher: &crate::events::EventDispatcher,
+    snapshot: &RwLock<Option<MoonClientSnapshot>>,
+) {
+    #[cfg(not(any(test, feature = "diagnostics")))]
+    let _ = client;
+    #[cfg(any(test, feature = "diagnostics"))]
+    let snapshot_start = Instant::now();
+    publish_snapshot(dispatcher, snapshot);
+    #[cfg(any(test, feature = "diagnostics"))]
+    client
+        .metrics
+        .protocol_metrics
+        .record_profile_phase_labeled(
+            ProfilePhase::SnapshotPublish,
+            snapshot_start.elapsed(),
+            u8::MAX,
+            u8::MAX,
+            0,
+        );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::engine_api::ServerInfo;
+    use crate::commands::market::{BaseCurrency, ExchangeCode};
+    use crate::commands::strategy_serializer::{FieldValue, StrategyFields, StrategySnapshot};
+    use crate::commands::trade::{
+        BaseCommandHeader, CanonicalOrderState, DelphiBool, OrderCommandPayload, OrderDescription,
+        OrderImage, OrderWorkerStatus, StopSettings, TradeCommand, ORDER_SECTION_ALL_MASK,
+    };
+    use crate::state::ExchangeKind;
+
+    #[test]
+    fn shared_config_refresh_is_immediate_then_retries_every_five_seconds() {
+        let mut refresh = SharedConfigRefresh::default();
+        let token = 0x1234;
+
+        assert!(refresh.request_due(token, 1_000));
+        refresh.mark_requested(token, 1_000);
+        assert!(!refresh.request_due(token, 5_999));
+        assert!(refresh.request_due(token, 6_000));
+    }
+
+    #[test]
+    fn shared_config_refresh_is_level_triggered_by_server_token() {
+        let mut refresh = SharedConfigRefresh::default();
+        refresh.observe(1, 0x1111);
+        assert!(!refresh.request_due(0x1111, 10_000));
+        assert!(refresh.request_due(0x2222, 10_000));
+
+        refresh.observe(2, 0x2222);
+        assert!(!refresh.request_due(0x2222, 10_000));
+    }
+
+    fn dummy_cfg() -> ClientConfig {
+        ClientConfig {
+            server_ip: "127.0.0.1".to_string(),
+            server_port: 3000,
+            master_key: [0; 16],
+            mac_key: [0; 16],
+            transport_mode: TransportMode::V0,
+            client_id: 0,
+            ntp_host: None,
+            refresh: RefreshConfig {
+                update_markets_every: None,
+                check_tags_every: None,
+            },
+            market_history: crate::state::MarketHistorySizing::default(),
+        }
+    }
+
+    fn ready_client() -> Client {
+        let mut client = Client::new(dummy_cfg());
+        client.testing_set_domain_ready(true);
+        client.set_server_info(ServerInfo {
+            exchange_code: Some(ExchangeCode::FGate),
+            base_currency_code: Some(BaseCurrency::IDR),
+            ..Default::default()
+        });
+        client
+    }
+
+    fn seed_runtime_order(
+        dispatcher: &mut crate::events::EventDispatcher,
+        uid: u64,
+        status: OrderWorkerStatus,
+        revision: u64,
+    ) {
+        let desc = OrderDescription::for_test("DOGEUSDT", false, false);
+        let mut state = CanonicalOrderState::default();
+        state.0[0] = status.to_byte();
+        let command = TradeCommand::OrderImage(OrderImage {
+            header: BaseCommandHeader {
+                cmd_id: 41,
+                ver: crate::commands::registry::CURRENT_PROTO_CMD_VER,
+                uid,
+            },
+            state_rev: revision,
+            desc: desc.clone(),
+            section_mask: ORDER_SECTION_ALL_MASK,
+            state: state.clone(),
+        });
+        let mut events = Vec::new();
+        let mut repairs = Vec::new();
+        dispatcher.orders_mut().apply_protocol(
+            command,
+            1_000,
+            1,
+            2,
+            0.0,
+            &|_| true,
+            &mut events,
+            &mut repairs,
+        );
+        assert!(repairs.is_empty());
+        assert!(dispatcher.orders().get(uid).is_some());
+    }
+
+    fn write_str8(out: &mut Vec<u8>, value: &str) {
+        out.push(value.len() as u8);
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn apply_comment_strategy_schema(dispatcher: &mut crate::events::EventDispatcher) {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut body = Vec::new();
+        body.push(crate::commands::strategy_schema::SCHEMA_FORMAT_VERSION);
+        body.push(1); // kind_count
+        body.push(1); // kind ordinal
+        write_str8(&mut body, "Kind1");
+        body.extend_from_slice(&1u16.to_le_bytes()); // field_count
+        write_str8(&mut body, "Comment");
+        body.push(crate::commands::strategy_serializer::TID_STRING);
+        body.push(0);
+        body.push(1); // visible for kind 1
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&body).unwrap();
+        let data = encoder.finish().unwrap();
+
+        let mut payload = Vec::new();
+        payload.push(8); // TStratSchema
+        payload.extend_from_slice(&crate::commands::registry::CURRENT_PROTO_CMD_VER.to_le_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&data);
+
+        let mut out = Vec::new();
+        dispatcher.dispatch_into(Command::Strat, &payload, 0, &mut out);
+        assert!(out.iter().any(|ev| {
+            matches!(
+                ev,
+                crate::events::Event::Strat(crate::state::StratEvent::SchemaApplied {
+                    kind_count: 1,
+                    field_count: 1,
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn moon_trade_new_order_builds_v4_start_command() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+
+        let changed = handle_trade_action(
+            &mut client,
+            &mut dispatcher,
+            RuntimeTradeCommandKind::NewOrder {
+                params: NewOrderParams::new("DOGEUSDT", OrderSide::Short, 12.5, 0.25)
+                    .with_strategy_id(42)
+                    .with_planned_sell_price(15.0)
+                    .with_market_stop(true),
+                request_uid: 0xCAFE_BABE,
+            },
+        )
+        .expect("v4 start command does not need legacy route bytes");
+
+        assert!(!changed);
+        let (_, high, _) = client.take_send_queues_for_test();
+        assert_eq!(high.len(), 1);
+        match TradeCommand::parse(&high[0].data).expect("valid new order") {
+            TradeCommand::OrderCommand(cmd) => match cmd.payload {
+                OrderCommandPayload::Start {
+                    market_name,
+                    is_short,
+                    use_market_stop,
+                    strategy_id,
+                    size,
+                    price,
+                    planned_sell_price,
+                } => {
+                    assert_eq!(cmd.header.uid, 0xCAFE_BABE);
+                    assert_eq!(market_name, "DOGEUSDT");
+                    assert!(is_short && use_market_stop);
+                    assert_eq!(strategy_id, 42);
+                    assert_eq!(size, 0.25);
+                    assert_eq!(price, 12.5);
+                    assert_eq!(planned_sell_price, 15.0);
+                }
+                other => panic!("unexpected order payload: {other:?}"),
+            },
+            other => panic!("unexpected trade command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn moon_trade_new_pending_order_builds_v4_start_pending_command() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+
+        let changed = handle_trade_action(
+            &mut client,
+            &mut dispatcher,
+            RuntimeTradeCommandKind::NewPendingOrder {
+                params: PendingOrderParams::new("ETHUSDT", OrderSide::Long, 2100.0, 250.0)
+                    .with_strategy_id(42)
+                    .with_planned_sell_price(2200.0)
+                    .with_market_stop(true),
+                request_uid: 0xCAFE_BABF,
+            },
+        )
+        .expect("v4 pending command does not need legacy route bytes");
+
+        assert!(!changed);
+        let (_, high, _) = client.take_send_queues_for_test();
+        assert_eq!(high.len(), 1);
+        match TradeCommand::parse(&high[0].data).expect("valid pending order") {
+            TradeCommand::OrderCommand(cmd) => match cmd.payload {
+                OrderCommandPayload::StartPending {
+                    market_name,
+                    is_short,
+                    use_market_stop,
+                    strategy_id,
+                    size,
+                    trigger_price,
+                    planned_sell_price,
+                } => {
+                    assert_eq!(cmd.header.uid, 0xCAFE_BABF);
+                    assert_eq!(market_name, "ETHUSDT");
+                    assert!(!is_short && use_market_stop);
+                    assert_eq!(strategy_id, 42);
+                    assert_eq!(size, 250.0);
+                    assert_eq!(trigger_price, 2100.0);
+                    assert_eq!(planned_sell_price, 2200.0);
+                }
+                other => panic!("unexpected order payload: {other:?}"),
+            },
+            other => panic!("unexpected trade command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn moon_trade_bare_pending_sends_zero_strategy_id() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+
+        handle_trade_action(
+            &mut client,
+            &mut dispatcher,
+            RuntimeTradeCommandKind::NewPendingOrder {
+                params: PendingOrderParams::new("ETHUSDT", OrderSide::Long, 2100.0, 250.0),
+                request_uid: 0xCAFE_BAC0,
+            },
+        )
+        .expect("v4 bare pending command does not need legacy route bytes");
+
+        let (_, high, _) = client.take_send_queues_for_test();
+        assert_eq!(high.len(), 1);
+        match TradeCommand::parse(&high[0].data).expect("valid bare pending order") {
+            TradeCommand::OrderCommand(cmd) => match cmd.payload {
+                OrderCommandPayload::StartPending { strategy_id, .. } => {
+                    assert_eq!(strategy_id, 0);
+                }
+                other => panic!("unexpected order payload: {other:?}"),
+            },
+            other => panic!("unexpected trade command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_update_stops_sends_for_tracked_server_order() {
+        let uid = 0x5151;
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        seed_runtime_order(&mut dispatcher, uid, OrderWorkerStatus::BuySet, 1);
+
+        let stops = StopSettings {
+            stop_loss_on: DelphiBool::TRUE,
+            sl_level: 12.5,
+            use_take_profit: DelphiBool::TRUE,
+            take_profit: 15.0,
+            ..StopSettings::default()
+        };
+        let mut pending = RuntimePending::default();
+        assert!(handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::OrderAction(RuntimeCommandKind::UpdateStops { uid, stops }),
+            &mut pending
+        ));
+
+        let (_, high, _) = client.take_send_queues_for_test();
+        assert_eq!(high.len(), 1);
+        match TradeCommand::parse(&high[0].data).expect("valid stops update") {
+            TradeCommand::OrderCommand(cmd) => match cmd.payload {
+                OrderCommandPayload::Stops { order_id, stops } => {
+                    assert_eq!(order_id, uid);
+                    assert!(bool::from(stops.stop_loss_on));
+                    assert_eq!(stops.sl_level, 12.5);
+                    assert!(bool::from(stops.use_take_profit));
+                    assert_eq!(stops.take_profit, 15.0);
+                    assert!(
+                        bool::from(stops.take_profit_changed),
+                        "runtime derives the TP latch before sending"
+                    );
+                }
+                other => panic!("unexpected order payload: {other:?}"),
+            },
+            other => panic!("unexpected trade command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_update_vstop_sends_for_tracked_server_order() {
+        let uid = 0x5252;
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        seed_runtime_order(&mut dispatcher, uid, OrderWorkerStatus::SellSet, 1);
+
+        let mut pending = RuntimePending::default();
+        assert!(handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::OrderAction(RuntimeCommandKind::UpdateVStop {
+                uid,
+                params: VStopParams::percent(12.5, 100.0),
+            }),
+            &mut pending
+        ));
+
+        let (_, high, _) = client.take_send_queues_for_test();
+        assert_eq!(high.len(), 1);
+        match TradeCommand::parse(&high[0].data).expect("valid VStop update") {
+            TradeCommand::OrderCommand(cmd) => match cmd.payload {
+                OrderCommandPayload::VStop {
+                    order_id,
+                    enabled,
+                    fixed,
+                    level,
+                    volume,
+                } => {
+                    assert_eq!(order_id, uid);
+                    assert!(enabled);
+                    assert!(!fixed);
+                    assert_eq!(level, 12.5);
+                    assert_eq!(volume, 100.0);
+                }
+                other => panic!("unexpected order payload: {other:?}"),
+            },
+            other => panic!("unexpected trade command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_report_set_rows_deleted_uses_the_sliced_trade_path() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let change = crate::state::ReportRowsDeleted::new(
+            true,
+            [crate::state::ReportRecIdRange::new(10, 20)],
+            [30, 40],
+        );
+
+        assert!(!handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::ReportSetRowsDeleted(vec![change].into()),
+            &mut pending,
+        ));
+
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(high.is_empty() && low.is_empty());
+        assert_eq!(sliced.len(), 1);
+        match TradeCommand::parse(&sliced[0].data).expect("valid report mutation") {
+            TradeCommand::ReportSetRowsDeleted(command) => {
+                assert!(command.deleted);
+                assert_eq!(command.ranges, [(10, 20)]);
+                assert_eq!(command.singles, [30, 40]);
+            }
+            other => panic!("unexpected trade command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn moon_trade_returns_route_error_before_base_check_fields() {
+        let mut client = Client::new(dummy_cfg());
+        client.testing_set_domain_ready(true);
+        let mut dispatcher = crate::events::EventDispatcher::new();
+
+        let err = handle_trade_action(
+            &mut client,
+            &mut dispatcher,
+            RuntimeTradeCommandKind::Penalty {
+                market_name: "DOGEUSDT".to_string(),
+            },
+        )
+        .expect_err("new Client has no BaseCheck route");
+
+        assert!(err.missing_exchange_code);
+        assert!(err.missing_base_currency_code);
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(sliced.is_empty() && high.is_empty() && low.is_empty());
+    }
+
+    #[test]
+    fn auto_candles_snapshot_is_one_shot_for_current_trades_scope() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::SubscribeAllTrades(false),
+            &mut pending,
+        );
+        assert!(pending.auto_candles_requested);
+        assert_eq!(pending.auto_candles.len(), 1);
+
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::SubscribeAllTrades(false),
+            &mut pending,
+        );
+        assert_eq!(
+            pending.auto_candles.len(),
+            1,
+            "same trades scope must not schedule duplicate full candles requests"
+        );
+
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::UnsubscribeAllTrades,
+            &mut pending,
+        );
+        assert!(!pending.auto_candles_requested);
+        assert!(pending.auto_candles.is_empty());
+        assert!(pending.auto_candles_apply.is_empty());
+        assert!(pending.auto_candles_scope.is_none());
+    }
+
+    #[test]
+    fn runtime_unsubscribe_without_local_subscription_reaches_wire_queue() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+
+        assert!(!handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::UnsubscribeAllTrades,
+            &mut pending,
+        ));
+
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(high.is_empty() && low.is_empty());
+        assert_eq!(sliced.len(), 1);
+        assert_eq!(sliced[0].cmd, Command::API.to_byte());
+        assert_eq!(
+            sliced[0].data.get(11).copied(),
+            Some(crate::commands::engine_api::EngineMethod::UnsubscribeAllTrades.to_byte())
+        );
+    }
+
+    #[test]
+    fn init_time_trades_scope_schedules_auto_candles_when_runtime_starts() {
+        let mut client = ready_client();
+        client.subscribe_all_trades(false);
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+
+        sync_runtime_trade_storage_scope(&client, &mut dispatcher);
+        schedule_auto_candles_snapshot(&mut client, &mut pending);
+
+        assert!(pending.auto_candles_requested);
+        assert_eq!(pending.auto_candles.len(), 1);
+    }
+
+    #[test]
+    fn auto_candles_timeout_cleans_chunk_collector_and_allows_retry() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::SubscribeAllTrades(false),
+            &mut pending,
+        );
+        let uid = pending.auto_candles[0].uid;
+        assert!(client.pending_api.pending_candles.contains_key(&uid));
+        pending.auto_candles[0].deadline = Instant::now() - std::time::Duration::from_millis(1);
+
+        assert!(poll_auto_candles(
+            &mut client,
+            &mut pending,
+            &mut dispatcher
+        ));
+        assert!(!pending.auto_candles_requested);
+        assert!(pending.auto_candles.is_empty());
+        assert!(!client.pending_api.pending_candles.contains_key(&uid));
+        match dispatcher.take_queued_events().as_slice() {
+            [crate::events::Event::CandlesSnapshot(crate::state::CandlesSnapshotEvent::Failed {
+                request_uid: Some(failed_uid),
+                error,
+            })] => {
+                assert_eq!(*failed_uid, uid);
+                assert!(error.contains("timed out"));
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
+
+        schedule_auto_candles_snapshot(&mut client, &mut pending);
+        assert!(pending.auto_candles_requested);
+        assert_eq!(pending.auto_candles.len(), 1);
+    }
+
+    #[test]
+    fn auto_candles_scope_change_drops_old_chunk_collector() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::SubscribeAllTrades(false),
+            &mut pending,
+        );
+        let old_uid = pending.auto_candles[0].uid;
+        assert!(client.pending_api.pending_candles.contains_key(&old_uid));
+
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::SubscribeTradesFor {
+                want_mm: false,
+                markets: vec!["BTCUSDT".to_string()],
+            },
+            &mut pending,
+        );
+
+        assert!(!client.pending_api.pending_candles.contains_key(&old_uid));
+        assert!(pending.auto_candles_requested);
+        assert_eq!(pending.auto_candles.len(), 1);
+        let new_uid = pending.auto_candles[0].uid;
+        assert!(client.pending_api.pending_candles.contains_key(&new_uid));
+    }
+
+    fn strategy_test_list(count: u64) -> Vec<StrategySnapshot> {
+        (1..=count)
+            .map(|strategy_id| {
+                let mut fields = StrategyFields::new();
+                fields.insert(
+                    "Comment",
+                    FieldValue::String(format!("Strategy {strategy_id}")),
+                );
+                StrategySnapshot {
+                    strategy_id,
+                    strategy_ver: 1,
+                    last_date: 1234,
+                    checked: false,
+                    kind: 1,
+                    path: "Local".into(),
+                    fields,
+                }
+            })
+            .collect()
+    }
+
+    fn apply_strategy_test_list(
+        dispatcher: &mut crate::events::EventDispatcher,
+        strategies: &[StrategySnapshot],
+    ) {
+        apply_comment_strategy_schema(dispatcher);
+        let payload = crate::commands::strat::build_snapshot_from_strategies(
+            1,
+            42,
+            true,
+            dispatcher.strats().strategy_schema().unwrap(),
+            strategies,
+        );
+        dispatcher.dispatch_into(Command::Strat, &payload, 0, &mut Vec::new());
+    }
+
+    #[test]
+    fn strategy_folders_full_is_replaceable_and_old_snapshots_cannot_restore_deleted_paths() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut receiver = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let mut saved = Vec::new();
+        for paths in [
+            vec!["Empty/Nested".into()],
+            vec!["Renamed/Child".into()],
+            vec![],
+        ] {
+            handle_command(
+                &mut client,
+                &mut dispatcher,
+                RuntimeCommand::StrategyFolders {
+                    strategies: None,
+                    paths,
+                },
+                &mut pending,
+            );
+            let (sliced, high, low) = client.take_send_queues_for_test();
+            assert!(high.is_empty() && low.is_empty());
+            assert_eq!(sliced.len(), 1);
+            assert!(
+                !sliced[0].u_key.is_none(),
+                "Full still uses the existing replacement key"
+            );
+            saved.push(sliced[0].data.clone());
+        }
+        for payload in saved.iter().rev() {
+            receiver.dispatch_into(Command::Strat, payload, 0, &mut Vec::new());
+        }
+        assert_eq!(receiver.strats().folder_paths().count(), 0);
+        assert!(receiver.strats().folders_last_modified() > 0);
+        let latest = saved.last().unwrap();
+        dispatcher.dispatch_into(Command::Strat, latest, 0, &mut Vec::new());
+        assert_eq!(dispatcher.strats().folder_paths().count(), 0);
+
+        // Reconnect/request replies retain the newest complete empty tree, not a deletion event.
+        let reply = dispatcher.local_strategy_snapshot_reply().unwrap();
+        assert!(reply.full);
+        assert_eq!(
+            reply.folders_last_modified,
+            receiver.strats().folders_last_modified()
+        );
+        assert!(
+            crate::commands::strategy_serializer::parse_strategy_batch(&reply.data)
+                .unwrap()
+                .paths
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn strategy_folder_rename_applies_paths_after_rows_and_parameter_edits_remain_diffs() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut receiver = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let mut rows = strategy_test_list(3);
+        apply_strategy_test_list(&mut dispatcher, &rows);
+        apply_strategy_test_list(&mut receiver, &rows);
+        for row in &mut rows {
+            row.path = "Renamed".into();
+            row.last_date += 1;
+        }
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::StrategyFolders {
+                strategies: Some(rows.clone()),
+                paths: vec!["Renamed".into(), "Empty/Child".into()],
+            },
+            &mut pending,
+        );
+        let (sliced, _, _) = client.take_send_queues_for_test();
+        assert_eq!(sliced.len(), 1);
+        let crate::commands::strat::StratCommand::Snapshot(full) =
+            crate::commands::strat::StratCommand::parse(&sliced[0].data).unwrap()
+        else {
+            panic!("Full");
+        };
+        assert!(full.full);
+        assert_eq!(
+            full.server_epoch, 42,
+            "a rename does not change linear strategy order"
+        );
+        receiver.dispatch_into(Command::Strat, &sliced[0].data, 0, &mut Vec::new());
+        dispatcher.dispatch_into(Command::Strat, &sliced[0].data, 0, &mut Vec::new());
+        let mut paths: Vec<_> = receiver.strats().folder_paths().collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["Empty", "Empty/Child", "Renamed"]);
+        assert!(receiver
+            .strats()
+            .snapshots()
+            .all(|s| s.path.as_ref() == "Renamed"));
+        let date = dispatcher.strats().folders_last_modified();
+
+        rows[0].last_date += 1;
+        rows[0]
+            .fields
+            .insert("Comment", FieldValue::String("parameters only".into()));
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::StrategySnapshotBatch(rows),
+            &mut pending,
+        );
+        let (sliced, _, _) = client.take_send_queues_for_test();
+        assert_eq!(sliced.len(), 1);
+        let crate::commands::strat::StratCommand::Snapshot(diff) =
+            crate::commands::strat::StratCommand::parse(&sliced[0].data).unwrap()
+        else {
+            panic!("diff");
+        };
+        assert!(!diff.full);
+        assert_eq!(diff.folders_last_modified, 0);
+        assert_eq!(
+            crate::commands::strategy_serializer::parse_strategy_batch(&diff.data)
+                .unwrap()
+                .strategies
+                .len(),
+            1
+        );
+        receiver.dispatch_into(Command::Strat, &sliced[0].data, 0, &mut Vec::new());
+        let reply = receiver.local_strategy_snapshot_reply().unwrap();
+        let batch =
+            crate::commands::strategy_serializer::parse_strategy_batch(&reply.data).unwrap();
+        assert!(
+            batch.paths.iter().any(|p| p.as_ref() == "Empty/Child"),
+            "diff must not poison the Full cache"
+        );
+        assert_eq!(reply.folders_last_modified, date);
+
+        // Missing occupied folders survive even if a newer tree omits them.
+        let empty = crate::commands::strat::build_snapshot(123, 42, 0, true, &[], date + 1);
+        receiver.dispatch_into(Command::Strat, &empty, 0, &mut Vec::new());
+        assert_eq!(
+            receiver.strats().folder_paths().collect::<Vec<_>>(),
+            ["Renamed"]
+        );
+    }
+
+    #[test]
+    fn queued_folder_full_keeps_all_paths_and_pending_edits_when_replaced() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let mut rows = strategy_test_list(2);
+        apply_strategy_test_list(&mut dispatcher, &rows);
+        for paths in [
+            vec!["Local".into(), "A".into()],
+            vec!["Local".into(), "A".into(), "B".into()],
+        ] {
+            handle_command(
+                &mut client,
+                &mut dispatcher,
+                RuntimeCommand::StrategyFolders {
+                    strategies: None,
+                    paths,
+                },
+                &mut pending,
+            );
+        }
+        rows[0].last_date += 1;
+        rows[0]
+            .fields
+            .insert("Comment", FieldValue::String("pending edit".into()));
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::StrategySnapshotBatch(rows.clone()),
+            &mut pending,
+        );
+        rows.swap(0, 1);
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::StrategySnapshotBatch(rows),
+            &mut pending,
+        );
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(high.is_empty() && low.is_empty());
+        assert_eq!(
+            sliced.len(),
+            2,
+            "one independent diff plus the latest replaceable Full"
+        );
+        let crate::commands::strat::StratCommand::Snapshot(full) =
+            crate::commands::strat::StratCommand::parse(&sliced[1].data).unwrap()
+        else {
+            panic!("Full");
+        };
+        assert!(full.full);
+        assert!(full.folders_last_modified > 0);
+        let batch = crate::commands::strategy_serializer::parse_strategy_batch(&full.data).unwrap();
+        assert!(batch.paths.iter().any(|p| p.as_ref() == "A"));
+        assert!(batch.paths.iter().any(|p| p.as_ref() == "B"));
+        assert_eq!(
+            batch
+                .strategies
+                .iter()
+                .map(|s| s.strategy_id)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(
+            batch.strategies[1].fields.get("Comment"),
+            Some(&FieldValue::String("pending edit".into()))
+        );
+    }
+
+    #[test]
+    fn legacy_and_malformed_full_cannot_change_versioned_empty_folders() {
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let data =
+            crate::commands::strategy_serializer::StrategyBatchBuilder::folder_payload(vec![
+                "Keep/Nested".into(),
+            ]);
+        let payload = crate::commands::strat::build_snapshot(1, 1, 0, true, &data, 100);
+        dispatcher.dispatch_into(Command::Strat, &payload, 0, &mut Vec::new());
+        let mut legacy = crate::commands::strat::build_snapshot(2, 200, 0, true, &[], 0);
+        legacy.truncate(legacy.len() - 8);
+        dispatcher.dispatch_into(Command::Strat, &legacy, 0, &mut Vec::new());
+        let malformed = crate::commands::strat::build_snapshot(3, 300, 0, true, &[0xff], 200);
+        dispatcher.dispatch_into(Command::Strat, &malformed, 0, &mut Vec::new());
+        assert_eq!(dispatcher.strats().folders_last_modified(), 100);
+        assert_eq!(dispatcher.strats().folder_paths().count(), 2);
+        assert!(dispatcher
+            .strats()
+            .folder_paths()
+            .any(|p| p == "Keep/Nested"));
+    }
+
+    #[test]
+    fn strategy_parameter_edit_sends_one_row_out_of_1000_and_keeps_full_reply() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let mut strategies = strategy_test_list(1000);
+        strategies[999].last_date = 9000;
+        apply_strategy_test_list(&mut dispatcher, &strategies);
+
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::StrategySnapshotBatch(strategies.clone()),
+            &mut pending,
+        );
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(
+            sliced.is_empty() && high.is_empty() && low.is_empty(),
+            "unchanged list must not send"
+        );
+
+        strategies[777].last_date += 1;
+        strategies[777]
+            .fields
+            .insert("Comment", FieldValue::String("edited".into()));
+        let before = crate::MoonTime::now();
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::StrategySnapshotBatch(strategies.clone()),
+            &mut pending,
+        );
+        let after = crate::MoonTime::now();
+        let submitted = dispatcher
+            .strats()
+            .strategy_edit(778)
+            .unwrap()
+            .submitted_at();
+        assert!(
+            submitted >= before && submitted <= after,
+            "submitted_at must be UTC, not client uptime"
+        );
+
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(high.is_empty() && low.is_empty());
+        assert_eq!(sliced.len(), 1);
+        assert!(sliced[0].u_key.is_none());
+        let crate::commands::strat::StratCommand::Snapshot(snapshot) =
+            crate::commands::strat::StratCommand::parse(&sliced[0].data).unwrap()
+        else {
+            panic!("snapshot");
+        };
+        assert!(!snapshot.full);
+        assert_eq!(snapshot.server_epoch, 0);
+        assert_eq!(
+            snapshot.client_max_last_date, 1235,
+            "only transmitted rows contribute to max date"
+        );
+        let batch =
+            crate::commands::strategy_serializer::parse_strategy_batch(&snapshot.data).unwrap();
+        assert_eq!(batch.strategies.len(), 1);
+        assert_eq!(batch.strategies[0].strategy_id, 778);
+        assert_eq!(
+            batch.strategies[0].fields.get("Comment"),
+            strategies[777].fields.get("Comment")
+        );
+
+        let mut events = Vec::new();
+        dispatcher.dispatch_into(Command::Strat, &sliced[0].data, 0, &mut events);
+        assert!(dispatcher.strats().strategy_edit(778).is_none());
+        assert!(events.iter().any(|event| matches!(event,
+            crate::events::Event::Strat(crate::state::StratEvent::EditConfirmed { strategy_ids })
+                if strategy_ids == &[778])));
+        assert_eq!(dispatcher.strats().last_modified(), 42);
+        assert_eq!(dispatcher.local_strategy_epoch(), 42);
+        assert_eq!(
+            dispatcher
+                .strats()
+                .snapshots()
+                .map(|s| s.strategy_id)
+                .collect::<Vec<_>>(),
+            (1..=1000).collect::<Vec<_>>()
+        );
+
+        let reply = dispatcher.local_strategy_snapshot_reply().unwrap();
+        assert!(reply.full);
+        assert_eq!(reply.server_epoch, 42);
+        assert_eq!(reply.client_max_last_date, 9000);
+        let full = crate::commands::strategy_serializer::parse_strategy_batch(&reply.data).unwrap();
+        assert_eq!(
+            full.strategies.len(),
+            1000,
+            "diff must not replace the Full reply cache"
+        );
+        assert_eq!(
+            full.strategies[777].fields.get("Comment"),
+            strategies[777].fields.get("Comment")
+        );
+
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::StrategySnapshotBatch(strategies),
+            &mut pending,
+        );
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(
+            sliced.is_empty() && high.is_empty() && low.is_empty(),
+            "confirmed edit must not be resent"
+        );
+    }
+
+    #[test]
+    fn strategy_diffs_and_pending_reorder_survive_reverse_delivery() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut receiver = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let mut strategies = strategy_test_list(3);
+        apply_strategy_test_list(&mut dispatcher, &strategies);
+        apply_strategy_test_list(&mut receiver, &strategies);
+
+        for index in 0..2 {
+            strategies[index].last_date += 1;
+            strategies[index]
+                .fields
+                .insert("Comment", FieldValue::String(format!("edited {index}")));
+            handle_command(
+                &mut client,
+                &mut dispatcher,
+                RuntimeCommand::StrategySnapshotBatch(strategies.clone()),
+                &mut pending,
+            );
+        }
+        strategies.swap(0, 1);
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::StrategySnapshotBatch(strategies.clone()),
+            &mut pending,
+        );
+
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(high.is_empty() && low.is_empty());
+        assert_eq!(
+            sliced.len(),
+            3,
+            "independent partials must survive the Full enqueue"
+        );
+        for (index, item) in sliced.iter().enumerate() {
+            let crate::commands::strat::StratCommand::Snapshot(snapshot) =
+                crate::commands::strat::StratCommand::parse(&item.data).unwrap()
+            else {
+                panic!("snapshot");
+            };
+            let batch =
+                crate::commands::strategy_serializer::parse_strategy_batch(&snapshot.data).unwrap();
+            let expected: &[u64] = match index {
+                0 => &[1],
+                1 => &[1, 2],
+                _ => &[2, 1, 3],
+            };
+            assert_eq!(
+                batch
+                    .strategies
+                    .iter()
+                    .map(|s| s.strategy_id)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(snapshot.full, index == 2);
+            assert_eq!(item.u_key.is_none(), index != 2);
+        }
+        for item in sliced.iter().rev() {
+            receiver.dispatch_into(Command::Strat, &item.data, 0, &mut Vec::new());
+            dispatcher.dispatch_into(Command::Strat, &item.data, 0, &mut Vec::new());
+        }
+        for state in [&receiver, &dispatcher] {
+            assert_eq!(
+                state
+                    .strats()
+                    .snapshots()
+                    .map(|s| s.strategy_id)
+                    .collect::<Vec<_>>(),
+                [2, 1, 3]
+            );
+            assert_eq!(
+                state.strats().last_modified(),
+                dispatcher.local_strategy_epoch()
+            );
+            for strategy in &strategies {
+                let actual = state.strats().snapshot(strategy.strategy_id).unwrap();
+                assert_eq!(actual.last_date, strategy.last_date);
+                assert_eq!(actual.fields.get("Comment"), strategy.fields.get("Comment"));
+                assert!(state.strats().strategy_edit(strategy.strategy_id).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn strategy_obsolete_draft_does_not_send_stale_rows() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let mut strategies = strategy_test_list(2);
+        apply_strategy_test_list(&mut dispatcher, &strategies);
+        strategies[0].last_date -= 1;
+        strategies[0]
+            .fields
+            .insert("Comment", FieldValue::String("stale".into()));
+        handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::StrategySnapshotBatch(strategies),
+            &mut pending,
+        );
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(sliced.is_empty() && high.is_empty() && low.is_empty());
+        assert!(dispatcher
+            .take_queued_events()
+            .iter()
+            .any(|event| matches!(event,
+            crate::events::Event::Strat(crate::state::StratEvent::EditSuperseded { strategy_ids })
+                if strategy_ids == &[1])));
+        let reply = dispatcher.local_strategy_snapshot_reply().unwrap();
+        let full = crate::commands::strategy_serializer::parse_strategy_batch(&reply.data).unwrap();
+        assert_eq!(full.strategies[0].last_date, 1234);
+        assert_eq!(
+            full.strategies[0].fields.get("Comment"),
+            Some(&FieldValue::String("Strategy 1".into()))
+        );
+    }
+
+    #[test]
+    fn post_connect_strategy_sync_advances_local_epoch_before_snapshot_send() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        apply_comment_strategy_schema(&mut dispatcher);
+        dispatcher.set_local_strategy_epoch(41);
+
+        let mut fields = StrategyFields::new();
+        fields.insert("Comment", FieldValue::String("edited".to_string()));
+        let strategy = StrategySnapshot {
+            strategy_id: 0x5157,
+            strategy_ver: 3,
+            last_date: 1234,
+            checked: true,
+            kind: 1,
+            path: "Local".into(),
+            fields,
+        };
+
+        assert!(handle_command(
+            &mut client,
+            &mut dispatcher,
+            RuntimeCommand::StrategySnapshotBatch(vec![strategy.clone()]),
+            &mut pending,
+        ));
+        assert!(dispatcher.local_strategy_epoch() > 1_000_000_000_000);
+
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        let item = sliced
+            .into_iter()
+            .chain(high)
+            .chain(low)
+            .find(|item| item.cmd == Command::Strat.to_byte())
+            .expect("strategy snapshot command must be queued");
+        let crate::commands::strat::StratCommand::Snapshot(snapshot) =
+            crate::commands::strat::StratCommand::parse(&item.data)
+                .expect("queued strategy snapshot must parse")
+        else {
+            panic!("expected TStratSnapshot");
+        };
+        assert_eq!(snapshot.server_epoch, dispatcher.local_strategy_epoch());
+        assert!(
+            snapshot.full,
+            "a changed list carries order in Full row sequence"
+        );
+        assert_eq!(snapshot.client_max_last_date, strategy.last_date);
+        let batch = crate::commands::strategy_serializer::parse_strategy_batch(&snapshot.data)
+            .expect("strategy snapshot payload must parse");
+        assert_eq!(batch.strategies.len(), 1);
+        assert_eq!(batch.strategies[0].strategy_id, strategy.strategy_id);
+        assert!(
+            dispatcher.strats().snapshot(strategy.strategy_id).is_none(),
+            "submitting a local edit must not manufacture core-confirmed state"
+        );
+        assert_eq!(
+            dispatcher
+                .strats()
+                .strategy_edit(strategy.strategy_id)
+                .unwrap()
+                .desired()
+                .strategy_ver,
+            strategy.strategy_ver
+        );
+        assert!(dispatcher.take_queued_events().iter().any(|event| matches!(
+            event,
+            crate::events::Event::Strat(crate::state::StratEvent::EditSubmitted {
+                strategy_ids
+            }) if strategy_ids == &[strategy.strategy_id]
+        )));
+    }
+
+    #[test]
+    fn startup_defers_strategy_sync_until_schema_gate_is_ready() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+
+        let mut fields = StrategyFields::new();
+        fields.insert("Comment", FieldValue::String("early edit".to_string()));
+        let strategy = StrategySnapshot {
+            strategy_id: 0xE4E4,
+            strategy_ver: 1,
+            last_date: 77,
+            checked: true,
+            kind: 1,
+            path: "Local".into(),
+            fields,
+        };
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeCommand::StrategySnapshotBatch(
+            vec![strategy.clone()],
+        ))
+        .unwrap();
+
+        let mut deferred = VecDeque::new();
+        let (stop, changed) = drain_commands_during_startup(&rx, &mut deferred);
+        assert!(!stop);
+        assert!(!changed);
+        assert_eq!(deferred.len(), 1);
+        assert!(client.take_send_queues_for_test().0.is_empty());
+
+        apply_comment_strategy_schema(&mut dispatcher);
+        let (stop, changed) = drain_deferred_and_live_commands(
+            &mut client,
+            &mut dispatcher,
+            &rx,
+            &mut pending,
+            &mut deferred,
+        );
+        assert!(!stop);
+        assert!(changed);
+        assert!(deferred.is_empty());
+
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        let item = sliced
+            .into_iter()
+            .chain(high)
+            .chain(low)
+            .find(|item| item.cmd == Command::Strat.to_byte())
+            .expect("deferred strategy sync must be sent after schema is available");
+        let crate::commands::strat::StratCommand::Snapshot(snapshot) =
+            crate::commands::strat::StratCommand::parse(&item.data)
+                .expect("queued strategy snapshot must parse")
+        else {
+            panic!("expected TStratSnapshot");
+        };
+        let batch = crate::commands::strategy_serializer::parse_strategy_batch(&snapshot.data)
+            .expect("deferred strategy snapshot payload must parse");
+        assert_eq!(batch.strategies.len(), 1);
+        assert_eq!(batch.strategies[0].strategy_id, strategy.strategy_id);
+    }
+
+    #[test]
+    fn startup_defers_unsubscribe_then_sends_it_after_init() {
+        let mut client = Client::new(dummy_cfg());
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeCommand::UnsubscribeAllTrades).unwrap();
+
+        let mut deferred = VecDeque::new();
+        let (stop, changed) = drain_commands_during_startup(&rx, &mut deferred);
+        assert!(!stop);
+        assert!(!changed);
+        assert_eq!(deferred.len(), 1);
+        assert!(client.take_send_queues_for_test().0.is_empty());
+
+        client.testing_set_domain_ready(true);
+        let (stop, changed) = drain_deferred_and_live_commands(
+            &mut client,
+            &mut dispatcher,
+            &rx,
+            &mut pending,
+            &mut deferred,
+        );
+        assert!(!stop);
+        assert!(!changed);
+        assert!(deferred.is_empty());
+
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(high.is_empty() && low.is_empty());
+        assert_eq!(sliced.len(), 1);
+        assert_eq!(
+            sliced[0].data.get(11).copied(),
+            Some(crate::commands::engine_api::EngineMethod::UnsubscribeAllTrades.to_byte())
+        );
+    }
+
+    #[test]
+    fn problems_intents_defer_until_ready_and_use_encrypted_high_without_local_clear() {
+        let mut client = Client::new(dummy_cfg());
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let (tx, rx) = mpsc::channel();
+        for cmd in [
+            UiRuntimeCommand::ProblemsClear,
+            UiRuntimeCommand::ProblemsTest("firetest".into()),
+        ] {
+            tx.send(RuntimeCommand::Ui(cmd)).unwrap();
+        }
+        let mut deferred = VecDeque::new();
+        drain_commands_during_startup(&rx, &mut deferred);
+        assert_eq!(deferred.len(), 2);
+        let queues = client.take_send_queues_for_test();
+        assert!(queues.0.is_empty() && queues.1.is_empty() && queues.2.is_empty());
+
+        client.testing_set_domain_ready(true);
+        let (_, changed) = drain_deferred_and_live_commands(
+            &mut client,
+            &mut dispatcher,
+            &rx,
+            &mut pending,
+            &mut deferred,
+        );
+        assert!(!changed, "only inbound state may confirm a clear");
+        assert!(!dispatcher.settings.problems.snapshot_received());
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(sliced.is_empty() && low.is_empty());
+        assert_eq!(high.len(), 2);
+        assert!(high
+            .iter()
+            .all(|item| item.encrypted && item.cmd == Command::UI.to_byte()));
+        assert_eq!(high[0].data[0], 34);
+        assert_eq!(high[0].data.len(), 11);
+        assert_eq!(high[1].data[0], 35);
+        assert_eq!(&high[1].data[11..], b"\x08\x00firetest");
+        assert!(
+            matches!(crate::commands::ui::UICommand::parse(&high[1].data),
+            Some(crate::commands::ui::UICommand::ProblemsTest(text)) if text == "firetest")
+        );
+    }
+
+    #[test]
+    fn transfer_assets_batch_emits_completion_after_all_kinds_finish() {
+        let mut pending = RuntimePending::default();
+        pending
+            .transfer_assets_batches
+            .push(PendingTransferAssetsBatch {
+                id: 7,
+                remaining: 3,
+                updated: 0,
+                failed: 0,
+            });
+        let mut dispatcher = crate::events::EventDispatcher::new();
+
+        finish_transfer_assets_batch_item(&mut pending, &mut dispatcher, Some(7), true);
+        assert!(dispatcher.take_queued_events().is_empty());
+        finish_transfer_assets_batch_item(&mut pending, &mut dispatcher, Some(7), false);
+        assert!(dispatcher.take_queued_events().is_empty());
+        finish_transfer_assets_batch_item(&mut pending, &mut dispatcher, Some(7), true);
+
+        assert!(matches!(
+            dispatcher.take_queued_events().as_slice(),
+            [crate::events::Event::TransferAssets(
+                crate::state::TransferAssetsEvent::RefreshCompleted {
+                    request_id: 7,
+                    requested: 3,
+                    updated: 2,
+                    failed: 1,
+                    ..
+                }
+            )]
+        ));
+        assert!(pending.transfer_assets_batches.is_empty());
+    }
+
+    #[test]
+    fn transfer_assets_refresh_burst_queues_one_batch_per_interval() {
+        let mut client = ready_client();
+        let mut pending = RuntimePending::default();
+        let now = Instant::now();
+
+        assert!(schedule_transfer_assets_refresh_at(
+            &mut client,
+            &mut pending,
+            now
+        ));
+        for _ in 1..24 {
+            assert!(!schedule_transfer_assets_refresh_at(
+                &mut client,
+                &mut pending,
+                now
+            ));
+        }
+
+        assert_eq!(pending.transfer_assets_batches.len(), 1);
+        assert_eq!(pending.transfer_assets.len(), ExchangeKind::ALL.len());
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert_eq!(
+            sliced.len() + high.len() + low.len(),
+            ExchangeKind::ALL.len()
+        );
+
+        assert!(!schedule_transfer_assets_refresh_at(
+            &mut client,
+            &mut pending,
+            now + TRANSFER_ASSETS_REFRESH_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(schedule_transfer_assets_refresh_at(
+            &mut client,
+            &mut pending,
+            now + TRANSFER_ASSETS_REFRESH_INTERVAL
+        ));
+        assert_eq!(pending.transfer_assets_batches.len(), 2);
+        assert_eq!(pending.transfer_assets.len(), ExchangeKind::ALL.len() * 2);
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert_eq!(
+            sliced.len() + high.len() + low.len(),
+            ExchangeKind::ALL.len()
+        );
+    }
+
+    #[test]
+    fn published_snapshots_have_monotonic_revisions() {
+        let dispatcher = crate::events::EventDispatcher::new();
+        let snapshot = RwLock::new(None);
+
+        publish_snapshot(&dispatcher, &snapshot);
+        let first = snapshot.read().clone().expect("first snapshot");
+        assert_eq!(first.revision(), 1);
+
+        publish_snapshot(&dispatcher, &snapshot);
+        let second = snapshot.read().clone().expect("second snapshot");
+        assert_eq!(second.revision(), 2);
+        assert_eq!(second.orders().len(), first.orders().len());
+    }
+
+    #[test]
+    fn published_order_snapshot_is_persistent_without_cloning_protocol_state() {
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let uid = 0x5151;
+        seed_runtime_order(&mut dispatcher, uid, OrderWorkerStatus::BuySet, 1);
+        let held = dispatcher.snapshot();
+
+        seed_runtime_order(&mut dispatcher, uid, OrderWorkerStatus::SellSet, 2);
+        let fresh = dispatcher.snapshot();
+
+        assert_eq!(
+            held.orders().get(uid).unwrap().status,
+            OrderWorkerStatus::BuySet
+        );
+        assert_eq!(
+            fresh.orders().get(uid).unwrap().status,
+            OrderWorkerStatus::SellSet
+        );
+    }
+}

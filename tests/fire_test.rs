@@ -1,0 +1,9923 @@
+//! FireTest: live health test for the active MoonProto library.
+//!
+//! This test is intentionally ignored by default. It talks to a real MoonBot
+//! server, enables client-side `err_emu=10%` before connecting, verifies the
+//! full chunked candles snapshot under loss, then raises client-side
+//! `err_emu=50%` for simple operations and reconnect health. Heavy candles are
+//! intentionally excluded from the 50% gate; settings/strategy mutation,
+//! cross-client broadcast, and the final forced reconnect run after resetting
+//! the stochastic loss emulator.
+//!
+//! Config file is outside this crate repository:
+//! `../moonproto.firetest.conf` relative to `moonproto/`.
+//!
+//! Minimal config:
+//! ```text
+//! server = 127.0.0.1:3000
+//! key = <exported MoonBot key>
+//! # transport_mode = 0
+//! allow_mutation = true
+//! market = BTCUSDT
+//! strategy_field = Comment
+//! # strategy_id = 123456789
+//! # candles_timeout_secs = 30
+//! # high_loss_timeout_secs = 60
+//! ```
+//!
+//! Profiles:
+//! - `MOONPROTO_FIRETEST_PROFILE=quick` — public `MoonClient` path, <=30s
+//!   target health gate:
+//!   connect/AuthDone/InitDone, BaseCheck/AuthCheck, markets/indexes/update,
+//!   retained LastPrice/trades, derived trade/LastPrice snapshot, non-blocking
+//!   CoinCard 4h candle request, trades + orderbook streams, ParseFailed=0,
+//!   CPU summary.
+//! - `MOONPROTO_FIRETEST_PROFILE=full` or unset — the complete destructive
+//!   public `MoonClient` health/stress scenario below. Requires
+//!   `allow_mutation=true`.
+//!
+//! FireTest checks live full-parse health for all real server packets. Crafted
+//! malformed parser semantics (Delphi `Read` zero-tail vs `ReadBuffer`
+//! fail-fast) belong in deterministic unit/parser tests next to each parser.
+//! At the end of each profile it prints an ActiveLib UI-state report for
+//! BTCUSDT/ETHUSDT: LastPrice/MarkPrice retained lines, volumes, deltas,
+//! funding, balances/assets, and order events already observed during the run.
+//! The full profile also switches the server to real/non-emulator mode for one
+//! SOLUSDT limit-long cancel test: place 1000 USD 5% below market, wait for the
+//! real server order UID, then cancel through the tracked ActiveLib order path.
+//! Binance balance updates are intentionally not tied to that exact order:
+//! FireTest only requires the full run to receive and apply live balance events.
+//! Strategy snapshots are also dumped as raw `TStratSnapshot.Data` files under
+//! `target/firetest_strategy_raw/` by default, so Delphi/Rust serializer and CPU
+//! checks can run against the exact same live payload bytes.
+//! Live FireTest cases are serialized inside this binary: they share one live
+//! server and process-wide err_emu diagnostics, so parallel test-harness
+//! execution would mix scenarios instead of measuring one pipeline.
+//! The one-client public smoke keeps the init-time all-market retention path.
+//! Multi-client destructive sessions retain only the BTC/ETH/SOL markets used
+//! by their assertions, so four simultaneous clients do not each materialize
+//! histories for every server market.
+//!
+//! This is a diagnostic/protocol health test, not application example code. The
+//! full profile uses the same public `MoonClient` path as regular applications,
+//! while still inspecting protocol metrics, err_emu counters, raw strategy
+//! payloads, reconnect phases, and destructive order/settings scenarios. Both
+//! profiles print Sliced recovery math for the configured `err_emu`, so a
+//! missing startup request/response is compared against the protocol retry
+//! budget instead of being dismissed as random loss.
+
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use moonproto::client::{set_err_emu, ErrEmuDiagnostics, ErrEmuSlicedDatagramDiagnostics};
+use moonproto::commands::{
+    parse_request_candles_data_response, parse_strategy_batch, CandlesAggregator,
+    RequestCandlesMarket,
+};
+use moonproto::events::Event;
+use moonproto::shared_config::SharedConfig;
+use moonproto::state::{
+    ApplyResult, BalanceEvent, LastPricePoint, MarkPricePoint, MarketHistoryApplySummary,
+    MarketHistoryConfig, MarketHistoryCounts, MarketHistoryEvent, MarketHistorySizing, MarketPrice,
+    MiniCandle, Order, OrderBookEvent, OrderBookKind, OrderEvent, SettingsEvent, StratEvent,
+    TradeHistoryRow, TradesEvent,
+};
+use moonproto::Command;
+use moonproto::{
+    parse_key_info, ClientConfig, ClientSettingsCommand, ConnectConfig, DeepHistoryKind,
+    EngineMethod, EngineResponse, ExchangeCode, ExchangeKind, ExchangeOrder, FieldValue,
+    ImportedKeys, InitConfig, InitialStrategies, KernelHealth, LifecycleEvent, MoonClient,
+    MoonShotStrategy, MoonStateSnapshot, MoonTime, NewsEvent, OrderWorkerStatus,
+    ProfitStateCommand, ProtocolMetricsSnapshot, ReportAliveMapComplete, ReportAliveMapOutcome,
+    ReportEvent, ReportHistoryDepth, ReportRow, ReportSchema, ReportSyncCheckpoint,
+    ReportSyncComplete, ReportSyncRequest, ReportValue, StrategyDynamicPicklist,
+    StrategyFieldLayout, StrategyFieldUiKind, StrategyFields, StrategyKind, StrategySchema,
+    StrategySnapshot, TradesStreamMode, TransportMode,
+};
+
+const DEFAULT_FIRETEST_ERR_EMU_PERCENT: u8 = 10;
+const FIRETEST_HIGH_LOSS_ERR_EMU_PERCENT: u8 = 50;
+const FIRETEST_RECONNECT_MATH_ATTEMPTS: i32 = 10;
+const FIRETEST_STRATEGY_ID: u64 = 0xF17E_5737_0000_0001;
+const DEFAULT_WAIT_SECS: u64 = 5;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 45;
+const DEFAULT_CANDLES_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_HIGH_LOSS_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_DISCONNECT_TIMEOUT_SECS: u64 = 45;
+const DEFAULT_RECONNECT_TIMEOUT_SECS: u64 = 30;
+const FIRETEST_SLICED_MAX_RETRIES: i32 = 6;
+const PUMP_SLICE: Duration = Duration::from_millis(50);
+const PRICE_NEIGHBORHOOD_PCT: f64 = 0.05;
+const FIRETEST_ORDER_SIZE_USD: f64 = 1000.0;
+const FIRETEST_REAL_BALANCE_ORDER_MARKET: &str = "SOLUSDT";
+const FIRETEST_REAL_BALANCE_ORDER_DISCOUNT: f64 = 0.05;
+const FIRETEST_REAL_BALANCE_ORDER_TIMEOUT: Duration = Duration::from_secs(5);
+const FIRETEST_MOONSHOT_STRATEGY_ID: u64 = 0xF17E_5737_0000_0002;
+const FIRETEST_MOONSHOT_NAME: &str = "MoonProto FireTest Shot";
+const FIRETEST_MOONSHOT_FOLDER: &str = "FireTest";
+const FIRETEST_MOONSHOT_COIN: &str = "ETH";
+const FIRETEST_MOONSHOT_MARKET: &str = "ETHUSDT";
+const FIRETEST_MOONSHOT_ORDER_SIZE_USD: f64 = 250.0;
+const FIRETEST_MOONSHOT_ORDER_SIZE_MIN_USD: f64 = 240.0;
+const FIRETEST_MOONSHOT_ORDER_SIZE_MAX_USD: f64 = 260.0;
+const EPS: f64 = 1e-9;
+const QUICK_CONNECT_TIMEOUT_SECS: u64 = 18;
+const QUICK_STREAM_TIMEOUT_SECS: u64 = 8;
+const QUICK_TOTAL_TARGET_SECS: u64 = 30;
+const FIRETEST_SLOW_STARTUP_DIAG_SECS: f64 = 8.0;
+const FIRETEST_CPU_HARD_RED_FLAG_NS: u64 = 5_000_000;
+const ACTIVE_LIB_REPORT_MARKETS: [&str; 2] = ["BTCUSDT", "ETHUSDT"];
+const FIRETEST_COIN_CARD_KIND: DeepHistoryKind = DeepHistoryKind::Hour4;
+const FIRETEST_MIN_COIN_CARD_CANDLES: usize = 24;
+const FIRETEST_RETAINED_CANDLE_MAX_AGE_SECS: f64 = 11.0 * 60.0;
+const FIRETEST_REPORT_SYNC_TIMEOUT: Duration = Duration::from_secs(180);
+const FIRETEST_REPORT_MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
+const FIRETEST_REPORT_TABLE: &str = "Orders";
+const FIRETEST_REPORT_PARTIAL_FIELDS: usize = 4;
+const FIRETEST_TRANSFER_ASSETS_BURST_CALLS: usize = 24;
+const FIRETEST_TRANSFER_ASSETS_SETTLE: Duration = Duration::from_secs(6);
+
+static FIRETEST_LIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn firetest_live_test_lock() -> MutexGuard<'static, ()> {
+    FIRETEST_LIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FireProfile {
+    Quick,
+    Full,
+}
+
+#[derive(Clone)]
+struct ParseFailureRecord {
+    event_no: u64,
+    cmd: Command,
+    len: usize,
+    hash: u64,
+    dump: Option<PathBuf>,
+}
+
+impl FireProfile {
+    fn from_env() -> Self {
+        match std::env::var("MOONPROTO_FIRETEST_PROFILE") {
+            Ok(value) if value.eq_ignore_ascii_case("quick") => Self::Quick,
+            Ok(value) if value.eq_ignore_ascii_case("full") => Self::Full,
+            Ok(value) => {
+                panic!("bad MOONPROTO_FIRETEST_PROFILE={value:?}; expected `quick` or `full`")
+            }
+            Err(_) => Self::Full,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Full => "full",
+        }
+    }
+}
+
+fn firetest_err_emu_percent() -> u8 {
+    match std::env::var("MOONPROTO_FIRETEST_ERR_EMU") {
+        Ok(value) => value
+            .parse::<u8>()
+            .unwrap_or_else(|err| panic!("bad MOONPROTO_FIRETEST_ERR_EMU={value:?}: {err}")),
+        Err(_) => DEFAULT_FIRETEST_ERR_EMU_PERCENT,
+    }
+}
+
+#[derive(Clone)]
+struct FireConfig {
+    path: PathBuf,
+    host: String,
+    port: u16,
+    transport_mode: TransportMode,
+    key_b64: String,
+    allow_mutation: bool,
+    market: String,
+    strategy_id: Option<u64>,
+    strategy_field: String,
+    wait: Duration,
+    connect_timeout: Duration,
+    candles_timeout: Duration,
+    high_loss_timeout: Duration,
+    disconnect_timeout: Duration,
+    reconnect_timeout: Duration,
+}
+
+impl FireConfig {
+    fn load_required() -> Self {
+        let path = std::env::var_os("MOONPROTO_FIRETEST_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                manifest
+                    .parent()
+                    .expect("moonproto must have a parent directory")
+                    .join("moonproto.firetest.conf")
+            });
+        let text = fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "FIRETEST_CONFIG_MISSING: cannot read {}: {err}. \
+                 During development this is a red health check. Create the file \
+                 outside the moonproto repo or set MOONPROTO_FIRETEST_CONFIG.",
+                path.display()
+            )
+        });
+
+        let mut values = HashMap::<String, String>::new();
+        for raw in text.lines() {
+            let line = raw.trim_start_matches('\u{feff}').trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                panic!("bad FireTest config line: {raw}");
+            };
+            values.insert(
+                key.trim().to_ascii_lowercase(),
+                strip_quotes(value.trim()).to_string(),
+            );
+        }
+
+        let key_b64 = values
+            .get("key")
+            .or_else(|| values.get("moonproto_key"))
+            .unwrap_or_else(|| panic!("FireTest config missing `key`"))
+            .to_string();
+        let key_info = parse_key_info(&key_b64)
+            .unwrap_or_else(|| panic!("invalid MoonProto key in FireTest config"));
+        let (host, port) = match values.get("server").filter(|s| !s.trim().is_empty()) {
+            Some(server) => parse_server(server),
+            None => {
+                let network = key_info.network.unwrap_or_else(|| {
+                    panic!("FireTest config missing `server`, and this MoonBot key does not carry endpoint metadata")
+                });
+                let address = network.address.unwrap_or_else(|| {
+                    panic!("FireTest config missing `server`, and this MoonBot key has no active IP address")
+                });
+                (address.to_string(), network.port)
+            }
+        };
+        let transport_mode = values
+            .get("transport_mode")
+            .or_else(|| values.get("mask_ver"))
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                s.parse::<u8>()
+                    .unwrap_or_else(|_| panic!("bad transport_mode: {s}"))
+            })
+            .map(TransportMode::from_byte)
+            .or_else(|| key_info.network.map(|network| network.transport_mode))
+            .unwrap_or(TransportMode::V0);
+        let allow_mutation = parse_bool(
+            values
+                .get("allow_mutation")
+                .map(String::as_str)
+                .unwrap_or("false"),
+        );
+        let market = values
+            .get("market")
+            .cloned()
+            .unwrap_or_else(|| "BTCUSDT".to_string());
+        let strategy_id = values
+            .get("strategy_id")
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                s.parse::<u64>()
+                    .unwrap_or_else(|_| panic!("bad strategy_id: {s}"))
+            });
+        let strategy_field = values
+            .get("strategy_field")
+            .cloned()
+            .unwrap_or_else(|| "Comment".to_string());
+        let wait = Duration::from_secs(parse_u64(
+            values.get("wait_secs").map(String::as_str),
+            DEFAULT_WAIT_SECS,
+        ));
+        let connect_timeout = Duration::from_secs(parse_u64(
+            values.get("connect_timeout_secs").map(String::as_str),
+            DEFAULT_CONNECT_TIMEOUT_SECS,
+        ));
+        let candles_timeout = Duration::from_secs(parse_u64(
+            values.get("candles_timeout_secs").map(String::as_str),
+            DEFAULT_CANDLES_TIMEOUT_SECS,
+        ));
+        let high_loss_timeout = Duration::from_secs(parse_u64(
+            values.get("high_loss_timeout_secs").map(String::as_str),
+            DEFAULT_HIGH_LOSS_TIMEOUT_SECS,
+        ));
+        let disconnect_timeout = Duration::from_secs(parse_u64(
+            values.get("disconnect_timeout_secs").map(String::as_str),
+            DEFAULT_DISCONNECT_TIMEOUT_SECS,
+        ));
+        let reconnect_timeout = Duration::from_secs(parse_u64(
+            values.get("reconnect_timeout_secs").map(String::as_str),
+            DEFAULT_RECONNECT_TIMEOUT_SECS,
+        ));
+
+        Self {
+            path,
+            host,
+            port,
+            transport_mode,
+            key_b64,
+            allow_mutation,
+            market,
+            strategy_id,
+            strategy_field,
+            wait,
+            connect_timeout,
+            candles_timeout,
+            high_loss_timeout,
+            disconnect_timeout,
+            reconnect_timeout,
+        }
+    }
+}
+
+fn strip_quotes(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value)
+}
+
+fn parse_server(server: &str) -> (String, u16) {
+    let Some((host, port)) = server.rsplit_once(':') else {
+        panic!("bad server value `{server}`, expected host:port");
+    };
+    let port = port
+        .parse::<u16>()
+        .unwrap_or_else(|_| panic!("bad server port in `{server}`"));
+    (host.to_string(), port)
+}
+
+fn parse_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "y" | "on"
+    )
+}
+
+fn parse_u64(value: Option<&str>, default: u64) -> u64 {
+    value
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.parse::<u64>().unwrap_or_else(|_| panic!("bad u64: {v}")))
+        .unwrap_or(default)
+}
+
+#[derive(Clone, Debug, Default)]
+struct CandlesSnapshotSummary {
+    uid: u64,
+    zipped_bytes: usize,
+    markets: usize,
+    candles: usize,
+    market_preview: String,
+}
+
+impl CandlesSnapshotSummary {
+    fn is_healthy(&self) -> bool {
+        self.markets > 0 && self.candles > 0
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "uid={} zipped={} markets={} candles={} preview=[{}]",
+            self.uid, self.zipped_bytes, self.markets, self.candles, self.market_preview
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MarketProbePrice {
+    bid: f64,
+    ask: f64,
+    mark_price: f64,
+    mark_price_found: bool,
+}
+
+impl From<&MarketPrice> for MarketProbePrice {
+    fn from(value: &MarketPrice) -> Self {
+        Self {
+            bid: value.bid,
+            ask: value.ask,
+            mark_price: value.mark_price,
+            mark_price_found: value.mark_price_found,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeStateProbe {
+    is_started: bool,
+    auto_detect_active: bool,
+}
+
+impl From<moonproto::RuntimeStateCommand> for RuntimeStateProbe {
+    fn from(value: moonproto::RuntimeStateCommand) -> Self {
+        Self {
+            is_started: value.is_started,
+            auto_detect_active: value.auto_detect_active,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KernelLicenseProbe {
+    paid_version: bool,
+    reg_id: i32,
+    order_count: i32,
+    moon_credits: i32,
+    moon_credits_hold: i32,
+    moon_credits_auction: i32,
+    arb_active: bool,
+    can_use_watcher: bool,
+    news_valid_until: Option<MoonTime>,
+    arb_valid_seen: bool,
+}
+
+impl KernelLicenseProbe {
+    fn news_service_active(self, now: MoonTime) -> bool {
+        news_service_active(self.news_valid_until, now)
+    }
+}
+
+fn news_service_active(news_valid_until: Option<MoonTime>, now: MoonTime) -> bool {
+    news_valid_until.is_some_and(|until| until > now)
+}
+
+impl From<moonproto::KernelLicenseStateCommand> for KernelLicenseProbe {
+    fn from(value: moonproto::KernelLicenseStateCommand) -> Self {
+        Self {
+            paid_version: value.paid_version,
+            reg_id: value.reg_id,
+            order_count: value.order_count,
+            moon_credits: value.moon_credits,
+            moon_credits_hold: value.moon_credits_hold,
+            moon_credits_auction: value.moon_credits_auction,
+            arb_active: value.arb_active,
+            can_use_watcher: value.can_use_watcher,
+            news_valid_until: value.news_valid_until,
+            arb_valid_seen: value.arb_valid_until.is_some(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SessionStats {
+    problems_snapshots: u64,
+    problem_notifications: u64,
+    label: String,
+    market: String,
+    market_index: Option<u16>,
+    connected_now: bool,
+    server_events: u64,
+    connected_fresh: u64,
+    connected_again: u64,
+    reconnecting: u64,
+    disconnected: u64,
+    engine_responses: u64,
+    engine_method_counts: HashMap<u8, u64>,
+    raw_events: u64,
+    server_logs: u64,
+    settings_events: u64,
+    lev_manage_events: u64,
+    runtime_state_events: u64,
+    runtime_state: Option<RuntimeStateProbe>,
+    kernel_license_state_events: u64,
+    kernel_license_state: Option<KernelLicenseProbe>,
+    profit_state_events: u64,
+    profit_state: Option<ProfitStateCommand>,
+    hyperliquid_request_limit_events: u64,
+    hyperliquid_requests_left: Option<u64>,
+    kernel_health_events: u64,
+    kernel_health: Option<KernelHealth>,
+    news_history_events: u64,
+    news_history_count: usize,
+    news_history_tags_seen: bool,
+    news_live_events: u64,
+    news_tags_events: u64,
+    news_snapshot_count: usize,
+    news_tags_present: bool,
+    strategy_events: u64,
+    strategy_snapshot_events: u64,
+    strategy_schema_events: u64,
+    strategy_schema_fields: usize,
+    strategy_schema_kinds: usize,
+    strategy_runtime_events: u64,
+    strategies_running: Option<bool>,
+    market_events: u64,
+    trades_apply: u64,
+    target_trade_packets: u64,
+    orderbook_apply: u64,
+    target_orderbook_full: u64,
+    target_orderbook_update: u64,
+    last_trade_price: Option<f64>,
+    last_book_bid: Option<f64>,
+    last_book_ask: Option<f64>,
+    last_book_kind: Option<u8>,
+    last_market_price: Option<MarketProbePrice>,
+    market_invariant_error: Option<String>,
+    order_events: u64,
+    order_event_kinds: HashMap<&'static str, u64>,
+    order_status_by_uid: HashMap<u64, OrderWorkerStatus>,
+    order_market_by_uid: HashMap<u64, String>,
+    order_sell_reason_by_uid: HashMap<u64, String>,
+    order_ignored_by_uid: HashMap<u64, ApplyResult>,
+    balance_events: u64,
+    balance_snapshot_events: u64,
+    balance_incremental_events: u64,
+    session_profit_events: u64,
+    session_profit_nonzero_count: usize,
+    transfer_asset_events: u64,
+    transfer_asset_updated_mask: u8,
+    transfer_asset_failures: u64,
+    transfer_asset_refresh_completed: u64,
+    coin_card_events: u64,
+    coin_card_updates: u64,
+    coin_card_failures: u64,
+    coin_card_last_count: usize,
+    parse_failed: u64,
+    parse_failures: Vec<ParseFailureRecord>,
+    candles_requested: bool,
+    candles_chunks: u64,
+    candles_ignored: u64,
+    candles_payload_bytes: usize,
+    candles_seen_chunks: Vec<bool>,
+    candles_last_progress: (usize, usize),
+    candles_complete: Option<CandlesSnapshotSummary>,
+    retained_candles_5m: usize,
+    retained_candles_5m_newest_age_s: Option<f64>,
+    candles_aggregator: CandlesAggregator,
+    last_settings: Option<ClientSettingsCommand>,
+    strategies_by_id: HashMap<u64, StrategySnapshot>,
+}
+
+impl Clone for SessionStats {
+    fn clone(&self) -> Self {
+        Self {
+            problems_snapshots: self.problems_snapshots,
+            problem_notifications: self.problem_notifications,
+            label: self.label.clone(),
+            market: self.market.clone(),
+            market_index: self.market_index,
+            connected_now: self.connected_now,
+            server_events: self.server_events,
+            connected_fresh: self.connected_fresh,
+            connected_again: self.connected_again,
+            reconnecting: self.reconnecting,
+            disconnected: self.disconnected,
+            engine_responses: self.engine_responses,
+            engine_method_counts: self.engine_method_counts.clone(),
+            raw_events: self.raw_events,
+            server_logs: self.server_logs,
+            settings_events: self.settings_events,
+            lev_manage_events: self.lev_manage_events,
+            runtime_state_events: self.runtime_state_events,
+            runtime_state: self.runtime_state,
+            kernel_license_state_events: self.kernel_license_state_events,
+            kernel_license_state: self.kernel_license_state,
+            profit_state_events: self.profit_state_events,
+            profit_state: self.profit_state,
+            hyperliquid_request_limit_events: self.hyperliquid_request_limit_events,
+            hyperliquid_requests_left: self.hyperliquid_requests_left,
+            kernel_health_events: self.kernel_health_events,
+            kernel_health: self.kernel_health,
+            news_history_events: self.news_history_events,
+            news_history_count: self.news_history_count,
+            news_history_tags_seen: self.news_history_tags_seen,
+            news_live_events: self.news_live_events,
+            news_tags_events: self.news_tags_events,
+            news_snapshot_count: self.news_snapshot_count,
+            news_tags_present: self.news_tags_present,
+            strategy_events: self.strategy_events,
+            strategy_snapshot_events: self.strategy_snapshot_events,
+            strategy_schema_events: self.strategy_schema_events,
+            strategy_schema_fields: self.strategy_schema_fields,
+            strategy_schema_kinds: self.strategy_schema_kinds,
+            strategy_runtime_events: self.strategy_runtime_events,
+            strategies_running: self.strategies_running,
+            market_events: self.market_events,
+            trades_apply: self.trades_apply,
+            target_trade_packets: self.target_trade_packets,
+            orderbook_apply: self.orderbook_apply,
+            target_orderbook_full: self.target_orderbook_full,
+            target_orderbook_update: self.target_orderbook_update,
+            last_trade_price: self.last_trade_price,
+            last_book_bid: self.last_book_bid,
+            last_book_ask: self.last_book_ask,
+            last_book_kind: self.last_book_kind,
+            last_market_price: self.last_market_price,
+            market_invariant_error: self.market_invariant_error.clone(),
+            order_events: self.order_events,
+            order_event_kinds: self.order_event_kinds.clone(),
+            order_status_by_uid: self.order_status_by_uid.clone(),
+            order_market_by_uid: self.order_market_by_uid.clone(),
+            order_sell_reason_by_uid: self.order_sell_reason_by_uid.clone(),
+            order_ignored_by_uid: self.order_ignored_by_uid.clone(),
+            balance_events: self.balance_events,
+            balance_snapshot_events: self.balance_snapshot_events,
+            balance_incremental_events: self.balance_incremental_events,
+            session_profit_events: self.session_profit_events,
+            session_profit_nonzero_count: self.session_profit_nonzero_count,
+            transfer_asset_events: self.transfer_asset_events,
+            transfer_asset_updated_mask: self.transfer_asset_updated_mask,
+            transfer_asset_failures: self.transfer_asset_failures,
+            transfer_asset_refresh_completed: self.transfer_asset_refresh_completed,
+            coin_card_events: self.coin_card_events,
+            coin_card_updates: self.coin_card_updates,
+            coin_card_failures: self.coin_card_failures,
+            coin_card_last_count: self.coin_card_last_count,
+            parse_failed: self.parse_failed,
+            parse_failures: self.parse_failures.clone(),
+            candles_requested: self.candles_requested,
+            candles_chunks: self.candles_chunks,
+            candles_ignored: self.candles_ignored,
+            candles_payload_bytes: self.candles_payload_bytes,
+            candles_seen_chunks: self.candles_seen_chunks.clone(),
+            candles_last_progress: self.candles_last_progress,
+            candles_complete: self.candles_complete.clone(),
+            retained_candles_5m: self.retained_candles_5m,
+            retained_candles_5m_newest_age_s: self.retained_candles_5m_newest_age_s,
+            candles_aggregator: CandlesAggregator::new(),
+            last_settings: self.last_settings.clone(),
+            strategies_by_id: self.strategies_by_id.clone(),
+        }
+    }
+}
+
+impl SessionStats {
+    fn engine_method_count(&self, method: EngineMethod) -> u64 {
+        self.engine_method_counts
+            .get(&(method.to_byte()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn summary(&self) -> String {
+        let parse_failed_detail = if self.parse_failures.is_empty() {
+            String::new()
+        } else {
+            let recent = self.parse_failures.iter().rev().take(4).collect::<Vec<_>>();
+            let mut parts = Vec::with_capacity(recent.len());
+            for pf in recent.iter().rev() {
+                parts.push(format!(
+                    "#{}:{:?}:len{}:{:016X}",
+                    pf.event_no, pf.cmd, pf.len, pf.hash
+                ));
+            }
+            format!(" [{}]", parts.join(","))
+        };
+        let candles = self
+            .candles_complete
+            .as_ref()
+            .map(CandlesSnapshotSummary::summary)
+            .unwrap_or_else(|| {
+                let missing = missing_chunk_indexes(&self.candles_seen_chunks);
+                format!(
+                    "incomplete chunks={} ignored={} payload_bytes={} progress={}/{} missing=[{}]",
+                    self.candles_chunks,
+                    self.candles_ignored,
+                    self.candles_payload_bytes,
+                    self.candles_last_progress.0,
+                    self.candles_last_progress.1,
+                    missing
+                )
+            });
+        let base = format!(
+            "connected_now={} fresh={} again={} reconnecting={} disconnected={} server_events={} engine={} raw={} logs={} settings={} lev_manage_events={} runtime_state_events={} runtime_state={:?} kernel_license_events={} kernel_license={:?} profit_state_events={} profit_state={:?} hl_limit_events={} hl_requests_left={:?} strats={} strat_snapshots={} schema_events={} schema_kinds={} schema_fields={} strat_runtime_events={} strategies_running={:?} strategy_rows={} markets={} trades={} target_trade_packets={} books={} target_book_full={} target_book_update={} market_probe=[{}] order_events={} balances={} session_profit_events={} session_profit_nonzero={} transfer_assets={} mask={:#05b} failures={} coin_card_events={} updates={} failures={} last_count={} parse_failed={}{} candles={} retained_candles_5m={} newest_age_s={:?}",
+            self.connected_now,
+            self.connected_fresh,
+            self.connected_again,
+            self.reconnecting,
+            self.disconnected,
+            self.server_events,
+            self.engine_responses,
+            self.raw_events,
+            self.server_logs,
+            self.settings_events,
+            self.lev_manage_events,
+            self.runtime_state_events,
+            self.runtime_state,
+            self.kernel_license_state_events,
+            self.kernel_license_state,
+            self.profit_state_events,
+            self.profit_state,
+            self.hyperliquid_request_limit_events,
+            self.hyperliquid_requests_left,
+            self.strategy_events,
+            self.strategy_snapshot_events,
+            self.strategy_schema_events,
+            self.strategy_schema_kinds,
+            self.strategy_schema_fields,
+            self.strategy_runtime_events,
+            self.strategies_running,
+            self.strategies_by_id.len(),
+            self.market_events,
+            self.trades_apply,
+            self.target_trade_packets,
+            self.orderbook_apply,
+            self.target_orderbook_full,
+            self.target_orderbook_update,
+            self.market_probe_summary(),
+            self.order_events,
+            self.balance_events,
+            self.session_profit_events,
+            self.session_profit_nonzero_count,
+            self.transfer_asset_events,
+            self.transfer_asset_updated_mask,
+            self.transfer_asset_failures,
+            self.coin_card_events,
+            self.coin_card_updates,
+            self.coin_card_failures,
+            self.coin_card_last_count,
+            self.parse_failed,
+            parse_failed_detail,
+            candles,
+            self.retained_candles_5m,
+            self.retained_candles_5m_newest_age_s,
+        );
+        format!(
+            "{base} kernel_health_events={} kernel_health={:?} news_history_events={} news_history_count={} news_history_tags={} news_live={} news_tags_events={} news_retained={} news_tags_present={}",
+            self.kernel_health_events,
+            self.kernel_health,
+            self.news_history_events,
+            self.news_history_count,
+            self.news_history_tags_seen,
+            self.news_live_events,
+            self.news_tags_events,
+            self.news_snapshot_count,
+            self.news_tags_present,
+        )
+    }
+
+    fn retained_candles_healthy(&self) -> bool {
+        self.retained_candles_5m > 0
+            && self
+                .retained_candles_5m_newest_age_s
+                .is_some_and(|age| age <= FIRETEST_RETAINED_CANDLE_MAX_AGE_SECS)
+    }
+
+    fn market_probe_summary(&self) -> String {
+        let market_price = self
+            .last_market_price
+            .map(|p| {
+                format!(
+                    "market_bid={:.8} market_ask={:.8} mark={:.8}/{}",
+                    p.bid, p.ask, p.mark_price, p.mark_price_found
+                )
+            })
+            .unwrap_or_else(|| "market_price=none".to_string());
+        format!(
+            "market={} idx={:?} book_kind={:?} bid={:?} ask={:?} trade={:?} {} err={}",
+            self.market,
+            self.market_index,
+            self.last_book_kind,
+            self.last_book_bid,
+            self.last_book_ask,
+            self.last_trade_price,
+            market_price,
+            self.market_invariant_error.as_deref().unwrap_or("none")
+        )
+    }
+}
+
+struct Session {
+    client: MoonClient,
+    latest_snapshot: Option<Arc<MoonStateSnapshot>>,
+    stats: Arc<Mutex<SessionStats>>,
+    parse_failure_correlations_logged: usize,
+    report_events: Vec<ReportEvent>,
+    market_history_events: Vec<MarketHistoryEvent>,
+    order_state_events: Option<Vec<FireTestOrderStateEvent>>,
+    candle_tf_state_events: Vec<moonproto::CandleTimeframeStateEvent>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FireTestOrderStateEventKind {
+    Created,
+    Updated,
+    Removed,
+}
+
+#[derive(Clone, Debug)]
+struct FireTestOrderStateEvent {
+    kind: FireTestOrderStateEventKind,
+    uid: u64,
+    status: OrderWorkerStatus,
+    buy_actual_price: f64,
+    buy_mean_price: f64,
+    sell_actual_price: f64,
+    sell_mean_price: f64,
+    pending_buy_cond_price: Option<f64>,
+    bulk_replace_buy: bool,
+    bulk_replace_sell: bool,
+    panic_sell: bool,
+    job_is_done: bool,
+}
+
+impl FireTestOrderStateEvent {
+    fn from_event(event: &OrderEvent) -> Option<Self> {
+        let (kind, order) = match event {
+            OrderEvent::Created(order) => (FireTestOrderStateEventKind::Created, order.as_ref()),
+            OrderEvent::Updated(order) => (FireTestOrderStateEventKind::Updated, order.as_ref()),
+            OrderEvent::Removed(order) => (FireTestOrderStateEventKind::Removed, order.as_ref()),
+            _ => return None,
+        };
+        Some(Self {
+            kind,
+            uid: order.uid,
+            status: order.status,
+            buy_actual_price: order.buy_order.actual_price,
+            buy_mean_price: order.buy_order.mean_price,
+            sell_actual_price: order.sell_order.actual_price,
+            sell_mean_price: order.sell_order.mean_price,
+            pending_buy_cond_price: order.pending_buy_cond_price,
+            bulk_replace_buy: order.bulk_replace_buy,
+            bulk_replace_sell: order.bulk_replace_sell,
+            panic_sell: order.panic_sell,
+            job_is_done: order.job_is_done,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FireTestClosedOrderProbe {
+    server_uid: u64,
+    market: String,
+    buy_price: f64,
+    bought_q: f64,
+}
+
+impl Session {
+    fn connect(
+        label: &str,
+        cfg: &FireConfig,
+        keys: ImportedKeys,
+        provided_strategy: Option<StrategySnapshot>,
+    ) -> Self {
+        Self::connect_with_market_history(
+            label,
+            cfg,
+            keys,
+            provided_strategy,
+            MarketHistorySizing::default(),
+        )
+    }
+
+    fn connect_with_market_history(
+        label: &str,
+        cfg: &FireConfig,
+        keys: ImportedKeys,
+        provided_strategy: Option<StrategySnapshot>,
+        market_history: MarketHistorySizing,
+    ) -> Self {
+        let stats = Arc::new(Mutex::new(SessionStats {
+            label: label.to_string(),
+            market: cfg.market.clone(),
+            ..Default::default()
+        }));
+        let initial_strategies: Vec<_> = provided_strategy.iter().cloned().collect();
+        if let Some(strategy) = provided_strategy.as_ref() {
+            println!(
+                "FIRETEST {label}: local strategy snapshot seeded id={} ver={} last_date={}",
+                strategy.strategy_id, strategy.strategy_ver, strategy.last_date
+            );
+        }
+
+        let retained_markets = firetest_retained_markets(cfg);
+        let init = InitConfig {
+            subscribe_trades: None,
+            subscribe_orderbooks: vec![cfg.market.clone()],
+            step_timeout: None,
+            initial_strategies: Some(InitialStrategies::new(0, initial_strategies)),
+        };
+
+        println!(
+            "FIRETEST {label}: connecting to {}:{} market={}",
+            cfg.host, cfg.port, cfg.market
+        );
+        let client = MoonClient::connect(
+            ClientConfig::new(&cfg.host, cfg.port, keys.master_key, keys.mac_key)
+                .with_transport_mode(cfg.transport_mode)
+                .with_client_id(rand::random())
+                .with_market_history(market_history),
+            ConnectConfig::new(init).with_connect_timeout(cfg.connect_timeout),
+        )
+        .unwrap_or_else(|err| panic!("FIRETEST {label}: MoonClient connect failed: {err}"));
+        client
+            .streams()
+            .subscribe_trades_for(TradesStreamMode::TradesOnly, retained_markets.iter())
+            .unwrap_or_else(|err| {
+                panic!("FIRETEST {label}: scoped trades subscription failed: {err}")
+            });
+        println!(
+            "FIRETEST {label}: retained trades scope={}",
+            retained_markets.join(",")
+        );
+
+        let mut session = Self {
+            client,
+            latest_snapshot: None,
+            stats,
+            parse_failure_correlations_logged: 0,
+            report_events: Vec::new(),
+            market_history_events: Vec::new(),
+            order_state_events: None,
+            candle_tf_state_events: Vec::new(),
+        };
+        assert!(
+            pump_session_until(&mut session, cfg.connect_timeout, "connect ready", |s| {
+                let st = s.snapshot();
+                st.connected_now && st.connected_fresh > 0 && s.latest_snapshot.is_some()
+            }),
+            "FIRETEST {label}: MoonClient did not connect within {:?}",
+            cfg.connect_timeout
+        );
+        session
+    }
+
+    fn pump(&mut self, duration: Duration) {
+        self.drain_queued();
+        if !duration.is_zero() {
+            std::thread::sleep(duration);
+        }
+        self.log_new_parse_failure_correlations("immediate");
+        self.drain_queued();
+        self.refresh_stats_from_dispatcher(false);
+    }
+
+    fn drain_queued(&mut self) {
+        let mut lifecycle = Vec::new();
+        self.client.drain_lifecycle_events_into(&mut lifecycle);
+        for event in lifecycle {
+            self.record_lifecycle_event(event);
+        }
+
+        if let Some(snapshot) = self.client.snapshot() {
+            self.latest_snapshot = Some(snapshot);
+        }
+        let snapshot = self.latest_snapshot.clone();
+
+        let mut events = Vec::new();
+        self.client.drain_events_into(&mut events);
+        for event in events {
+            if let Event::Report(report) = &event {
+                self.report_events.push(report.clone());
+            }
+            if let Event::MarketHistory(history) = &event {
+                self.market_history_events.push(history.clone());
+            }
+            if let Event::Order(order) = &event {
+                if let (Some(captured), Some(state)) = (
+                    self.order_state_events.as_mut(),
+                    FireTestOrderStateEvent::from_event(order),
+                ) {
+                    captured.push(state);
+                }
+            }
+            if let Event::CandleTimeframeState(state) = &event {
+                self.candle_tf_state_events.push(state.clone());
+            }
+            record_event(&self.stats, &event, snapshot.as_deref(), None);
+        }
+    }
+
+    fn take_report_events(&mut self) -> Vec<ReportEvent> {
+        std::mem::take(&mut self.report_events)
+    }
+
+    fn take_market_history_events(&mut self) -> Vec<MarketHistoryEvent> {
+        std::mem::take(&mut self.market_history_events)
+    }
+
+    fn begin_order_state_capture(&mut self) {
+        self.order_state_events = Some(Vec::new());
+    }
+
+    fn end_order_state_capture(&mut self) {
+        self.order_state_events = None;
+    }
+
+    fn order_state_event_count(&self) -> usize {
+        self.order_state_events.as_ref().map_or(0, Vec::len)
+    }
+
+    fn captured_order_states(&self) -> &[FireTestOrderStateEvent] {
+        self.order_state_events.as_deref().unwrap_or_default()
+    }
+
+    fn record_lifecycle_event(&self, event: LifecycleEvent) {
+        let mut st = self.stats.lock().unwrap();
+        match event {
+            LifecycleEvent::Connected { fresh: true } => {
+                st.connected_now = true;
+                st.connected_fresh += 1;
+            }
+            LifecycleEvent::Connected { fresh: false } => {
+                st.connected_now = true;
+                st.connected_again += 1;
+            }
+            LifecycleEvent::Reconnecting => {
+                st.connected_now = false;
+                st.reconnecting += 1;
+            }
+            LifecycleEvent::Disconnected => {
+                st.connected_now = false;
+                st.disconnected += 1;
+            }
+            LifecycleEvent::ConnectFailed { error } => {
+                panic!("FIRETEST {}: MoonClient connect failed: {error}", st.label);
+            }
+            _ => {}
+        }
+        println!("LIFECYCLE->{}: {event:?}", st.label);
+    }
+
+    fn log_new_parse_failure_correlations(&mut self, label: &str) {
+        let (session_label, records, total) = {
+            let st = self.stats.lock().unwrap();
+            let records = st
+                .parse_failures
+                .iter()
+                .skip(self.parse_failure_correlations_logged)
+                .cloned()
+                .collect::<Vec<_>>();
+            (st.label.clone(), records, st.parse_failures.len())
+        };
+        if records.is_empty() {
+            return;
+        }
+        let diag = self.client.err_emu_diagnostics_snapshot();
+        log_parse_failure_correlations(label, &session_label, &diag, &records);
+        self.parse_failure_correlations_logged = total;
+    }
+
+    fn request_transfer_assets_refresh(&mut self) {
+        self.client
+            .balances()
+            .refresh_transfer_assets()
+            .expect("MoonClient refresh_transfer_assets must queue");
+        println!(
+            "FIRETEST transfer assets refresh queued kinds=[{}]",
+            ExchangeKind::ALL
+                .into_iter()
+                .map(ExchangeKind::name)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+
+    fn request_coin_card_candles(&mut self, market: &str, kind: DeepHistoryKind) {
+        let snapshot = self.state_snapshot();
+        let handle = snapshot.markets().get(market).unwrap_or_else(|| {
+            panic!("MoonClient request_coin_card_candles market not found: {market}")
+        });
+        self.client
+            .candles()
+            .request_coin_card_for(&handle, kind)
+            .expect("MoonClient request_coin_card_candles must queue");
+        println!(
+            "FIRETEST non-blocking CoinCard candles queued market={} kind={kind:?}",
+            market
+        );
+    }
+
+    fn coin_card_candles_count(&self, market: &str, kind: DeepHistoryKind) -> usize {
+        self.latest_snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                let handle = snapshot.markets().get(market)?;
+                snapshot.coin_card_candles_for(&handle, kind)
+            })
+            .map(|rows| rows.len())
+            .unwrap_or(0)
+    }
+
+    fn state_snapshot(&self) -> Arc<MoonStateSnapshot> {
+        self.latest_snapshot.as_ref().cloned().unwrap_or_else(|| {
+            self.client
+                .snapshot()
+                .expect("MoonClient snapshot is not ready")
+        })
+    }
+
+    fn maybe_state_snapshot(&self) -> Option<Arc<MoonStateSnapshot>> {
+        self.latest_snapshot
+            .as_ref()
+            .cloned()
+            .or_else(|| self.client.snapshot())
+    }
+
+    fn assert_coin_card_candles_healthy(&self, market: &str, kind: DeepHistoryKind) {
+        let count = self.coin_card_candles_count(market, kind);
+        assert!(
+            count >= FIRETEST_MIN_COIN_CARD_CANDLES,
+            "FireTest non-blocking CoinCard candles returned too few rows for {market} {kind:?}: got {count}, expected at least {}",
+            FIRETEST_MIN_COIN_CARD_CANDLES
+        );
+        println!(
+            "OK: non-blocking CoinCard candles market={} kind={kind:?} count={}",
+            market, count
+        );
+    }
+
+    fn refresh_stats_from_dispatcher(&self, log_changes: bool) {
+        let Some(snapshot) = self.maybe_state_snapshot() else {
+            return;
+        };
+        let mut st = self.stats.lock().unwrap();
+        let event_no = st.server_events;
+        sync_market_probe_from_dispatcher(&mut st, event_no, snapshot.as_ref(), log_changes);
+        record_order_state_snapshot(&mut st, snapshot.as_ref());
+        let target_market = st.market.clone();
+
+        if let Some(settings) = snapshot.settings().client_settings.clone() {
+            st.last_settings = Some(settings);
+        }
+        st.runtime_state = snapshot
+            .settings()
+            .runtime_state
+            .map(RuntimeStateProbe::from);
+        st.kernel_license_state = snapshot
+            .settings()
+            .kernel_license_state
+            .map(KernelLicenseProbe::from);
+        st.profit_state = snapshot.settings().profit_state;
+        st.hyperliquid_requests_left = snapshot.settings().hyperliquid_requests_left;
+        let health = snapshot.kernel_health();
+        if health != KernelHealth::default() {
+            st.kernel_health = Some(health);
+        }
+        st.news_snapshot_count = snapshot.news().len();
+        st.news_tags_present = snapshot.news().tags_json().is_some();
+        st.strategies_running = snapshot.strats().strategies_running();
+        if let Some(state) = snapshot.markets().trade_state(&st.market) {
+            if state.last_trade_price > 0.0 {
+                st.last_trade_price = Some(state.last_trade_price);
+                st.target_trade_packets = st.target_trade_packets.max(st.trades_apply);
+            }
+        }
+        if let (Some(market), Some(book_kind)) =
+            (snapshot.markets().get(&st.market), st.last_book_kind)
+        {
+            if let Some(kind) = OrderBookKind::from_u8(book_kind) {
+                if let Some(top) = snapshot.top_of_book_for(&market, kind) {
+                    if let (Some(bid), Some(ask)) = (top.bid, top.ask) {
+                        st.last_book_bid = Some(bid.rate);
+                        st.last_book_ask = Some(ask.rate);
+                    }
+                }
+            }
+        }
+        if let Some(market) = snapshot.markets().get(&target_market) {
+            if let Some(readers) = snapshot.market_history_readers_for(&market) {
+                if let Some(reader) = readers.candles_5m.as_ref() {
+                    st.retained_candles_5m = reader.bounds().len;
+                    let mut newest = Vec::new();
+                    reader.copy_last(1, &mut newest);
+                    st.retained_candles_5m_newest_age_s = newest
+                        .last()
+                        .map(|row| moon_time_abs_age_s(moon_now_for_test(), row.time()));
+                }
+            }
+        }
+    }
+
+    fn snapshot(&self) -> SessionStats {
+        self.stats.lock().unwrap().clone()
+    }
+
+    fn protocol_summary(&self) -> String {
+        let m = self.client.protocol_metrics_snapshot();
+        let profile = protocol_profile_summary(&m);
+        let market_apply = self
+            .maybe_state_snapshot()
+            .as_ref()
+            .and_then(|snapshot| snapshot.markets().last_markets_list_apply_timing())
+            .map(|t| {
+                format!(
+                    " get_markets_list_apply(total={}us markets={}us index={}us corr={}us ref={}us payload={} markets={} corr={})",
+                    t.total_ns / 1_000,
+                    t.market_loop_ns / 1_000,
+                    t.index_rebuild_ns / 1_000,
+                    t.corr_loop_ns / 1_000,
+                    t.ref_passes_ns / 1_000,
+                    t.payload_len,
+                    t.market_count,
+                    t.corr_count
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "recv={} pmtu={} reader_cpu(avg/max={}us/{}us max_src={} >100us/>1ms/>5ms={}/{}/{}) reader_thread_cpu(avg/max={}us/{}us max_src={} >100us/>1ms/>5ms={}/{}/{}) reader_thread_cycles(avg/max={}/{} max_src={}) reader_wait(count={} avg/max={}us/{}us max_src={}) writer_cpu(avg/max={}us/{}us >100us/>1ms/>5ms={}/{}/{}) writer_thread_cpu(avg/max={}us/{}us >100us/>1ms/>5ms={}/{}/{}) writer_thread_cycles(avg/max={}/{}) active_dispatch(avg/max={}us/{}us max_src={} events={} actions={} >100us/>1ms/>5ms={}/{}/{} thread_cpu(avg/max={}us/{}us >100us/>1ms/>5ms={}/{}/{}) thread_cycles(avg/max={}/{})) app_enqueue(avg/max={}us/{}us max_src={} events={} mode={} >100us/>1ms/>5ms={}/{}/{}) writer_tick_wall(count={} avg/max={}us/{}us) send_max={}us public_events={}{}{}",
+            m.recv_count,
+            m.last_pmtu,
+            avg_us(m.reader_protocol_ns, m.reader_protocol_count),
+            m.reader_protocol_max_ns / 1_000,
+            metric_cmd_label(
+                m.reader_protocol_max_cmd,
+                u8::MAX,
+                m.reader_protocol_max_payload_len
+            ),
+            m.reader_protocol_over_100us,
+            m.reader_protocol_over_1ms,
+            m.reader_protocol_over_5ms,
+            avg_us(m.reader_thread_cpu_ns, m.reader_thread_cpu_count),
+            m.reader_thread_cpu_max_ns / 1_000,
+            metric_cmd_label(
+                m.reader_thread_cpu_max_cmd,
+                u8::MAX,
+                m.reader_thread_cpu_max_payload_len
+            ),
+            m.reader_thread_cpu_over_100us,
+            m.reader_thread_cpu_over_1ms,
+            m.reader_thread_cpu_over_5ms,
+            avg_units(m.reader_thread_cycles_total, m.reader_thread_cycles_count),
+            m.reader_thread_cycles_max,
+            metric_cmd_label(
+                m.reader_thread_cycles_max_cmd,
+                u8::MAX,
+                m.reader_thread_cycles_max_payload_len
+            ),
+            m.reader_protocol_wait_count,
+            avg_us(m.reader_protocol_wait_ns, m.reader_protocol_wait_count),
+            m.reader_protocol_wait_max_ns / 1_000,
+            metric_cmd_label(
+                m.reader_protocol_wait_max_cmd,
+                u8::MAX,
+                m.reader_protocol_wait_max_payload_len
+            ),
+            avg_us(m.writer_cpu_ns, m.writer_cpu_count),
+            m.writer_cpu_max_ns / 1_000,
+            m.writer_cpu_over_100us,
+            m.writer_cpu_over_1ms,
+            m.writer_cpu_over_5ms,
+            avg_us(m.writer_thread_cpu_ns, m.writer_thread_cpu_count),
+            m.writer_thread_cpu_max_ns / 1_000,
+            m.writer_thread_cpu_over_100us,
+            m.writer_thread_cpu_over_1ms,
+            m.writer_thread_cpu_over_5ms,
+            avg_units(m.writer_thread_cycles_total, m.writer_thread_cycles_count),
+            m.writer_thread_cycles_max,
+            avg_us(m.active_dispatch_ns, m.active_dispatch_count),
+            m.active_dispatch_max_ns / 1_000,
+            metric_cmd_label(
+                m.active_dispatch_max_cmd,
+                m.active_dispatch_max_api_method,
+                m.active_dispatch_max_payload_len
+            ),
+            m.active_dispatch_max_events,
+            m.active_dispatch_max_actions,
+            m.active_dispatch_over_100us,
+            m.active_dispatch_over_1ms,
+            m.active_dispatch_over_5ms,
+            avg_us(
+                m.active_dispatch_thread_cpu_ns,
+                m.active_dispatch_thread_cpu_count
+            ),
+            m.active_dispatch_thread_cpu_max_ns / 1_000,
+            m.active_dispatch_thread_cpu_over_100us,
+            m.active_dispatch_thread_cpu_over_1ms,
+            m.active_dispatch_thread_cpu_over_5ms,
+            avg_units(
+                m.active_dispatch_thread_cycles_total,
+                m.active_dispatch_thread_cycles_count
+            ),
+            m.active_dispatch_thread_cycles_max,
+            avg_us(m.app_enqueue_ns, m.app_enqueue_count),
+            m.app_enqueue_max_ns / 1_000,
+            metric_cmd_label(
+                m.app_enqueue_max_cmd,
+                m.app_enqueue_max_api_method,
+                m.app_enqueue_max_payload_len
+            ),
+            m.app_enqueue_max_events,
+            metric_app_mode_label(m.app_enqueue_max_mode),
+            m.app_enqueue_over_100us,
+            m.app_enqueue_over_1ms,
+            m.app_enqueue_over_5ms,
+            m.writer_tick_count,
+            avg_us(m.writer_tick_ns, m.writer_tick_count),
+            m.writer_tick_max_ns / 1_000,
+            m.send_phase_max_ns / 1_000,
+            m.public_event_queue_len,
+            profile,
+            market_apply
+        )
+    }
+
+    fn emit_active_lib_report(&mut self, profile: FireProfile, started_at: Instant) {
+        self.drain_queued();
+        let now_time = moon_now_for_test();
+        self.refresh_stats_from_dispatcher(false);
+
+        let snapshot = self.state_snapshot();
+        let st = self.snapshot();
+        let elapsed = started_at.elapsed().as_secs_f64();
+        let update_count = st.engine_method_count(EngineMethod::UpdateMarketsList);
+        println!(
+            "FIRETEST ActiveLib report profile={} session={} elapsed={:.2}s update_markets={} balance_events={} snapshots={} increments={} orders_seen={} current_orders={} order_event_kinds=[{}]",
+            profile.as_str(),
+            st.label,
+            elapsed,
+            update_count,
+            st.balance_events,
+            st.balance_snapshot_events,
+            st.balance_incremental_events,
+            st.order_status_by_uid.len(),
+            snapshot.orders().len(),
+            format_count_map(&st.order_event_kinds),
+        );
+
+        for market in ACTIVE_LIB_REPORT_MARKETS {
+            self.emit_active_lib_market_report(profile, snapshot.as_ref(), market, now_time);
+        }
+        self.emit_balance_asset_report(snapshot.as_ref());
+        self.emit_order_report(snapshot.as_ref(), &st);
+    }
+
+    fn emit_active_lib_market_report(
+        &self,
+        profile: FireProfile,
+        snapshot: &MoonStateSnapshot,
+        market: &str,
+        now_time: MoonTime,
+    ) {
+        let Some(handle) = snapshot.markets().get(market) else {
+            println!("FIRETEST ActiveLib market={market}: market handle not found");
+            return;
+        };
+        let Some(readers) = snapshot.market_history_readers_for(&handle) else {
+            println!(
+                "FIRETEST ActiveLib market={market}: no retained readers; reason=market not retained by trades storage scope"
+            );
+            return;
+        };
+
+        let mut last_prices = Vec::new();
+        if let Some(reader) = readers.last_prices.as_ref() {
+            reader.copy_last(reader.capacity(), &mut last_prices);
+        }
+        let mut mark_prices = Vec::new();
+        if let Some(reader) = readers.mark_prices.as_ref() {
+            reader.copy_last(reader.capacity(), &mut mark_prices);
+        }
+        let mut futures_25 = Vec::new();
+        let mut futures_60 = Vec::new();
+        let mut futures_all = Vec::new();
+        if let Some(reader) = readers.futures_trades.as_ref() {
+            reader.copy_last(reader.capacity(), &mut futures_all);
+            let from_25 = moon_time_saturating_sub_ms(now_time, 25_000);
+            let from_60 = moon_time_saturating_sub_ms(now_time, 60_000);
+            let to_time = moon_time_saturating_add_ms(now_time, 1_000);
+            reader.copy_time_range(from_25, to_time, reader.capacity(), &mut futures_25);
+            reader.copy_time_range(from_60, to_time, reader.capacity(), &mut futures_60);
+        }
+        let mut spot_all = Vec::new();
+        if let Some(reader) = readers.spot_trades.as_ref() {
+            reader.copy_last(reader.capacity(), &mut spot_all);
+        }
+
+        let last_stats = price_line_stats(last_prices.iter().map(|p| (p.time(), p.price())));
+        let mark_stats = price_line_stats(mark_prices.iter().map(|p| (p.time(), p.price())));
+        let last_delta_1m = price_delta_for_window(
+            last_prices.iter().map(|p| (p.time(), p.price())),
+            now_time,
+            60.0,
+        );
+        let last_delta_1h = price_delta_for_window(
+            last_prices.iter().map(|p| (p.time(), p.price())),
+            now_time,
+            3600.0,
+        );
+        let mark_delta_1m = price_delta_for_window(
+            mark_prices.iter().map(|p| (p.time(), p.price())),
+            now_time,
+            60.0,
+        );
+        let manual_25 = trade_volume(&futures_25);
+        let manual_60 = trade_volume(&futures_60);
+        let derived = snapshot.market_history_derived_snapshot_for(&handle, now_time);
+        let price = Some(handle.price());
+        let balance = Some(handle.balance_position());
+        let (max_order_value, max_pos_limit, max_qty, last_ask) = handle.with(|m| {
+            (
+                m.max_order_value(),
+                m.max_pos_limit(),
+                m.max_qty(),
+                m.price.last_ask,
+            )
+        });
+        let lev_default_max_pos = snapshot
+            .settings()
+            .lev_manage
+            .as_ref()
+            .map(|lev| lev.default_max_pos_limit());
+
+        println!(
+            "FIRETEST ActiveLib market={market} LastPrice count={} expected_by_updates~{} span={:.2}s expected_by_2s_span~{} min={:.8} max={:.8} delta_all={:.4}% delta_1m={:.4}% delta_1h={:.4}% values=[{}]",
+            last_stats.count,
+            self.snapshot().engine_method_count(EngineMethod::UpdateMarketsList),
+            last_stats.span_secs,
+            expected_price_points_for_span(last_stats),
+            last_stats.min,
+            last_stats.max,
+            last_stats.delta_percent,
+            last_delta_1m,
+            last_delta_1h,
+            format_last_price_values(&last_prices),
+        );
+        println!(
+            "FIRETEST ActiveLib market={market} MarkPrice count={} span={:.2}s expected_by_2s_span~{} min={:.8} max={:.8} delta_all={:.4}% delta_1m={:.4}% values=[{}]",
+            mark_stats.count,
+            mark_stats.span_secs,
+            expected_price_points_for_span(mark_stats),
+            mark_stats.min,
+            mark_stats.max,
+            mark_stats.delta_percent,
+            mark_delta_1m,
+            format_mark_price_values(&mark_prices),
+        );
+
+        if let (Some(last), Some(mark)) = (last_prices.last(), mark_prices.last()) {
+            let rel = rel_diff(f64::from(last.price()), f64::from(mark.price()));
+            println!(
+                "FIRETEST ActiveLib market={market} LastPrice_vs_MarkPrice last={:.8} mark={:.8} rel_diff={:.4}%",
+                last.price(),
+                mark.price(),
+                rel * 100.0
+            );
+            assert!(
+                rel <= PRICE_NEIGHBORHOOD_PCT,
+                "ActiveLib {market}: MarkPrice diverged from LastPrice by {:.4}%",
+                rel * 100.0
+            );
+        }
+
+        let Some(derived) = derived else {
+            panic!("ActiveLib {market}: missing derived snapshot");
+        };
+        println!(
+            "FIRETEST ActiveLib market={market} trades retained futures={} spot={} manual_vol_25s={:.4} manual_vol_60s={:.4} active_vol_1m={:.4} active_vol_3m={:.4} active_vol_5m={:.4}",
+            futures_all.len(),
+            spot_all.len(),
+            manual_25,
+            manual_60,
+            derived.trade_volumes.one_minute.total_value(),
+            derived.trade_volumes.three_minutes.total_value(),
+            derived.trade_volumes.five_minutes.total_value(),
+        );
+        println!(
+            "FIRETEST ActiveLib market={market} deltas trade(1m={:.4}% 5m={:.4}%) last_price(1m={:.4}% 5m={:.4}% 15m={:.4}% 30m={:.4}% 1h={:.4}%) candle(5m={:.4}% 15m={:.4}% 30m={:.4}% 1h={:.4}% 2h={:.4}% 3h={:.4}% 24h={:.4}% 72h={:.4}%) combined(1m={:.4}% 5m={:.4}% 15m={:.4}% 30m={:.4}% 1h={:.4}% 2h={:.4}% 3h={:.4}% 24h={:.4}% 72h={:.4}%)",
+            derived.trade_deltas.one_minute,
+            derived.trade_deltas.five_minutes,
+            derived.last_price_deltas.one_minute,
+            derived.last_price_deltas.five_minutes,
+            derived.last_price_deltas.fifteen_minutes,
+            derived.last_price_deltas.thirty_minutes,
+            derived.last_price_deltas.one_hour,
+            derived.candle_deltas.five_minutes,
+            derived.candle_deltas.fifteen_minutes,
+            derived.candle_deltas.thirty_minutes,
+            derived.candle_deltas.one_hour,
+            derived.candle_deltas.two_hours,
+            derived.candle_deltas.three_hours,
+            derived.candle_deltas.twenty_four_hours,
+            derived.candle_deltas.seventy_two_hours,
+            derived.deltas.one_minute,
+            derived.deltas.five_minutes,
+            derived.deltas.fifteen_minutes,
+            derived.deltas.thirty_minutes,
+            derived.deltas.one_hour,
+            derived.deltas.two_hours,
+            derived.deltas.three_hours,
+            derived.deltas.twenty_four_hours,
+            derived.deltas.seventy_two_hours,
+        );
+        println!(
+            "FIRETEST ActiveLib market={market} volumes candle(5m={:.4} 15m={:.4} 30m={:.4} 1h={:.4} 2h={:.4} 3h={:.4} 24h={:.4} 72h={:.4}) trade_buy_sell_1m=({:.4}/{:.4}) trade_buy_sell_5m=({:.4}/{:.4})",
+            derived.candle_volumes.five_minutes,
+            derived.candle_volumes.fifteen_minutes,
+            derived.candle_volumes.thirty_minutes,
+            derived.candle_volumes.one_hour,
+            derived.candle_volumes.two_hours,
+            derived.candle_volumes.three_hours,
+            derived.candle_volumes.twenty_four_hours,
+            derived.candle_volumes.seventy_two_hours,
+            derived.trade_volumes.one_minute.buy_value,
+            derived.trade_volumes.one_minute.sell_value,
+            derived.trade_volumes.five_minutes.buy_value,
+            derived.trade_volumes.five_minutes.sell_value,
+        );
+
+        let zero_fields = active_lib_zero_fields(&derived, profile);
+        if !zero_fields.is_empty() {
+            let zero_reason = if zero_fields
+                .iter()
+                .all(|field| field.starts_with("trade_delta_"))
+            {
+                "expected: DeltasByTrades is disabled in the normal ActiveLib profile".to_string()
+            } else {
+                active_lib_zero_reason(profile, last_stats, futures_all.len())
+            };
+            println!(
+                "FIRETEST ActiveLib market={market} ZERO_FIELDS [{}] reason={zero_reason}",
+                zero_fields.join(",")
+            );
+        }
+
+        assert!(
+            last_stats.count > 0,
+            "ActiveLib {market}: LastPrice history is empty"
+        );
+        assert!(
+            mark_stats.count > 0,
+            "ActiveLib {market}: MarkPrice history is empty"
+        );
+        assert!(
+            last_stats.delta_percent <= 10.0,
+            "ActiveLib {market}: LastPrice delta looks insane: {:.4}%",
+            last_stats.delta_percent
+        );
+        assert!(
+            mark_stats.delta_percent <= 10.0,
+            "ActiveLib {market}: MarkPrice delta looks insane: {:.4}%",
+            mark_stats.delta_percent
+        );
+        assert!(
+            manual_25 <= manual_60 + EPS,
+            "ActiveLib {market}: manual 25s volume exceeds 60s volume: {manual_25} > {manual_60}"
+        );
+        if manual_60 > EPS {
+            assert!(
+                derived.trade_volumes.one_minute.total_value() > EPS,
+                "ActiveLib {market}: manual 60s trade volume is non-zero but active 1m volume is zero"
+            );
+        }
+
+        if let Some(price) = price {
+            let funding_time = price.funding_time();
+            let funding_hours =
+                (funding_time.unix_millis() - now_time.unix_millis()) as f64 / 3_600_000.0;
+            println!(
+                "FIRETEST ActiveLib market={market} funding_rate={:.8} funding_time_ms={} funding_hours_from_now={:.3} mark_current={:.8}/{} bid={:.8} ask={:.8}",
+                price.funding_rate,
+                funding_time.unix_millis(),
+                funding_hours,
+                price.mark_price,
+                price.mark_price_found,
+                price.bid,
+                price.ask,
+            );
+            assert!(
+                funding_time == MoonTime::ZERO || funding_hours.abs() <= 12.0,
+                "ActiveLib {market}: funding time is outside 12h window: {funding_hours:.3}h"
+            );
+        }
+        println!(
+            "FIRETEST ActiveLib market={market} market_table max_order_value={:.4} max_qty={:.8} last_ask={:.8} max_pos_limit={} lev_default_max_pos={:?}",
+            max_order_value, max_qty, last_ask, max_pos_limit, lev_default_max_pos
+        );
+        if max_qty > EPS && last_ask > EPS {
+            assert!(
+                max_order_value > EPS,
+                "ActiveLib {market}: Max.Order derived value is zero despite max_qty={max_qty} last_ask={last_ask}"
+            );
+        }
+        if let Some(balance) = balance {
+            println!(
+                "FIRETEST ActiveLib market={market} balance init={:.8} locked={:.8} pos_size={:.8} pos_price={:.8} liq={:.8} leverage={} asset={:.8}/{:.8} pnl={:.8} epoch={}",
+                balance.initial_balance,
+                balance.locked_balance,
+                balance.pos_size,
+                balance.pos_price,
+                balance.liq_price,
+                balance.leverage_x,
+                balance.asset_balance,
+                balance.asset_balance_full,
+                balance.total_profit(),
+                balance.last_balance_epoch,
+            );
+        }
+    }
+
+    fn emit_balance_asset_report(&self, snapshot: &MoonStateSnapshot) {
+        let balances = snapshot.balances();
+        println!(
+            "FIRETEST ActiveLib balances global btc_total={:.8} btc_locked={:.8} btc_full={:.8} special_coin={:.8} total_pnl={:.8} rows={}",
+            balances.global.btc_balance_total,
+            balances.global.btc_balance_locked,
+            balances.global.btc_balance_full,
+            balances.global.special_coin_balance,
+            balances.global.total_pnl,
+            snapshot.markets().market_count(),
+        );
+        assert!(
+            balances.global.btc_balance_total.abs()
+                + balances.global.btc_balance_full.abs()
+                + balances.global.special_coin_balance.abs()
+                > EPS,
+            "ActiveLib global balances are zero"
+        );
+
+        let mut assets = snapshot
+            .markets()
+            .iter()
+            .filter_map(|handle| {
+                handle.with(|market| {
+                    let amount = market
+                        .asset_balance_full
+                        .abs()
+                        .max(market.asset_balance.abs());
+                    (amount > EPS).then(|| {
+                        (
+                            market.bn_market_currency.clone(),
+                            market.bn_market_name.clone(),
+                            market.asset_balance,
+                            market.asset_balance_full,
+                        )
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        assets.sort_by(|a, b| b.3.abs().total_cmp(&a.3.abs()));
+        let preview = assets
+            .iter()
+            .take(12)
+            .map(|(asset, market, bal, full)| format!("{asset}:{market}:{bal:.8}/{full:.8}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "FIRETEST ActiveLib assets nonzero_count={} preview=[{}]",
+            assets.len(),
+            preview
+        );
+
+        let mut total_transfer_nonzero = 0usize;
+        for (kind, rows) in snapshot.transfer_assets().iter() {
+            let nonzero = rows
+                .iter()
+                .filter(|asset| asset.amount.abs().max(asset.total.abs()) > EPS)
+                .count();
+            total_transfer_nonzero += nonzero;
+            let preview = rows
+                .iter()
+                .take(16)
+                .map(|asset| format!("{}:{:.8}/{:.8}", asset.currency, asset.amount, asset.total))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "FIRETEST ActiveLib transfer_assets kind={} revision={} rows={} nonzero={} preview=[{}]",
+                kind.name(),
+                snapshot.transfer_assets().kind_revision(kind),
+                rows.len(),
+                nonzero,
+                preview
+            );
+            assert!(
+                snapshot.transfer_assets().kind_revision(kind) > 0,
+                "ActiveLib transfer assets for {} were not refreshed",
+                kind.name()
+            );
+        }
+        assert!(
+            total_transfer_nonzero > 0,
+            "ActiveLib transfer assets were refreshed but all amount/total values are zero"
+        );
+    }
+
+    fn emit_order_report(&self, snapshot: &MoonStateSnapshot, st: &SessionStats) {
+        let mut statuses = HashMap::<String, u64>::new();
+        for order in snapshot.orders().iter() {
+            *statuses.entry(format!("{:?}", order.status)).or_default() += 1;
+        }
+        println!(
+            "FIRETEST ActiveLib orders seen_total={} current={} statuses=[{}] events=[{}] markets_seen=[{}]",
+            st.order_status_by_uid.len(),
+            snapshot.orders().len(),
+            format_count_map(&statuses),
+            format_count_map(&st.order_event_kinds),
+            format_order_market_preview(st),
+        );
+    }
+
+    fn strategy_snapshot(&self, strategy_id: u64) -> Option<StrategySnapshot> {
+        self.maybe_state_snapshot()
+            .and_then(|snapshot| snapshot.strategy_snapshot(strategy_id).cloned())
+    }
+
+    fn sync_local_strategies(&mut self, strategies: &[StrategySnapshot]) {
+        self.client
+            .strategies()
+            .sync_local_strategies(strategies.to_vec())
+            .expect("MoonClient local strategies sync must queue");
+    }
+
+    fn send_new_order(
+        &mut self,
+        market: &str,
+        is_short: bool,
+        price: f64,
+        strat_id: u64,
+        order_size: f64,
+    ) -> u64 {
+        let ticket = self
+            .client
+            .trade()
+            .new_order(
+                moonproto::NewOrderParams::new(
+                    market,
+                    if is_short {
+                        moonproto::OrderSide::Short
+                    } else {
+                        moonproto::OrderSide::Long
+                    },
+                    price,
+                    order_size,
+                )
+                .with_strategy_id(strat_id),
+            )
+            .expect("MoonClient new_order must queue");
+        ticket.request_uid
+    }
+
+    fn send_new_pending_order(
+        &mut self,
+        market: &str,
+        is_short: bool,
+        trigger_price: f64,
+        order_size: f64,
+    ) -> u64 {
+        let ticket = self
+            .client
+            .trade()
+            .new_pending_order(moonproto::PendingOrderParams::new(
+                market,
+                if is_short {
+                    moonproto::OrderSide::Short
+                } else {
+                    moonproto::OrderSide::Long
+                },
+                trigger_price,
+                order_size,
+            ))
+            .expect("MoonClient new_pending_order must queue");
+        ticket.request_uid
+    }
+
+    fn replace_order(&mut self, uid: u64, new_price: f64) -> bool {
+        self.client.orders().move_order(uid, new_price).is_ok()
+    }
+
+    fn cancel_order(&mut self, uid: u64) -> bool {
+        self.client.orders().cancel(uid).is_ok()
+    }
+
+    fn panic_sell_order(&mut self, uid: u64, turn_on: bool) -> bool {
+        self.client.orders().turn_panic_sell(uid, turn_on).is_ok()
+    }
+
+    fn request_candles_snapshot(&mut self) {
+        let mut st = self.stats.lock().unwrap();
+        st.candles_requested = true;
+        println!(
+            "FIRETEST {}: full candles snapshot is maintained by MoonClient after trades subscription",
+            st.label
+        );
+    }
+}
+
+fn firetest_retained_markets(cfg: &FireConfig) -> Vec<String> {
+    let mut markets = Vec::with_capacity(3);
+    for market in [
+        cfg.market.as_str(),
+        FIRETEST_MOONSHOT_MARKET,
+        FIRETEST_REAL_BALANCE_ORDER_MARKET,
+    ] {
+        if !markets.iter().any(|known| known == market) {
+            markets.push(market.to_string());
+        }
+    }
+    markets
+}
+
+fn market_history_event_id(event: &MarketHistoryEvent) -> u64 {
+    match event {
+        MarketHistoryEvent::Ready { ticket, .. } | MarketHistoryEvent::Failed { ticket, .. } => {
+            ticket.id()
+        }
+    }
+}
+
+fn validate_chart_section<T, FT, FP>(
+    market: &str,
+    section: &str,
+    rows: &[T],
+    row_time: FT,
+    row_price_range: FP,
+) -> Option<f64>
+where
+    FT: Fn(&T) -> MoonTime,
+    FP: Fn(&T) -> (f64, f64),
+{
+    let now_ms = MoonTime::now().unix_millis();
+    let oldest_plausible_ms = 1_262_304_000_000i64; // 2010-01-01 UTC
+    let mut previous_ms = i64::MIN;
+    let mut late_rows = 0usize;
+    let mut newest = None::<(i64, f64)>;
+    for row in rows {
+        let time_ms = row_time(row).unix_millis();
+        assert!(
+            time_ms >= oldest_plausible_ms && time_ms <= now_ms.saturating_add(5 * 60 * 1000),
+            "FireTest {market} {section}: implausible timestamp {time_ms} (now={now_ms})"
+        );
+        if time_ms < previous_ms {
+            late_rows += 1;
+        }
+        previous_ms = time_ms;
+
+        let (low, high) = row_price_range(row);
+        assert!(
+            low.is_finite() && high.is_finite() && low > 0.0 && high >= low,
+            "FireTest {market} {section}: invalid price range {low}..{high}"
+        );
+        if newest.is_none_or(|(newest_ms, _)| time_ms >= newest_ms) {
+            newest = Some((time_ms, (low + high) * 0.5));
+        }
+    }
+    let newest_price = newest.map(|(_, price)| price);
+    println!(
+        "FIRETEST chart archive market={} section={} rows={} first_time_ms={:?} last_time_ms={:?} newest_price={:?} late_resend_rows={}",
+        market,
+        section,
+        rows.len(),
+        rows.first().map(|row| row_time(row).unix_millis()),
+        rows.last().map(|row| row_time(row).unix_millis()),
+        newest_price,
+        late_rows
+    );
+    newest_price
+}
+
+fn market_reference_price(price: MarketPrice) -> Option<f64> {
+    if price.p_last.is_finite() && price.p_last > 0.0 {
+        Some(price.p_last)
+    } else if price.bid.is_finite()
+        && price.ask.is_finite()
+        && price.bid > 0.0
+        && price.ask >= price.bid
+    {
+        Some((price.bid + price.ask) * 0.5)
+    } else if price.mark_price_found && price.mark_price.is_finite() && price.mark_price > 0.0 {
+        Some(price.mark_price)
+    } else {
+        None
+    }
+}
+
+fn assert_market_history_layout(
+    session: &Session,
+    market_name: &str,
+    current_price: f64,
+    summary: MarketHistoryApplySummary,
+) {
+    let snapshot = session.state_snapshot();
+    let market = snapshot
+        .markets()
+        .get(market_name)
+        .unwrap_or_else(|| panic!("FireTest chart market disappeared: {market_name}"));
+    let readers = snapshot
+        .market_history_readers_for(&market)
+        .unwrap_or_else(|| panic!("FireTest chart readers missing for {market_name}"));
+
+    let futures_reader = readers
+        .futures_trades
+        .expect("futures-trades reader must be configured");
+    let mini_reader = readers
+        .mini_candles
+        .expect("mini-candles reader must be configured");
+    let prices_reader = readers
+        .last_prices
+        .expect("LastPrice reader must be configured");
+    let liquidations_reader = readers
+        .liquidations
+        .expect("liquidations reader must be configured");
+
+    let retained = MarketHistoryCounts {
+        futures_trades: futures_reader.bounds().len,
+        mini_candles: mini_reader.bounds().len,
+        last_prices: prices_reader.bounds().len,
+        liquidations: liquidations_reader.bounds().len,
+    };
+    for (section, current, applied, capacity) in [
+        (
+            "futures_trades",
+            retained.futures_trades,
+            summary.retained.futures_trades,
+            futures_reader.capacity(),
+        ),
+        (
+            "mini_candles",
+            retained.mini_candles,
+            summary.retained.mini_candles,
+            mini_reader.capacity(),
+        ),
+        (
+            "last_prices",
+            retained.last_prices,
+            summary.retained.last_prices,
+            prices_reader.capacity(),
+        ),
+        (
+            "liquidations",
+            retained.liquidations,
+            summary.retained.liquidations,
+            liquidations_reader.capacity(),
+        ),
+    ] {
+        assert!(
+            current >= applied && current <= capacity,
+            "FireTest {market_name} {section}: retained len {current} is outside applied..capacity {applied}..{capacity}"
+        );
+    }
+
+    let mut futures = Vec::new();
+    futures_reader.copy_last(retained.futures_trades, &mut futures);
+    assert!(
+        futures.iter().all(|row| row.qty.is_finite()),
+        "FireTest {market_name} futures trades contain non-finite quantity"
+    );
+    let futures_price = validate_chart_section(
+        market_name,
+        "futures_trades",
+        &futures,
+        |row| row.time(),
+        |row| (f64::from(row.price), f64::from(row.price)),
+    );
+
+    let mut minis = Vec::<MiniCandle>::new();
+    mini_reader.copy_last(retained.mini_candles, &mut minis);
+    assert!(
+        minis
+            .iter()
+            .all(|row| { row.cnt >= 0 && row.buy_vol.is_finite() && row.sell_vol.is_finite() }),
+        "FireTest {market_name} mini candles contain invalid counts/volumes"
+    );
+    let mini_price = validate_chart_section(
+        market_name,
+        "mini_candles",
+        &minis,
+        |row| row.time(),
+        |row| (f64::from(row.min_price), f64::from(row.max_price)),
+    );
+
+    let mut prices = Vec::<LastPricePoint>::new();
+    prices_reader.copy_last(retained.last_prices, &mut prices);
+    let last_price = validate_chart_section(
+        market_name,
+        "last_prices",
+        &prices,
+        |row| row.time(),
+        |row| (f64::from(row.price()), f64::from(row.price())),
+    );
+
+    let mut liquidations = Vec::new();
+    liquidations_reader.copy_last(retained.liquidations, &mut liquidations);
+    assert!(
+        liquidations.iter().all(|row| row.qty.is_finite()),
+        "FireTest {market_name} liquidations contain non-finite quantity"
+    );
+    validate_chart_section(
+        market_name,
+        "liquidations",
+        &liquidations,
+        |row| row.time(),
+        |row| (f64::from(row.price), f64::from(row.price)),
+    );
+
+    let chart_price = futures_price
+        .or(last_price)
+        .or(mini_price)
+        .unwrap_or_else(|| {
+            panic!("FireTest {market_name}: chart archive has no price-bearing rows")
+        });
+    let ratio = chart_price / current_price;
+    assert!(
+        ratio.is_finite() && (0.1..=10.0).contains(&ratio),
+        "FireTest {market_name}: newest archive price {chart_price} is not plausible against current price {current_price} (ratio={ratio})"
+    );
+    println!(
+        "OK: chart archive market={} tapes=4 received={:?} retained={:?} current={:?} apply_wall={}us newest/current={:.6}",
+        market_name,
+        summary.received,
+        summary.retained,
+        retained,
+        summary.apply_wall_micros,
+        ratio
+    );
+}
+
+fn run_market_history_archive_gate(
+    cfg: &FireConfig,
+    a: &mut Session,
+    b: &mut Session,
+    timeout: Duration,
+) {
+    a.take_market_history_events();
+    let snapshot = a.state_snapshot();
+    let markets = firetest_retained_markets(cfg);
+    assert_eq!(
+        markets.len(),
+        3,
+        "FireTest chart gate requires three distinct markets"
+    );
+    let mut requests = Vec::with_capacity(markets.len());
+    for market_name in markets {
+        let market = snapshot
+            .markets()
+            .get(&market_name)
+            .unwrap_or_else(|| panic!("FireTest chart market not found: {market_name}"));
+        let current_price = market_reference_price(market.price())
+            .unwrap_or_else(|| panic!("FireTest chart market has no current price: {market_name}"));
+        let ticket = a
+            .client
+            .history()
+            .request_chart_for(&market)
+            .unwrap_or_else(|err| panic!("FireTest chart request failed for {market_name}: {err}"));
+        println!(
+            "FIRETEST chart archive queued market={} ticket={} current_price={:.8}",
+            market_name,
+            ticket.id(),
+            current_price
+        );
+        requests.push((ticket, current_price));
+    }
+
+    assert!(
+        pump_pair_until_sessions(a, b, timeout, "three market chart archives", |a, _| {
+            requests.iter().all(|(ticket, _)| {
+                a.market_history_events
+                    .iter()
+                    .any(|event| market_history_event_id(event) == ticket.id())
+            })
+        }),
+        "FireTest did not receive all three market chart archives within {timeout:?}"
+    );
+
+    let events = a.take_market_history_events();
+    for (requested, current_price) in requests {
+        let event = events
+            .iter()
+            .find(|event| market_history_event_id(event) == requested.id())
+            .unwrap_or_else(|| panic!("FireTest chart event missing for {}", requested.market));
+        match event {
+            MarketHistoryEvent::Ready { ticket, summary } => {
+                assert_eq!(ticket.market, requested.market);
+                assert_market_history_layout(a, &ticket.market, current_price, *summary);
+            }
+            MarketHistoryEvent::Failed { ticket, error } => {
+                panic!(
+                    "FireTest chart archive failed for {} ticket={}: {}",
+                    ticket.market,
+                    ticket.id(),
+                    error
+                );
+            }
+        }
+    }
+}
+
+fn write_strategy_info_dump(
+    profile: FireProfile,
+    cfg: &FireConfig,
+    sessions: &[(&str, &Session)],
+) -> PathBuf {
+    let path = std::env::var_os("MOONPROTO_FIRETEST_STRATEGY_DUMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("firetest_strategy_info_{}.txt", profile.as_str()))
+        });
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|err| {
+            panic!(
+                "cannot create strategy dump dir {}: {err}",
+                parent.display()
+            )
+        });
+    }
+
+    let mut out = String::new();
+    writeln!(
+        out,
+        "FireTest strategy dump\nprofile={}\nserver={}:{}\nmarket={}\n",
+        profile.as_str(),
+        cfg.host,
+        cfg.port,
+        cfg.market
+    )
+    .unwrap();
+
+    for (label, session) in sessions {
+        append_session_strategy_dump(&mut out, label, session);
+    }
+
+    fs::write(&path, out)
+        .unwrap_or_else(|err| panic!("cannot write strategy dump {}: {err}", path.display()));
+    println!("FIRETEST strategy info dump: {}", path.display());
+    path
+}
+
+fn write_strategy_raw_dump(
+    label: &str,
+    event_no: u64,
+    kind: &str,
+    server_epoch: u64,
+    raw_data: &[u8],
+) -> Option<PathBuf> {
+    let dir = std::env::var_os("MOONPROTO_FIRETEST_STRATEGY_RAW_DUMP_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("firetest_strategy_raw")
+        });
+    if let Err(err) = fs::create_dir_all(&dir) {
+        eprintln!(
+            "WARN: cannot create strategy raw dump dir {}: {err}",
+            dir.display()
+        );
+        return None;
+    }
+
+    let file_name = format!(
+        "{}_strat_{}_event_{:06}_epoch_{}_raw_{}.bin",
+        sanitize_file_component(label),
+        sanitize_file_component(kind),
+        event_no,
+        server_epoch,
+        raw_data.len()
+    );
+    let path = dir.join(file_name);
+    match fs::write(&path, raw_data) {
+        Ok(()) => Some(path),
+        Err(err) => {
+            eprintln!(
+                "WARN: failed to write strategy raw dump label={label} kind={kind} epoch={server_epoch} len={} err={err}",
+                raw_data.len()
+            );
+            None
+        }
+    }
+}
+
+fn append_session_strategy_dump(out: &mut String, label: &str, session: &Session) {
+    let stats = session.snapshot();
+    let snapshot = session.state_snapshot();
+    let strats = snapshot.strats();
+    writeln!(
+        out,
+        "## Session {label}\nsummary={}\nschema_revision={} schema_failures={} schema_error={}\n",
+        stats.summary(),
+        strats.strategy_schema_revision(),
+        strats.strategy_schema_failures(),
+        strats.strategy_schema_last_error().unwrap_or("none")
+    )
+    .unwrap();
+
+    if let Some(schema) = strats.strategy_schema() {
+        append_schema_dump(
+            out,
+            strats.strategy_schema_raw().map_or(0, |raw| raw.len()),
+            schema,
+        );
+    } else {
+        writeln!(out, "Schema: <missing>\n").unwrap();
+    }
+
+    let mut snapshots = snapshot.strategy_snapshot_vec();
+    snapshots.sort_by_key(|s| s.strategy_id);
+    writeln!(out, "Strategies: count={}", snapshots.len()).unwrap();
+    for strategy in snapshots {
+        let kind = strategy.kind();
+        let kind_name = strats
+            .strategy_schema()
+            .and_then(|schema| schema.kind_name_for_strategy_kind(kind))
+            .unwrap_or("?");
+        writeln!(
+            out,
+            "- id={} ver={} last_date={} checked={} kind={}:{} path={} fields={}",
+            strategy.strategy_id,
+            strategy.strategy_ver,
+            strategy.last_date,
+            strategy.checked,
+            kind.ordinal(),
+            kind_name,
+            strategy.path,
+            strategy.fields.len()
+        )
+        .unwrap();
+        let mut fields: Vec<_> = strategy.fields.iter().collect();
+        fields.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, value) in fields {
+            writeln!(out, "    {} = {}", name, field_value_text(value)).unwrap();
+        }
+    }
+    writeln!(out).unwrap();
+}
+
+fn append_schema_dump(out: &mut String, raw_len: usize, schema: &StrategySchema) {
+    writeln!(
+        out,
+        "Schema: raw={} version={} kinds={} fields={}",
+        raw_len,
+        schema.format_version,
+        schema.kinds.len(),
+        schema.fields.len()
+    )
+    .unwrap();
+    writeln!(out, "Kinds:").unwrap();
+    for kind in &schema.kinds {
+        writeln!(out, "- {} {}", kind.ordinal(), kind.name).unwrap();
+    }
+
+    writeln!(out, "Chapters/Layout markers:").unwrap();
+    for field in &schema.fields {
+        match &field.layout {
+            StrategyFieldLayout::ChapterClass { value, chapter } => {
+                writeln!(
+                    out,
+                    "- field={} chapter_class={} chapter={}",
+                    field.name, value, chapter
+                )
+                .unwrap();
+            }
+            StrategyFieldLayout::FilterClass(value) => {
+                writeln!(out, "- field={} filter_class={}", field.name, value).unwrap();
+            }
+            StrategyFieldLayout::Comment(value) => {
+                writeln!(out, "- field={} comment={}", field.name, value).unwrap();
+            }
+            StrategyFieldLayout::None => {}
+        }
+    }
+
+    writeln!(out, "Fields:").unwrap();
+    for field in &schema.fields {
+        let visible = field
+            .visible_strategy_kinds()
+            .map(|kind| {
+                format!(
+                    "{}:{}",
+                    kind.ordinal(),
+                    schema.kind_name_for_strategy_kind(kind).unwrap_or("?")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(
+            out,
+            "- {} type={}({}) ui={} flags=0x{:02X} default={} visible=[{}] layout={} static_picklist={} dynamic_picklist={}",
+            field.name,
+            field.raw_type_id(),
+            field.type_id.name(),
+            ui_kind_text(field.ui_kind),
+            field.raw_flags(),
+            field
+                .default_value
+                .as_ref()
+                .map(field_value_text)
+                .unwrap_or_else(|| "none".to_string()),
+            visible,
+            layout_text(&field.layout),
+            field
+                .static_picklist_raw()
+                .map(|raw| short_text(raw, 220))
+                .unwrap_or_else(|| "none".to_string()),
+            field
+                .dynamic_picklist
+                .as_ref()
+                .map(dynamic_picklist_text)
+                .unwrap_or_else(|| "none".to_string())
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+fn ui_kind_text(kind: StrategyFieldUiKind) -> &'static str {
+    match kind {
+        StrategyFieldUiKind::Edit => "edit",
+        StrategyFieldUiKind::Checkbox => "checkbox",
+        StrategyFieldUiKind::Combo => "combo",
+        StrategyFieldUiKind::Color => "color",
+        StrategyFieldUiKind::Unknown(_) => "unknown",
+    }
+}
+
+fn layout_text(layout: &StrategyFieldLayout) -> String {
+    match layout {
+        StrategyFieldLayout::None => "none".to_string(),
+        StrategyFieldLayout::Comment(value) => format!("comment({})", short_text(value, 120)),
+        StrategyFieldLayout::FilterClass(value) => {
+            format!("filter_class({})", short_text(value, 120))
+        }
+        StrategyFieldLayout::ChapterClass { value, chapter } => format!(
+            "chapter_class(value={}, chapter={})",
+            short_text(value, 120),
+            short_text(chapter, 120)
+        ),
+    }
+}
+
+fn dynamic_picklist_text(value: &StrategyDynamicPicklist) -> String {
+    match value {
+        StrategyDynamicPicklist::HookStrategies => "hook_strategies".to_string(),
+        StrategyDynamicPicklist::AllStrategies => "all_strategies".to_string(),
+        StrategyDynamicPicklist::FieldName(name) => format!("field_name({name})"),
+    }
+}
+
+fn field_value_text(value: &FieldValue) -> String {
+    match value {
+        FieldValue::Bool(v) => v.to_string(),
+        FieldValue::Int32(v) => v.to_string(),
+        FieldValue::Int64(v) => v.to_string(),
+        FieldValue::Double(v) => format!("{v:.12}"),
+        FieldValue::String(v) => format!("{:?}", short_text(v, 260)),
+        FieldValue::Byte(v) => v.to_string(),
+        FieldValue::Word(v) => v.to_string(),
+        FieldValue::UInt32(v) => v.to_string(),
+        FieldValue::UInt64(v) => v.to_string(),
+        FieldValue::Single(v) => format!("{v:.7}"),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PriceLineStats {
+    count: usize,
+    min: f64,
+    max: f64,
+    delta_percent: f64,
+    span_secs: f64,
+}
+
+fn price_line_stats<I>(rows: I) -> PriceLineStats
+where
+    I: IntoIterator<Item = (MoonTime, f32)>,
+{
+    let mut count = 0usize;
+    let mut min = f64::INFINITY;
+    let mut max = 0.0f64;
+    let mut first_time = MoonTime::ZERO;
+    let mut last_time = MoonTime::ZERO;
+    for (time, price) in rows {
+        if price <= 0.0 {
+            continue;
+        }
+        let price = f64::from(price);
+        if count == 0 {
+            first_time = time;
+        }
+        last_time = time;
+        count += 1;
+        min = min.min(price);
+        max = max.max(price);
+    }
+    let delta_percent = if count > 0 && min > 0.0 && max >= min {
+        (max / min - 1.0) * 100.0
+    } else {
+        0.0
+    };
+    PriceLineStats {
+        count,
+        min: if count > 0 { min } else { 0.0 },
+        max,
+        delta_percent,
+        span_secs: if count > 1 {
+            ((last_time.unix_millis() - first_time.unix_millis()) as f64 / 1000.0).max(0.0)
+        } else {
+            0.0
+        },
+    }
+}
+
+fn expected_price_points_for_span(stats: PriceLineStats) -> usize {
+    if stats.count == 0 {
+        0
+    } else {
+        (stats.span_secs / 2.0).floor() as usize + 1
+    }
+}
+
+fn price_delta_for_window<I>(rows: I, now_time: MoonTime, window_seconds: f64) -> f64
+where
+    I: IntoIterator<Item = (MoonTime, f32)>,
+{
+    let from_time = moon_time_saturating_sub_ms(now_time, (window_seconds * 1000.0) as i64);
+    price_line_stats(
+        rows.into_iter()
+            .filter(|(time, _)| *time >= from_time && *time <= now_time),
+    )
+    .delta_percent
+}
+
+fn format_last_price_values(rows: &[LastPricePoint]) -> String {
+    rows.iter()
+        .map(|p| format!("{:.8}", p.price()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_mark_price_values(rows: &[MarkPricePoint]) -> String {
+    rows.iter()
+        .map(|p| format!("{:.8}", p.price()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn trade_volume(rows: &[TradeHistoryRow]) -> f64 {
+    rows.iter().map(|row| f64::from(row.traded_value())).sum()
+}
+
+fn rel_diff(a: f64, b: f64) -> f64 {
+    let denom = a.abs().max(b.abs()).max(EPS);
+    (a - b).abs() / denom
+}
+
+fn active_lib_zero_reason(
+    profile: FireProfile,
+    last_stats: PriceLineStats,
+    futures_count: usize,
+) -> String {
+    if last_stats.count == 0 {
+        "LastPrice storage did not receive UpdateMarketsList rows".to_string()
+    } else if futures_count == 0 {
+        "TradesStream retained no futures rows for this market".to_string()
+    } else if profile == FireProfile::Quick {
+        format!(
+            "quick profile captured only {:.2}s of retained price line; zero deltas can be a real flat price sample, and long candle windows may be absent",
+            last_stats.span_secs
+        )
+    } else {
+        "possible quiet market or ActiveLib derived-state bug; inspect fields".to_string()
+    }
+}
+
+fn active_lib_zero_fields(
+    derived: &moonproto::state::MarketDerivedSnapshot,
+    profile: FireProfile,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if derived.trade_volumes.one_minute.total_value() <= EPS {
+        fields.push("trade_vol_1m");
+    }
+    if derived.trade_volumes.five_minutes.total_value() <= EPS {
+        fields.push("trade_vol_5m");
+    }
+    if derived.trade_deltas.one_minute.abs() <= EPS {
+        fields.push("trade_delta_1m");
+    }
+    if derived.trade_deltas.five_minutes.abs() <= EPS {
+        fields.push("trade_delta_5m");
+    }
+    if derived.last_price_deltas.one_minute.abs() <= EPS {
+        fields.push("last_price_delta_1m");
+    }
+    if derived.last_price_deltas.one_hour.abs() <= EPS {
+        fields.push("last_price_delta_1h");
+    }
+    if profile == FireProfile::Full {
+        if derived.candle_volumes.one_hour <= EPS {
+            fields.push("candle_vol_1h");
+        }
+        if derived.candle_volumes.twenty_four_hours <= EPS {
+            fields.push("candle_vol_24h");
+        }
+        if derived.candle_deltas.one_hour.abs() <= EPS {
+            fields.push("candle_delta_1h");
+        }
+        if derived.deltas.one_hour.abs() <= EPS {
+            fields.push("combined_delta_1h");
+        }
+    }
+    fields
+}
+
+fn format_count_map<K>(map: &HashMap<K, u64>) -> String
+where
+    K: ToString + Eq + std::hash::Hash,
+{
+    let mut rows = map
+        .iter()
+        .map(|(key, value)| format!("{}={}", key.to_string(), value))
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows.join(" ")
+}
+
+fn format_order_market_preview(st: &SessionStats) -> String {
+    let mut markets = HashMap::<String, u64>::new();
+    for market in st.order_market_by_uid.values() {
+        *markets.entry(market.clone()).or_default() += 1;
+    }
+    format_count_map(&markets)
+}
+
+fn avg_us(total_ns: u64, count: u64) -> u64 {
+    total_ns.checked_div(count).unwrap_or(0) / 1_000
+}
+
+fn avg_units(total: u64, count: u64) -> u64 {
+    total.checked_div(count).unwrap_or(0)
+}
+
+fn metric_cmd_label(cmd: u8, api_method: u8, payload_len: u64) -> String {
+    if cmd == 254 {
+        return format!(
+            "RuntimeCommand/{}({}) payload={payload_len}",
+            runtime_command_metric_label(api_method),
+            api_method
+        );
+    }
+    if cmd == u8::MAX {
+        format!("pre-cmd payload={payload_len}")
+    } else {
+        let c = Command::from_byte(cmd);
+        if c == Command::API && api_method != u8::MAX {
+            let method = EngineMethod::from_byte(api_method);
+            format!(
+                "{}({}) method={}({}) payload={payload_len}",
+                c.name(),
+                c.to_byte(),
+                method.name(),
+                method.to_byte()
+            )
+        } else {
+            format!("{}({}) payload={payload_len}", c.name(), c.to_byte())
+        }
+    }
+}
+
+fn runtime_command_metric_label(kind: u8) -> &'static str {
+    match kind {
+        0 => "Stop",
+        1 => "SubscribeOrderBook",
+        2 => "SubscribeOrderBooks",
+        3 => "UnsubscribeOrderBook",
+        4 => "UnsubscribeOrderBooks",
+        5 => "UnsubscribeAllOrderBooks",
+        6 => "SubscribeAllTrades",
+        7 => "SubscribeTradesFor",
+        8 => "UnsubscribeAllTrades",
+        9 => "BalanceRefresh",
+        10 => "AccountHedgeModeRefresh",
+        11 => "AccountApiExpirationRefresh",
+        12 => "OrderSnapshotRefresh",
+        13 => "TransferAssetsRefresh",
+        14 => "TransferAssetsRefreshKind",
+        15 => "SetExcludeBlacklistedMarketsFromExchangeDelta",
+        16 => "EngineAction",
+        17 => "CoinCardCandles",
+        20 => "Ui.SettingsRequest",
+        21 => "Ui.MmSubscribe",
+        22 => "Ui.SendSettings",
+        23 => "Ui.UpdateVersion",
+        24 => "Ui.SwitchDex",
+        25 => "Ui.SwitchSpot",
+        26 => "Ui.LevManage",
+        27 => "Ui.EmuTrades",
+        28 => "Ui.TriggerManage",
+        29 => "Ui.ResetProfit",
+        30 => "Ui.ArbActivateNotify",
+        31 => "Ui.AlertObject",
+        32 => "Ui.AlertSnapshotRequest",
+        33 => "Ui.ChartTextState",
+        34 => "Ui.OrdersHistoryRequest",
+        40 => "Strat.SellPriceUpdate",
+        41 => "Strat.Delete",
+        50 => "StrategySnapshotBatch",
+        51 => "StrategySetChecked",
+        52 => "StrategySendCheckedDelta",
+        53 => "StrategyStartStop",
+        54 => "DebugOutgoingBlackhole",
+        55 => "DebugResetErrEmuDiagnostics",
+        60 => "Order.MoveOrder",
+        61 => "Order.CancelOrder",
+        62 => "Order.UpdateStops",
+        63 => "Order.UpdateVStop",
+        64 => "Order.SetImmune",
+        65 => "Order.TurnOrderPanicSell",
+        66 => "Order.RequestOrderStatus",
+        67 => "Order.SwitchPanicSellByMarket",
+        80 => "Trade.NewOrder",
+        81 => "Trade.JoinOrders",
+        82 => "Trade.SplitOrder",
+        83 => "Trade.MoveAllSells",
+        84 => "Trade.MoveAllBuys",
+        85 => "Trade.ClosePosition",
+        86 => "Trade.LimitClosePosition",
+        87 => "Trade.SplitPosition",
+        88 => "Trade.SellOrder",
+        89 => "Trade.MarketSplitPosition",
+        90 => "Trade.Penalty",
+        _ => "Unknown",
+    }
+}
+
+fn metric_app_mode_label(mode: u8) -> &'static str {
+    match mode {
+        1 => "callback",
+        2 => "state",
+        3 => "queue",
+        4 => "worker",
+        _ => "none",
+    }
+}
+
+fn protocol_profile_summary(m: &ProtocolMetricsSnapshot) -> String {
+    if m.profile_phases.is_empty() {
+        return String::new();
+    }
+    let mut phases = m.profile_phases.clone();
+    phases.sort_by_key(|p| std::cmp::Reverse(p.max_ns));
+    let body = phases
+        .iter()
+        .map(|p| {
+            format!(
+                "{}(avg/max={}us/{}us count={} src={} >100us/>1ms/>5ms={}/{}/{})",
+                p.name,
+                avg_us(p.total_ns, p.count),
+                p.max_ns / 1_000,
+                p.count,
+                metric_cmd_label(p.max_cmd, p.max_api_method, p.max_payload_len),
+                p.over_100us,
+                p.over_1ms,
+                p.over_5ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(" phases=[{body}]")
+}
+
+fn protocol_metrics_summary(m: &ProtocolMetricsSnapshot) -> String {
+    let profile = protocol_profile_summary(m);
+    format!(
+        "recv={} pmtu={} reader_cpu(avg/max={}us/{}us max_src={} >100us/>1ms/>5ms={}/{}/{}) reader_thread_cpu(avg/max={}us/{}us max_src={} >100us/>1ms/>5ms={}/{}/{}) reader_thread_cycles(avg/max={}/{} max_src={}) reader_wait(count={} avg/max={}us/{}us max_src={}) writer_cpu(avg/max={}us/{}us >100us/>1ms/>5ms={}/{}/{}) writer_thread_cpu(avg/max={}us/{}us >100us/>1ms/>5ms={}/{}/{}) writer_thread_cycles(avg/max={}/{}) active_dispatch(avg/max={}us/{}us max_src={} events={} actions={} >100us/>1ms/>5ms={}/{}/{} thread_cpu(avg/max={}us/{}us >100us/>1ms/>5ms={}/{}/{}) thread_cycles(avg/max={}/{})) app_enqueue(avg/max={}us/{}us max_src={} events={} mode={} >100us/>1ms/>5ms={}/{}/{}) writer_tick_wall(count={} avg/max={}us/{}us) send_max={}us public_events={}{}",
+        m.recv_count,
+        m.last_pmtu,
+        avg_us(m.reader_protocol_ns, m.reader_protocol_count),
+        m.reader_protocol_max_ns / 1_000,
+        metric_cmd_label(
+            m.reader_protocol_max_cmd,
+            u8::MAX,
+            m.reader_protocol_max_payload_len
+        ),
+        m.reader_protocol_over_100us,
+        m.reader_protocol_over_1ms,
+        m.reader_protocol_over_5ms,
+        avg_us(m.reader_thread_cpu_ns, m.reader_thread_cpu_count),
+        m.reader_thread_cpu_max_ns / 1_000,
+        metric_cmd_label(
+            m.reader_thread_cpu_max_cmd,
+            u8::MAX,
+            m.reader_thread_cpu_max_payload_len
+        ),
+        m.reader_thread_cpu_over_100us,
+        m.reader_thread_cpu_over_1ms,
+        m.reader_thread_cpu_over_5ms,
+        avg_units(m.reader_thread_cycles_total, m.reader_thread_cycles_count),
+        m.reader_thread_cycles_max,
+        metric_cmd_label(
+            m.reader_thread_cycles_max_cmd,
+            u8::MAX,
+            m.reader_thread_cycles_max_payload_len
+        ),
+        m.reader_protocol_wait_count,
+        avg_us(m.reader_protocol_wait_ns, m.reader_protocol_wait_count),
+        m.reader_protocol_wait_max_ns / 1_000,
+        metric_cmd_label(
+            m.reader_protocol_wait_max_cmd,
+            u8::MAX,
+            m.reader_protocol_wait_max_payload_len
+        ),
+        avg_us(m.writer_cpu_ns, m.writer_cpu_count),
+        m.writer_cpu_max_ns / 1_000,
+        m.writer_cpu_over_100us,
+        m.writer_cpu_over_1ms,
+        m.writer_cpu_over_5ms,
+        avg_us(m.writer_thread_cpu_ns, m.writer_thread_cpu_count),
+        m.writer_thread_cpu_max_ns / 1_000,
+        m.writer_thread_cpu_over_100us,
+        m.writer_thread_cpu_over_1ms,
+        m.writer_thread_cpu_over_5ms,
+        avg_units(m.writer_thread_cycles_total, m.writer_thread_cycles_count),
+        m.writer_thread_cycles_max,
+        avg_us(m.active_dispatch_ns, m.active_dispatch_count),
+        m.active_dispatch_max_ns / 1_000,
+        metric_cmd_label(
+            m.active_dispatch_max_cmd,
+            m.active_dispatch_max_api_method,
+            m.active_dispatch_max_payload_len
+        ),
+        m.active_dispatch_max_events,
+        m.active_dispatch_max_actions,
+        m.active_dispatch_over_100us,
+        m.active_dispatch_over_1ms,
+        m.active_dispatch_over_5ms,
+        avg_us(
+            m.active_dispatch_thread_cpu_ns,
+            m.active_dispatch_thread_cpu_count
+        ),
+        m.active_dispatch_thread_cpu_max_ns / 1_000,
+        m.active_dispatch_thread_cpu_over_100us,
+        m.active_dispatch_thread_cpu_over_1ms,
+        m.active_dispatch_thread_cpu_over_5ms,
+        avg_units(
+            m.active_dispatch_thread_cycles_total,
+            m.active_dispatch_thread_cycles_count
+        ),
+        m.active_dispatch_thread_cycles_max,
+        avg_us(m.app_enqueue_ns, m.app_enqueue_count),
+        m.app_enqueue_max_ns / 1_000,
+        metric_cmd_label(
+            m.app_enqueue_max_cmd,
+            m.app_enqueue_max_api_method,
+            m.app_enqueue_max_payload_len
+        ),
+        m.app_enqueue_max_events,
+        metric_app_mode_label(m.app_enqueue_max_mode),
+        m.app_enqueue_over_100us,
+        m.app_enqueue_over_1ms,
+        m.app_enqueue_over_5ms,
+        m.writer_tick_count,
+        avg_us(m.writer_tick_ns, m.writer_tick_count),
+        m.writer_tick_max_ns / 1_000,
+        m.send_phase_max_ns / 1_000,
+        m.public_event_queue_len,
+        profile,
+    )
+}
+
+fn assert_protocol_cpu_gate(label: &str, m: &ProtocolMetricsSnapshot) {
+    if cfg!(debug_assertions) {
+        println!(
+            "FIRETEST CPU gate {label}: skipped in debug build; run FireTest with `--release` for the hard CPU/latency gate."
+        );
+        return;
+    }
+
+    let mut red_flags = Vec::new();
+
+    if m.reader_protocol_over_5ms > 0 {
+        if m.reader_thread_cpu_count > 0 && m.reader_thread_cpu_over_5ms > 0 {
+            red_flags.push(format!(
+                "reader_cpu >5ms count={} wall_max={}us thread_cpu_max={}us src={}",
+                m.reader_protocol_over_5ms,
+                m.reader_protocol_max_ns / 1_000,
+                m.reader_thread_cpu_max_ns / 1_000,
+                metric_cmd_label(
+                    m.reader_protocol_max_cmd,
+                    u8::MAX,
+                    m.reader_protocol_max_payload_len
+                )
+            ));
+        } else if m.reader_thread_cpu_count > 0 {
+            println!(
+                "FIRETEST CPU gate {label}: reader wall spike observed but thread CPU stayed below 5ms: wall_count={} wall_max={}us thread_cpu_max={}us wall_src={} thread_src={}",
+                m.reader_protocol_over_5ms,
+                m.reader_protocol_max_ns / 1_000,
+                m.reader_thread_cpu_max_ns / 1_000,
+                metric_cmd_label(
+                    m.reader_protocol_max_cmd,
+                    u8::MAX,
+                    m.reader_protocol_max_payload_len
+                ),
+                metric_cmd_label(
+                    m.reader_thread_cpu_max_cmd,
+                    u8::MAX,
+                    m.reader_thread_cpu_max_payload_len
+                )
+            );
+        } else if m.reader_thread_cycles_count > 0 {
+            println!(
+                "FIRETEST CPU gate {label}: reader wall spike observed; duration CPU clock unavailable on this platform, thread cycles recorded instead: wall_count={} wall_max={}us wall_src={} cycles_avg={} cycles_max={} cycles_src={}",
+                m.reader_protocol_over_5ms,
+                m.reader_protocol_max_ns / 1_000,
+                metric_cmd_label(
+                    m.reader_protocol_max_cmd,
+                    u8::MAX,
+                    m.reader_protocol_max_payload_len
+                ),
+                avg_units(m.reader_thread_cycles_total, m.reader_thread_cycles_count),
+                m.reader_thread_cycles_max,
+                metric_cmd_label(
+                    m.reader_thread_cycles_max_cmd,
+                    u8::MAX,
+                    m.reader_thread_cycles_max_payload_len
+                )
+            );
+        } else {
+            red_flags.push(format!(
+                "reader_cpu >5ms count={} wall_max={}us src={} (no thread CPU/cycle clock available)",
+                m.reader_protocol_over_5ms,
+                m.reader_protocol_max_ns / 1_000,
+                metric_cmd_label(
+                    m.reader_protocol_max_cmd,
+                    u8::MAX,
+                    m.reader_protocol_max_payload_len
+                )
+            ));
+        }
+    }
+    if m.writer_cpu_over_5ms > 0 {
+        if m.writer_thread_cpu_count > 0 && m.writer_thread_cpu_over_5ms > 0 {
+            red_flags.push(format!(
+                "writer_cpu >5ms count={} wall_max={}us thread_cpu_max={}us",
+                m.writer_cpu_over_5ms,
+                m.writer_cpu_max_ns / 1_000,
+                m.writer_thread_cpu_max_ns / 1_000
+            ));
+        } else if m.writer_thread_cpu_count > 0 {
+            println!(
+                "FIRETEST CPU gate {label}: writer wall spike observed but thread CPU stayed below 5ms: wall_count={} wall_max={}us thread_cpu_max={}us",
+                m.writer_cpu_over_5ms,
+                m.writer_cpu_max_ns / 1_000,
+                m.writer_thread_cpu_max_ns / 1_000
+            );
+        } else if m.writer_thread_cycles_count > 0 {
+            println!(
+                "FIRETEST CPU gate {label}: writer wall spike observed; duration CPU clock unavailable on this platform, thread cycles recorded instead: wall_count={} wall_max={}us cycles_avg={} cycles_max={}",
+                m.writer_cpu_over_5ms,
+                m.writer_cpu_max_ns / 1_000,
+                avg_units(m.writer_thread_cycles_total, m.writer_thread_cycles_count),
+                m.writer_thread_cycles_max
+            );
+        } else {
+            red_flags.push(format!(
+                "writer_cpu >5ms count={} wall_max={}us (no thread CPU/cycle clock available)",
+                m.writer_cpu_over_5ms,
+                m.writer_cpu_max_ns / 1_000
+            ));
+        }
+    }
+    if m.active_dispatch_over_5ms > 0 {
+        if m.active_dispatch_thread_cpu_count > 0 && m.active_dispatch_thread_cpu_over_5ms > 0 {
+            red_flags.push(format!(
+                "active_dispatch >5ms count={} wall_max={}us thread_cpu_max={}us src={} events={} actions={}",
+                m.active_dispatch_over_5ms,
+                m.active_dispatch_max_ns / 1_000,
+                m.active_dispatch_thread_cpu_max_ns / 1_000,
+                metric_cmd_label(
+                    m.active_dispatch_max_cmd,
+                    m.active_dispatch_max_api_method,
+                    m.active_dispatch_max_payload_len
+                ),
+                m.active_dispatch_max_events,
+                m.active_dispatch_max_actions
+            ));
+        } else if m.active_dispatch_thread_cpu_count > 0 {
+            println!(
+                "FIRETEST CPU gate {label}: active_dispatch wall spike observed but thread CPU stayed below 5ms: wall_count={} wall_max={}us thread_cpu_max={}us src={} events={} actions={}",
+                m.active_dispatch_over_5ms,
+                m.active_dispatch_max_ns / 1_000,
+                m.active_dispatch_thread_cpu_max_ns / 1_000,
+                metric_cmd_label(
+                    m.active_dispatch_max_cmd,
+                    m.active_dispatch_max_api_method,
+                    m.active_dispatch_max_payload_len
+                ),
+                m.active_dispatch_max_events,
+                m.active_dispatch_max_actions
+            );
+        } else if m.active_dispatch_thread_cycles_count > 0 {
+            println!(
+                "FIRETEST CPU gate {label}: active_dispatch wall spike observed; duration CPU clock unavailable on this platform, thread cycles recorded instead: wall_count={} wall_max={}us src={} events={} actions={} cycles_avg={} cycles_max={}",
+                m.active_dispatch_over_5ms,
+                m.active_dispatch_max_ns / 1_000,
+                metric_cmd_label(
+                    m.active_dispatch_max_cmd,
+                    m.active_dispatch_max_api_method,
+                    m.active_dispatch_max_payload_len
+                ),
+                m.active_dispatch_max_events,
+                m.active_dispatch_max_actions,
+                avg_units(
+                    m.active_dispatch_thread_cycles_total,
+                    m.active_dispatch_thread_cycles_count
+                ),
+                m.active_dispatch_thread_cycles_max
+            );
+        } else {
+            red_flags.push(format!(
+                "active_dispatch >5ms count={} wall_max={}us src={} events={} actions={} (no thread CPU/cycle clock available)",
+                m.active_dispatch_over_5ms,
+                m.active_dispatch_max_ns / 1_000,
+                metric_cmd_label(
+                    m.active_dispatch_max_cmd,
+                    m.active_dispatch_max_api_method,
+                    m.active_dispatch_max_payload_len
+                ),
+                m.active_dispatch_max_events,
+                m.active_dispatch_max_actions
+            ));
+        }
+    }
+    if m.app_enqueue_over_5ms > 0 {
+        red_flags.push(format!(
+            "app_enqueue >5ms count={} max={}us src={} events={} mode={}",
+            m.app_enqueue_over_5ms,
+            m.app_enqueue_max_ns / 1_000,
+            metric_cmd_label(
+                m.app_enqueue_max_cmd,
+                m.app_enqueue_max_api_method,
+                m.app_enqueue_max_payload_len
+            ),
+            m.app_enqueue_max_events,
+            metric_app_mode_label(m.app_enqueue_max_mode)
+        ));
+    }
+    if m.send_phase_max_ns > FIRETEST_CPU_HARD_RED_FLAG_NS {
+        red_flags.push(format!("send_phase max={}us", m.send_phase_max_ns / 1_000));
+    }
+
+    assert!(
+        red_flags.is_empty(),
+        "FIRETEST CPU gate {label}: {}. reader_wait and writer_tick_wall are intentionally excluded from this hard gate.",
+        red_flags.join("; ")
+    );
+}
+
+fn moon_now_for_test() -> MoonTime {
+    MoonTime::now()
+}
+
+fn moon_time_saturating_sub_ms(time: MoonTime, delta_ms: i64) -> MoonTime {
+    MoonTime::from_unix_millis(time.unix_millis().saturating_sub(delta_ms))
+}
+
+fn moon_time_saturating_add_ms(time: MoonTime, delta_ms: i64) -> MoonTime {
+    MoonTime::from_unix_millis(time.unix_millis().saturating_add(delta_ms))
+}
+
+fn moon_time_abs_age_s(now: MoonTime, time: MoonTime) -> f64 {
+    let now_ms = now.unix_millis();
+    let time_ms = time.unix_millis();
+    let delta_ms = if now_ms >= time_ms {
+        now_ms.saturating_sub(time_ms)
+    } else {
+        time_ms.saturating_sub(now_ms)
+    };
+    delta_ms as f64 * 0.001
+}
+
+fn record_event(
+    stats: &Arc<Mutex<SessionStats>>,
+    event: &Event,
+    dispatcher: Option<&MoonStateSnapshot>,
+    candles_snapshot_tx: Option<&mpsc::Sender<Vec<RequestCandlesMarket>>>,
+) {
+    let mut st = stats.lock().unwrap();
+    st.server_events += 1;
+    let event_no = st.server_events;
+    if let Some(dispatcher) = dispatcher {
+        sync_market_probe_from_dispatcher(&mut st, event_no, dispatcher, false);
+    }
+    match event {
+        Event::Order(ev) => {
+            st.order_events += 1;
+            *st.order_event_kinds
+                .entry(order_event_kind(ev))
+                .or_default() += 1;
+            if let OrderEvent::Ignored { uid, reason } = ev {
+                st.order_ignored_by_uid.insert(*uid, *reason);
+            }
+            if let Some(dispatcher) = dispatcher {
+                record_order_state_snapshot(&mut st, dispatcher);
+            }
+            log_server_event(&st, event_no, format!("Order {ev:?}"));
+        }
+        Event::Balance(ev) => {
+            st.balance_events += 1;
+            match ev {
+                BalanceEvent::SnapshotApplied { .. } => st.balance_snapshot_events += 1,
+                BalanceEvent::IncrementalApplied { .. } => st.balance_incremental_events += 1,
+                BalanceEvent::SessionProfitsApplied { nonzero_count, .. } => {
+                    st.session_profit_events += 1;
+                    st.session_profit_nonzero_count = *nonzero_count;
+                }
+                BalanceEvent::Ignored { .. }
+                | BalanceEvent::EpochStale { .. }
+                | BalanceEvent::SessionProfitEpochStale { .. } => {}
+            }
+            log_server_event(&st, event_no, format!("Balance {ev:?}"));
+        }
+        Event::TransferAssets(ev) => {
+            st.transfer_asset_events += 1;
+            match ev {
+                moonproto::TransferAssetsEvent::Updated {
+                    kind,
+                    count,
+                    nonzero_count,
+                    revision,
+                    ..
+                } => {
+                    st.transfer_asset_updated_mask |= 1 << kind.to_byte();
+                    log_server_event(
+                        &st,
+                        event_no,
+                        format!(
+                            "TransferAssets kind={} count={} nonzero={} revision={}",
+                            kind.name(),
+                            count,
+                            nonzero_count,
+                            revision
+                        ),
+                    );
+                }
+                moonproto::TransferAssetsEvent::RefreshCompleted {
+                    request_id,
+                    requested,
+                    updated,
+                    failed,
+                    revision,
+                } => {
+                    st.transfer_asset_refresh_completed += 1;
+                    log_server_event(
+                        &st,
+                        event_no,
+                        format!(
+                            "TransferAssets refresh-complete id={} requested={} updated={} failed={} revision={}",
+                            request_id, requested, updated, failed, revision
+                        ),
+                    );
+                }
+                moonproto::TransferAssetsEvent::UpdateFailed { kind, error, .. } => {
+                    st.transfer_asset_failures += 1;
+                    log_server_event(
+                        &st,
+                        event_no,
+                        format!("TransferAssets kind={} failed={}", kind.name(), error),
+                    );
+                }
+                moonproto::TransferAssetsEvent::TransferApplied {
+                    asset,
+                    qty,
+                    from,
+                    to,
+                    revision,
+                    ..
+                } => {
+                    log_server_event(
+                        &st,
+                        event_no,
+                        format!(
+                            "TransferAssets local-transfer asset={} qty={:.8} from={} to={} revision={}",
+                            asset,
+                            qty,
+                            from.name(),
+                            to.name(),
+                            revision
+                        ),
+                    );
+                }
+            }
+        }
+        Event::CoinCardCandles(ev) => {
+            st.coin_card_events += 1;
+            match ev {
+                moonproto::CoinCardCandlesEvent::Updated {
+                    market,
+                    kind,
+                    request_uid,
+                    count,
+                    revision,
+                } => {
+                    st.coin_card_updates += 1;
+                    st.coin_card_last_count = *count;
+                    log_server_event(
+                        &st,
+                        event_no,
+                        format!(
+                            "CoinCardCandles market={} kind={:?} uid={} count={} revision={}",
+                            market, kind, request_uid, count, revision
+                        ),
+                    );
+                }
+                moonproto::CoinCardCandlesEvent::UpdateFailed {
+                    market,
+                    kind,
+                    request_uid,
+                    error,
+                } => {
+                    st.coin_card_failures += 1;
+                    log_server_event(
+                        &st,
+                        event_no,
+                        format!(
+                            "CoinCardCandles failed market={} kind={:?} uid={:?} error={}",
+                            market, kind, request_uid, error
+                        ),
+                    );
+                }
+            }
+        }
+        Event::CandlesSnapshot(ev) => match ev {
+            moonproto::state::CandlesSnapshotEvent::Ready {
+                request_uid,
+                summary,
+            } => {
+                st.candles_complete = Some(CandlesSnapshotSummary {
+                    uid: *request_uid,
+                    zipped_bytes: 0,
+                    markets: summary.retained_markets,
+                    candles: summary.retained_candles,
+                    market_preview: format!(
+                        "received_markets={} received_candles={}",
+                        summary.received_markets, summary.received_candles
+                    ),
+                });
+                log_server_event(
+                    &st,
+                    event_no,
+                    format!(
+                        "CandlesSnapshot Ready uid={} summary={summary:?}",
+                        request_uid
+                    ),
+                );
+            }
+            moonproto::state::CandlesSnapshotEvent::Failed { request_uid, error } => {
+                st.parse_failed += 1;
+                log_server_event(
+                    &st,
+                    event_no,
+                    format!(
+                        "CandlesSnapshot Failed uid={:?} error={}",
+                        request_uid, error
+                    ),
+                );
+            }
+        },
+        Event::MarketHistory(event) => {
+            log_server_event(&st, event_no, format!("MarketHistory {event:?}"));
+        }
+        Event::Markets(ev) => {
+            st.market_events += 1;
+            if let Some(dispatcher) = dispatcher {
+                sync_market_probe_from_dispatcher(&mut st, event_no, dispatcher, true);
+            }
+            log_server_event(
+                &st,
+                event_no,
+                format!("Markets {ev:?}; {}", st.market_probe_summary()),
+            );
+        }
+        Event::Settings(SettingsEvent::ClientSettingsUpdated) => {
+            st.settings_events += 1;
+            if let Some(dispatcher) = dispatcher {
+                st.last_settings = dispatcher.settings().client_settings.clone();
+            }
+            if let Some(settings) = &st.last_settings {
+                log_server_event(
+                    &st,
+                    event_no,
+                    format!(
+                        "UI ClientSettings uid={} x_sell={} emu_mode={} fixed_sell_mode={} fixed_sell_price={:.8} trailing_drop={:.8} trailing_stop={}",
+                        settings.uid,
+                        settings.x_sell,
+                        settings.emu_mode,
+                        settings.fixed_sell_mode,
+                        settings.fixed_sell_price,
+                        settings.trailing_drop,
+                        settings.trailing_stop
+                    ),
+                );
+            } else {
+                log_server_event(
+                    &st,
+                    event_no,
+                    "UI ClientSettingsUpdated; state snapshot is refreshed after pump",
+                );
+            }
+        }
+        Event::Settings(SettingsEvent::LevManageUpdated) => {
+            st.settings_events += 1;
+            st.lev_manage_events += 1;
+            let lev = dispatcher.and_then(|d| d.settings().lev_manage.as_ref().cloned());
+            if let Some(lev) = lev {
+                log_server_event(
+                    &st,
+                    event_no,
+                    format!(
+                        "UI LevManage auto_max_order={} auto_fix_lev={} fix_lev={} def_max_pos={} lev_control_len={}",
+                        lev.auto_max_order,
+                        lev.auto_fix_lev,
+                        lev.fix_lev,
+                        lev.default_max_pos_limit(),
+                        lev.lev_control.len()
+                    ),
+                );
+            } else {
+                log_server_event(&st, event_no, "UI LevManageUpdated");
+            }
+        }
+        Event::Settings(SettingsEvent::RuntimeStateUpdated) => {
+            st.runtime_state_events += 1;
+            if let Some(dispatcher) = dispatcher {
+                st.runtime_state = dispatcher
+                    .settings()
+                    .runtime_state
+                    .map(RuntimeStateProbe::from);
+            }
+            log_server_event(
+                &st,
+                event_no,
+                format!("UI RuntimeState {:?}", st.runtime_state),
+            );
+        }
+        Event::Settings(SettingsEvent::KernelLicenseStateUpdated) => {
+            st.kernel_license_state_events += 1;
+            if let Some(dispatcher) = dispatcher {
+                st.kernel_license_state = dispatcher
+                    .settings()
+                    .kernel_license_state
+                    .map(KernelLicenseProbe::from);
+            }
+            log_server_event(
+                &st,
+                event_no,
+                format!("UI KernelLicenseState {:?}", st.kernel_license_state),
+            );
+        }
+        Event::Settings(SettingsEvent::ProfitStateUpdated) => {
+            st.profit_state_events += 1;
+            if let Some(dispatcher) = dispatcher {
+                st.profit_state = dispatcher.settings().profit_state;
+            }
+            log_server_event(
+                &st,
+                event_no,
+                format!("UI ProfitState {:?}", st.profit_state),
+            );
+        }
+        Event::Settings(SettingsEvent::HyperliquidRequestLimitUpdated) => {
+            st.settings_events += 1;
+            st.hyperliquid_request_limit_events += 1;
+            if let Some(dispatcher) = dispatcher {
+                st.hyperliquid_requests_left = dispatcher.settings().hyperliquid_requests_left;
+            }
+            log_server_event(
+                &st,
+                event_no,
+                format!(
+                    "UI HyperliquidRequestLimit requests_left={:?}",
+                    st.hyperliquid_requests_left
+                ),
+            );
+        }
+        Event::Settings(SettingsEvent::ProblemsUpdated) => {
+            st.problems_snapshots += 1;
+            let items = dispatcher.map(|d| d.settings().problems.items());
+            log_server_event(
+                &st,
+                event_no,
+                format!(
+                    "UI ProblemsState count={:?}",
+                    items.map(|items| items.len())
+                ),
+            );
+        }
+        Event::Settings(SettingsEvent::ProblemConfirmed { problem }) => {
+            st.problem_notifications += 1;
+            log_server_event(&st, event_no, format!(
+                "UI ProblemConfirmed kind={} key={} category={:?} count={} first={:?} confirmed={:?} title={:?} message={:?} tech={:?}",
+                problem.kind, problem.kind_name, problem.category, problem.confirmations,
+                problem.first_seen, problem.confirmed, problem.title, problem.message, problem.technical_details
+            ));
+        }
+        Event::Settings(other) => {
+            log_server_event(&st, event_no, format!("UI {other:?}"));
+        }
+        Event::Strat(StratEvent::SnapshotFull {
+            server_epoch,
+            raw_data,
+            ..
+        }) => {
+            record_strategy_snapshot(&mut st, event_no, "SnapshotFull", *server_epoch, raw_data);
+        }
+        Event::Strat(StratEvent::SnapshotPartial {
+            server_epoch,
+            raw_data,
+            ..
+        }) => {
+            record_strategy_snapshot(
+                &mut st,
+                event_no,
+                "SnapshotPartial",
+                *server_epoch,
+                raw_data,
+            );
+        }
+        Event::Strat(StratEvent::SchemaApplied {
+            raw_len,
+            format_version,
+            kind_count,
+            field_count,
+        }) => {
+            st.strategy_events += 1;
+            st.strategy_schema_events += 1;
+            st.strategy_schema_kinds = *kind_count;
+            st.strategy_schema_fields = *field_count;
+            log_server_event(
+                &st,
+                event_no,
+                format!(
+                    "Strat SchemaApplied raw={} version={} kinds={} fields={}",
+                    raw_len, format_version, kind_count, field_count
+                ),
+            );
+        }
+        Event::Strat(StratEvent::SchemaParseFailed { raw_len }) => {
+            st.strategy_events += 1;
+            st.parse_failed += 1;
+            log_server_event(
+                &st,
+                event_no,
+                format!("Strat SchemaParseFailed raw={raw_len}"),
+            );
+        }
+        Event::Strat(StratEvent::RuntimeState { strategies_running }) => {
+            st.strategy_events += 1;
+            st.strategy_runtime_events += 1;
+            st.strategies_running = Some(*strategies_running);
+            log_server_event(
+                &st,
+                event_no,
+                format!("Strat RuntimeState strategies_running={strategies_running}"),
+            );
+        }
+        Event::Strat(other) => {
+            log_server_event(&st, event_no, format!("Strat {other:?}"));
+        }
+        Event::Trade(TradesEvent::Applied {
+            packet_num,
+            base_time,
+        }) => {
+            st.trades_apply += 1;
+            let target_trade_price = dispatcher.and_then(|dispatcher| {
+                dispatcher
+                    .markets()
+                    .trade_state(&st.market)
+                    .and_then(|state| {
+                        (state.last_trade_price > 0.0).then_some(state.last_trade_price)
+                    })
+            });
+            if let Some(price) = target_trade_price {
+                st.target_trade_packets += 1;
+                st.last_trade_price = Some(price);
+                if st.target_trade_packets <= 5 || st.target_trade_packets.is_power_of_two() {
+                    log_server_event(
+                        &st,
+                        event_no,
+                        format!(
+                            "TradesStream target market={} idx={:?} packet_num={} source=market_tail/SeqRing last_price={:.8}",
+                            st.market, st.market_index, packet_num, price
+                        ),
+                    );
+                }
+            }
+            if should_log_stream_count(st.trades_apply) {
+                log_server_event(
+                    &st,
+                    event_no,
+                    format!(
+                        "TradesStream Applied #{} packet_num={} base_time={:.8}; rows are retained in SeqRing/storage",
+                        st.trades_apply,
+                        packet_num,
+                        base_time,
+                    ),
+                );
+            }
+        }
+        Event::Trade(other) => {
+            log_server_event(&st, event_no, format!("TradesStream {other:?}"));
+        }
+        Event::OrderBook(OrderBookEvent::Apply {
+            market_index,
+            market_name,
+            kind,
+            is_full,
+            seq,
+            top,
+        }) => {
+            st.orderbook_apply += 1;
+            let raw_kind = kind.as_u8();
+            let is_target_market = market_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&st.market));
+            if is_target_market {
+                let old_index = st.market_index;
+                st.market_index = Some(*market_index);
+                if old_index != st.market_index {
+                    log_server_event(
+                        &st,
+                        event_no,
+                        format!(
+                            "OrderBook target market={} resolved event_index old={old_index:?} new={:?}",
+                            st.market, st.market_index
+                        ),
+                    );
+                }
+                if *is_full {
+                    st.target_orderbook_full += 1;
+                } else {
+                    st.target_orderbook_update += 1;
+                }
+                st.last_book_kind = Some(raw_kind);
+                if let (Some(bid), Some(ask)) = (top.bid, top.ask) {
+                    st.last_book_bid = Some(bid.rate);
+                    st.last_book_ask = Some(ask.rate);
+                    if bid.rate <= 0.0 || ask.rate <= 0.0 || ask.rate <= bid.rate {
+                        st.market_invariant_error = Some(format!(
+                            "bad book top for {} kind={raw_kind}: bid={:.8} ask={:.8}",
+                            st.market, bid.rate, ask.rate
+                        ));
+                    }
+                } else if dispatcher.is_some() {
+                    log_server_event(
+                        &st,
+                        event_no,
+                        format!(
+                            "OrderBook target top not complete yet market={} idx={} kind={} top_bid={:?} top_ask={:?}",
+                            st.market,
+                            market_index,
+                            raw_kind,
+                            top.bid.map(|level| level.rate),
+                            top.ask.map(|level| level.rate)
+                        ),
+                    );
+                }
+                if st.target_orderbook_full + st.target_orderbook_update <= 8
+                    || (st.target_orderbook_full + st.target_orderbook_update).is_power_of_two()
+                {
+                    log_server_event(
+                        &st,
+                        event_no,
+                        format!(
+                            "OrderBook target market={} event_market={:?} idx={} kind={:?} raw_kind={} full={} seq={} top_bid={:?} top_ask={:?}",
+                            st.market,
+                            market_name,
+                            market_index,
+                            kind,
+                            raw_kind,
+                            is_full,
+                            seq,
+                            st.last_book_bid,
+                            st.last_book_ask
+                        ),
+                    );
+                }
+            }
+            if should_log_stream_count(st.orderbook_apply) {
+                let top_buy = top
+                    .bid
+                    .map(|l| format!("{:.8}@{:.8}", l.quantity, l.rate))
+                    .unwrap_or_else(|| "none".to_string());
+                let top_sell = top
+                    .ask
+                    .map(|l| format!("{:.8}@{:.8}", l.quantity, l.rate))
+                    .unwrap_or_else(|| "none".to_string());
+                log_server_event(
+                    &st,
+                    event_no,
+                    format!(
+                        "OrderBook Apply #{} market_index={} kind={} full={} seq={} top_buy={} top_sell={}",
+                        st.orderbook_apply,
+                        market_index,
+                        raw_kind,
+                        is_full,
+                        seq,
+                        top_buy,
+                        top_sell
+                    ),
+                );
+            }
+        }
+        Event::OrderBook(other) => {
+            log_server_event(&st, event_no, format!("OrderBook {other:?}"));
+        }
+        Event::Report(report) => {
+            let summary = match report {
+                ReportEvent::Schema(schema) => format!(
+                    "Report Schema format={} fields={}",
+                    schema.format_version(),
+                    schema.revision()
+                ),
+                ReportEvent::RowUpsert(row) => format!(
+                    "Report RowUpsert rec_id={} fields={}",
+                    row.rec_id,
+                    row.fields.len()
+                ),
+                ReportEvent::RowDelete { rec_id } => {
+                    format!("Report RowDelete rec_id={rec_id}")
+                }
+                ReportEvent::RowsDeleted(change) => format!(
+                    "Report RowsDeleted deleted={} ranges={} singles={}",
+                    change.deleted,
+                    change.ranges.len(),
+                    change.singles.len()
+                ),
+                ReportEvent::SyncStarted { ticket, request } => format!(
+                    "Report SyncStarted sync_id={} from={} depth={}",
+                    ticket.sync_id, request.from_rec_id, request.history_depth
+                ),
+                ReportEvent::SyncPage(page) => format!(
+                    "Report SyncPage sync_id={} request_uid={} epoch={} from={} last={} max={} rows={} recreated={}",
+                    page.ticket.sync_id,
+                    page.request_uid,
+                    page.epoch,
+                    page.from_rec_id,
+                    page.last_rec_id,
+                    page.max_rec_id,
+                    page.row_count(),
+                    page.database_recreated
+                ),
+                ReportEvent::SyncComplete(done) => format!(
+                    "Report SyncComplete sync_id={} pages={} rows={} epoch={} max_rec_id={} next={}",
+                    done.ticket.sync_id,
+                    done.page_count,
+                    done.total_rows,
+                    done.epoch,
+                    done.max_rec_id,
+                    done.next_from_rec_id
+                ),
+                ReportEvent::AliveMapComplete(done) => {
+                    let outcome = match &done.outcome {
+                        moonproto::ReportAliveMapOutcome::DatabaseRecreated => {
+                            "database-recreated".to_string()
+                        }
+                        moonproto::ReportAliveMapOutcome::Snapshot => "snapshot".to_string(),
+                    };
+                    format!(
+                        "Report AliveMapComplete sync_id={} epoch={} covered_up_to={} outcome={}",
+                        done.ticket.sync_id,
+                        done.epoch,
+                        done.covered_up_to,
+                        outcome
+                    )
+                }
+                ReportEvent::OpenRowsCheckStarted { rec_ids } => {
+                    format!("Report OpenRowsCheckStarted count={}", rec_ids.len())
+                }
+                ReportEvent::OpenRowsCheckComplete { rec_ids } => {
+                    format!("Report OpenRowsCheckComplete count={}", rec_ids.len())
+                }
+                ReportEvent::SchemaRejected { reason } => {
+                    format!("Report SchemaRejected reason={reason}")
+                }
+            };
+            log_server_event(&st, event_no, summary);
+        }
+        Event::EngineResponse(resp) => {
+            record_engine_response(&mut st, event_no, resp, candles_snapshot_tx);
+        }
+        Event::Arb(arb) => {
+            log_server_event(&st, event_no, format!("Arb {}", arb_summary(arb)));
+        }
+        Event::KernelHealth(health) => {
+            st.kernel_health_events += 1;
+            st.kernel_health = Some(*health);
+            log_server_event(&st, event_no, format!("KernelHealth {health:?}"));
+        }
+        Event::News(event) => {
+            match event {
+                NewsEvent::Received { .. } => st.news_live_events += 1,
+                NewsEvent::TagsUpdated { .. } => st.news_tags_events += 1,
+                NewsEvent::HistoryApplied {
+                    news_count,
+                    tags_included,
+                } => {
+                    st.news_history_events += 1;
+                    st.news_history_count = st.news_history_count.max(*news_count);
+                    st.news_history_tags_seen |= *tags_included;
+                }
+            }
+            log_server_event(&st, event_no, format!("News {event:?}"));
+        }
+        Event::ServerLog(log) => {
+            st.server_logs += 1;
+            log_server_event(
+                &st,
+                event_no,
+                format!(
+                    "LogMsg time_ms={} msg={}",
+                    log.time().unix_millis(),
+                    short_text(&log.msg, 220)
+                ),
+            );
+        }
+        Event::Raw { cmd, payload } => {
+            st.raw_events += 1;
+            log_server_event(
+                &st,
+                event_no,
+                format!(
+                    "Raw cmd={cmd:?} len={} head={}",
+                    payload.len(),
+                    hex_preview(payload, 32)
+                ),
+            );
+        }
+        Event::ParseFailed { cmd, len, payload } => {
+            st.parse_failed += 1;
+            let hash = fnv1a64(payload);
+            let dump = write_parse_failed_dump(&st.label, event_no, *cmd, payload);
+            st.parse_failures.push(ParseFailureRecord {
+                event_no,
+                cmd: *cmd,
+                len: *len,
+                hash,
+                dump: dump.clone(),
+            });
+            let dump_suffix = dump
+                .as_ref()
+                .map(|path| format!(" dump={}", path.display()))
+                .unwrap_or_else(|| " dump=<write-failed>".to_string());
+            log_server_event(
+                &st,
+                event_no,
+                format!(
+                    "ParseFailed cmd={cmd:?} len={len} hash={:016X} head={}{}",
+                    hash,
+                    hex_preview(payload, 32),
+                    dump_suffix
+                ),
+            );
+        }
+        other => {
+            log_server_event(&st, event_no, format!("{other:?}"));
+        }
+    }
+}
+
+fn sync_market_probe_from_dispatcher(
+    st: &mut SessionStats,
+    event_no: u64,
+    dispatcher: &MoonStateSnapshot,
+    log_changes: bool,
+) {
+    let market_present = dispatcher.markets().get(&st.market).is_some();
+    if log_changes && market_present && st.last_market_price.is_none() {
+        log_server_event(
+            st,
+            event_no,
+            format!("Market handle resolved market={}", st.market),
+        );
+    }
+    if let Some(price) = dispatcher.markets().price(&st.market) {
+        st.last_market_price = Some(MarketProbePrice::from(&price));
+        if price.bid <= 0.0 || price.ask <= 0.0 || price.ask < price.bid {
+            st.market_invariant_error = Some(format!(
+                "bad UpdateMarketsList price for {}: bid={:.8} ask={:.8}",
+                st.market, price.bid, price.ask
+            ));
+        }
+    }
+}
+
+fn record_order_state_snapshot(st: &mut SessionStats, dispatcher: &MoonStateSnapshot) {
+    for order in dispatcher.orders().iter() {
+        st.order_status_by_uid.insert(order.uid, order.status);
+        st.order_market_by_uid
+            .insert(order.uid, order.market_name.clone());
+        st.order_sell_reason_by_uid
+            .insert(order.uid, order.sell_reason().description().to_string());
+    }
+}
+
+fn order_event_kind(ev: &OrderEvent) -> &'static str {
+    match ev {
+        OrderEvent::Created(_) => "Created",
+        OrderEvent::Updated(_) => "Updated",
+        OrderEvent::Removed(_) => "Removed",
+        OrderEvent::TracePoint { .. } => "TracePoint",
+        OrderEvent::CorridorChanged(_) => "CorridorChanged",
+        OrderEvent::Snapshot => "Snapshot",
+        OrderEvent::Ignored { .. } => "Ignored",
+    }
+}
+
+fn record_strategy_snapshot(
+    st: &mut SessionStats,
+    event_no: u64,
+    kind: &str,
+    server_epoch: u64,
+    raw_data: &[u8],
+) {
+    st.strategy_events += 1;
+    st.strategy_snapshot_events += 1;
+    let raw_dump = write_strategy_raw_dump(&st.label, event_no, kind, server_epoch, raw_data);
+    let raw_dump_suffix = raw_dump
+        .as_ref()
+        .map(|path| format!(" dump={}", path.display()))
+        .unwrap_or_else(|| " dump=<write-failed>".to_string());
+    if let Some(batch) = parse_strategy_batch(raw_data) {
+        let ids_preview = batch
+            .strategies
+            .iter()
+            .take(6)
+            .map(|s| s.strategy_id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let count = batch.strategies.len();
+        for strategy in batch.strategies {
+            st.strategies_by_id.insert(strategy.strategy_id, strategy);
+        }
+        log_server_event(
+            st,
+            event_no,
+            format!(
+                "Strat {kind} epoch={} raw={} strategies={} ids=[{}]{}",
+                server_epoch,
+                raw_data.len(),
+                count,
+                ids_preview,
+                raw_dump_suffix
+            ),
+        );
+    } else {
+        st.parse_failed += 1;
+        log_server_event(
+            st,
+            event_no,
+            format!(
+                "Strat {kind} epoch={} raw={} parse_failed head={}{}",
+                server_epoch,
+                raw_data.len(),
+                hex_preview(raw_data, 32),
+                raw_dump_suffix
+            ),
+        );
+    }
+}
+
+fn record_engine_response(
+    st: &mut SessionStats,
+    event_no: u64,
+    resp: &EngineResponse,
+    candles_snapshot_tx: Option<&mpsc::Sender<Vec<RequestCandlesMarket>>>,
+) {
+    st.engine_responses += 1;
+    *st.engine_method_counts
+        .entry(resp.method.to_byte())
+        .or_insert(0) += 1;
+    let mut detail = format!(
+        "EngineResponse #{} uid={} method={:?} success={} error_code={} error_msg={} data_len={} head={}",
+        st.engine_responses,
+        resp.request_uid,
+        resp.method,
+        resp.success,
+        resp.error_code,
+        short_text(&resp.error_msg, 120),
+        resp.data.len(),
+        hex_preview(&resp.data, 24)
+    );
+
+    if resp.method == EngineMethod::RequestCandlesData {
+        st.candles_chunks += 1;
+        if let Some((chunk_index, chunk_total, payload_len)) = candles_chunk_info(&resp.data) {
+            st.candles_payload_bytes += payload_len;
+            if st.candles_seen_chunks.len() != chunk_total {
+                st.candles_seen_chunks.clear();
+                st.candles_seen_chunks.resize(chunk_total, false);
+            }
+            if let Some(seen) = st.candles_seen_chunks.get_mut(chunk_index) {
+                *seen = true;
+            }
+            detail.push_str(&format!(
+                " candle_chunk={}/{} payload_len={} seen_missing=[{}]",
+                chunk_index + 1,
+                chunk_total,
+                payload_len,
+                missing_chunk_indexes(&st.candles_seen_chunks)
+            ));
+        } else {
+            detail.push_str(" candle_chunk=malformed");
+        }
+
+        if st.candles_requested && resp.success {
+            let before = st.candles_aggregator.progress();
+            let merged = st.candles_aggregator.on_chunk(&resp.data);
+            let after = st.candles_aggregator.progress();
+            st.candles_last_progress = after;
+            if merged.is_none() && before == after {
+                st.candles_ignored += 1;
+                detail.push_str(" candle_state=ignored_or_duplicate");
+            } else if let Some(zipped_data) = merged {
+                match parse_request_candles_data_response(&zipped_data) {
+                    Some(markets) => {
+                        let candles = markets.iter().map(|m| m.candles_5m.len()).sum();
+                        let market_preview = markets
+                            .iter()
+                            .take(8)
+                            .map(|m| format!("{}:{}", m.market_name, m.candles_5m.len()))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let summary = CandlesSnapshotSummary {
+                            uid: resp.request_uid,
+                            zipped_bytes: zipped_data.len(),
+                            markets: markets.len(),
+                            candles,
+                            market_preview,
+                        };
+                        detail.push_str(&format!(" candle_complete {}", summary.summary()));
+                        st.candles_complete = Some(summary);
+                        if let Some(tx) = candles_snapshot_tx {
+                            let _ = tx.send(markets);
+                        }
+                    }
+                    None => {
+                        st.parse_failed += 1;
+                        detail.push_str(&format!(
+                            " candle_complete parse_failed zipped={}",
+                            zipped_data.len()
+                        ));
+                    }
+                }
+            } else {
+                let (received, total) = st.candles_last_progress;
+                detail.push_str(&format!(" candle_progress={received}/{total}"));
+            }
+        }
+    }
+
+    log_server_event(st, event_no, detail);
+}
+
+fn arb_summary(event: &moonproto::ArbEvent) -> String {
+    match event {
+        moonproto::ArbEvent::PricesApplied {
+            uid,
+            version,
+            market_blocks,
+            price_items,
+            applied_prices,
+        } => {
+            format!(
+                "PricesApplied uid={} version={} market_blocks={} price_items={} applied_prices={}",
+                uid, version, market_blocks, price_items, applied_prices
+            )
+        }
+        moonproto::ArbEvent::IsolationApplied {
+            uid,
+            version,
+            entries,
+            applied_entries,
+        } => {
+            format!(
+                "IsolationApplied uid={} version={} entries={} applied_entries={}",
+                uid, version, entries, applied_entries
+            )
+        }
+    }
+}
+
+fn candles_chunk_info(data: &[u8]) -> Option<(usize, usize, usize)> {
+    if data.len() < 4 {
+        return None;
+    }
+    let chunk_index = u16::from_le_bytes([data[0], data[1]]) as usize;
+    let chunk_total = u16::from_le_bytes([data[2], data[3]]) as usize;
+    Some((chunk_index, chunk_total, data.len() - 4))
+}
+
+fn missing_chunk_indexes(seen_chunks: &[bool]) -> String {
+    if seen_chunks.is_empty() {
+        return String::new();
+    }
+    let missing = seen_chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, seen)| (!*seen).then_some((idx + 1).to_string()))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        "none".to_string()
+    } else {
+        missing.join(",")
+    }
+}
+
+fn should_log_stream_count(count: u64) -> bool {
+    count <= 10 || count.is_power_of_two()
+}
+
+fn log_server_event(st: &SessionStats, event_no: u64, detail: impl AsRef<str>) {
+    println!("SERVER->{} #{event_no}: {}", st.label, detail.as_ref());
+}
+
+fn short_text(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn hex_preview(data: &[u8], max_len: usize) -> String {
+    let mut out = data
+        .iter()
+        .take(max_len)
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if data.len() > max_len {
+        out.push_str(" ...");
+    }
+    out
+}
+
+fn write_parse_failed_dump(
+    label: &str,
+    event_no: u64,
+    cmd: Command,
+    payload: &[u8],
+) -> Option<std::path::PathBuf> {
+    let name = format!(
+        "moonproto_firetest_parse_failed_{}_{}_{}_{:06}.bin",
+        sanitize_file_component(label),
+        sanitize_file_component(&format!("{cmd:?}")),
+        payload.len(),
+        event_no
+    );
+    let path = std::env::temp_dir().join(name);
+    match std::fs::write(&path, payload) {
+        Ok(()) => Some(path),
+        Err(err) => {
+            eprintln!(
+                "WARN: failed to write ParseFailed dump label={label} cmd={cmd:?} len={} err={err}",
+                payload.len()
+            );
+            None
+        }
+    }
+}
+
+fn sanitize_file_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn pump_pair_for(a: &mut Session, b: &mut Session, duration: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < duration {
+        a.pump(PUMP_SLICE);
+        b.pump(PUMP_SLICE);
+    }
+}
+
+fn pump_session_until<F>(
+    session: &mut Session,
+    timeout: Duration,
+    label: &str,
+    mut predicate: F,
+) -> bool
+where
+    F: FnMut(&Session) -> bool,
+{
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        session.pump(PUMP_SLICE);
+        if predicate(session) {
+            println!("OK: {label} after {:.2}s", start.elapsed().as_secs_f64());
+            return true;
+        }
+    }
+    let stats = session.snapshot();
+    eprintln!(
+        "FIRETEST TIMEOUT {label}: session=[{}] metrics=[{}]",
+        stats.summary(),
+        session.protocol_summary(),
+    );
+    false
+}
+
+fn pump_pair_until<F>(
+    a: &mut Session,
+    b: &mut Session,
+    timeout: Duration,
+    label: &str,
+    mut predicate: F,
+) -> bool
+where
+    F: FnMut(&SessionStats, &SessionStats) -> bool,
+{
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        a.pump(PUMP_SLICE);
+        b.pump(PUMP_SLICE);
+        let a_stats = a.snapshot();
+        let b_stats = b.snapshot();
+        if predicate(&a_stats, &b_stats) {
+            println!("OK: {label} after {:.2}s", start.elapsed().as_secs_f64());
+            return true;
+        }
+    }
+
+    let a_stats = a.snapshot();
+    let b_stats = b.snapshot();
+    eprintln!(
+        "FIRETEST TIMEOUT {label}: A=[{}] A.metrics=[{}] B=[{}] B.metrics=[{}]",
+        a_stats.summary(),
+        a.protocol_summary(),
+        b_stats.summary(),
+        b.protocol_summary()
+    );
+    log_err_emu_pair(label, a, b);
+    false
+}
+
+fn pump_pair_until_sessions<F>(
+    a: &mut Session,
+    b: &mut Session,
+    timeout: Duration,
+    label: &str,
+    mut predicate: F,
+) -> bool
+where
+    F: FnMut(&Session, &Session) -> bool,
+{
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        a.pump(PUMP_SLICE);
+        b.pump(PUMP_SLICE);
+        if predicate(a, b) {
+            println!("OK: {label} after {:.2}s", start.elapsed().as_secs_f64());
+            return true;
+        }
+    }
+
+    let a_stats = a.snapshot();
+    let b_stats = b.snapshot();
+    eprintln!(
+        "FIRETEST TIMEOUT {label}: A=[{}] A.metrics=[{}] B=[{}] B.metrics=[{}]",
+        a_stats.summary(),
+        a.protocol_summary(),
+        b_stats.summary(),
+        b.protocol_summary()
+    );
+    log_err_emu_pair(label, a, b);
+    false
+}
+
+fn active_candle_kind(session: &Session, market: &str) -> Option<DeepHistoryKind> {
+    session
+        .client
+        .active_subscriptions()
+        .live_candle_timeframes
+        .into_iter()
+        .find(|subscription| subscription.market.eq_ignore_ascii_case(market))
+        .map(|subscription| subscription.kind)
+}
+
+fn engine_response_count(session: &Session, method: EngineMethod) -> u64 {
+    session
+        .stats
+        .lock()
+        .unwrap()
+        .engine_method_counts
+        .get(&method.to_byte())
+        .copied()
+        .unwrap_or(0)
+}
+
+fn saw_candle_tf_state_since(
+    session: &Session,
+    from: usize,
+    market: &str,
+    kind: DeepHistoryKind,
+) -> bool {
+    session.candle_tf_state_events[from..]
+        .iter()
+        .any(|event| event.market_name.eq_ignore_ascii_case(market) && event.kind == Some(kind))
+}
+
+fn run_candle_timeframe_state_gate(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    let initial_kind = DeepHistoryKind::Hour1;
+    let changed_kind = DeepHistoryKind::Hour4;
+    let a_response_before = engine_response_count(a, EngineMethod::SubscribeCandles);
+    let b_response_before = engine_response_count(b, EngineMethod::SubscribeCandles);
+    a.client
+        .streams()
+        .subscribe_candles([cfg.market.as_str()], initial_kind)
+        .expect("client A initial candle subscription must queue");
+    b.client
+        .streams()
+        .subscribe_candles([cfg.market.as_str()], initial_kind)
+        .expect("client B initial candle subscription must queue");
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "per-market candle initial subscription",
+            |a, b| {
+                active_candle_kind(a, &cfg.market) == Some(initial_kind)
+                    && active_candle_kind(b, &cfg.market) == Some(initial_kind)
+                    && engine_response_count(a, EngineMethod::SubscribeCandles) > a_response_before
+                    && engine_response_count(b, EngineMethod::SubscribeCandles) > b_response_before
+            },
+        ),
+        "both clients must retain the initial candle timeframe for {}",
+        cfg.market
+    );
+
+    let b_event_from = b.candle_tf_state_events.len();
+    a.client
+        .streams()
+        .subscribe_candles([cfg.market.as_str()], changed_kind)
+        .expect("client A candle timeframe change must queue");
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "cross-client candle timeframe state",
+            |a, b| {
+                active_candle_kind(a, &cfg.market) == Some(changed_kind)
+                    && active_candle_kind(b, &cfg.market) == Some(changed_kind)
+                    && saw_candle_tf_state_since(b, b_event_from, &cfg.market, changed_kind)
+            },
+        ),
+        "the core must broadcast the new {} candle timeframe to the other subscribed client",
+        cfg.market
+    );
+
+    let a_unsubscribe_before = engine_response_count(a, EngineMethod::UnsubscribeCandles);
+    let b_unsubscribe_before = engine_response_count(b, EngineMethod::UnsubscribeCandles);
+    a.client
+        .streams()
+        .unsubscribe_candles([cfg.market.as_str()])
+        .expect("client A candle unsubscribe must queue");
+    b.client
+        .streams()
+        .unsubscribe_candles([cfg.market.as_str()])
+        .expect("client B candle unsubscribe must queue");
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "per-market candle unsubscribe",
+            |a, b| {
+                active_candle_kind(a, &cfg.market).is_none()
+                    && active_candle_kind(b, &cfg.market).is_none()
+                    && engine_response_count(a, EngineMethod::UnsubscribeCandles)
+                        > a_unsubscribe_before
+                    && engine_response_count(b, EngineMethod::UnsubscribeCandles)
+                        > b_unsubscribe_before
+            },
+        ),
+        "the core must acknowledge candle unsubscribe and remove retained intent for both clients"
+    );
+    println!(
+        "OK: per-market candle TF state market={} {:?}->{:?}",
+        cfg.market, initial_kind, changed_kind
+    );
+}
+
+fn has_nonblocking_api_refresh(st: &SessionStats) -> bool {
+    has_transfer_assets_refresh(st) && has_coin_card_candles(st)
+}
+
+fn request_nonblocking_api_refresh(session: &mut Session, cfg: &FireConfig) {
+    session.request_transfer_assets_refresh();
+    session.request_coin_card_candles(&cfg.market, FIRETEST_COIN_CARD_KIND);
+}
+
+fn pump_pair_until_nonblocking_api_refresh(
+    a: &mut Session,
+    b: &mut Session,
+    cfg: &FireConfig,
+    timeout: Duration,
+) -> bool {
+    request_nonblocking_api_refresh(a, cfg);
+    request_nonblocking_api_refresh(b, cfg);
+    let start = Instant::now();
+    let mut next_retry = start + Duration::from_secs(2);
+    let mut attempts = 1u32;
+    while start.elapsed() < timeout {
+        a.pump(PUMP_SLICE);
+        b.pump(PUMP_SLICE);
+        let a_ok = has_nonblocking_api_refresh(&a.snapshot());
+        let b_ok = has_nonblocking_api_refresh(&b.snapshot());
+        if a_ok && b_ok {
+            println!(
+                "OK: non-blocking transfer assets + CoinCard candles after {:.2}s attempts={attempts}",
+                start.elapsed().as_secs_f64()
+            );
+            return true;
+        }
+        if Instant::now() >= next_retry {
+            attempts += 1;
+            if !a_ok {
+                println!(
+                    "FIRETEST retry non-blocking API for A after {:.2}s",
+                    start.elapsed().as_secs_f64()
+                );
+                request_nonblocking_api_refresh(a, cfg);
+            }
+            if !b_ok {
+                println!(
+                    "FIRETEST retry non-blocking API for B after {:.2}s",
+                    start.elapsed().as_secs_f64()
+                );
+                request_nonblocking_api_refresh(b, cfg);
+            }
+            next_retry += Duration::from_secs(2);
+        }
+    }
+
+    let a_stats = a.snapshot();
+    let b_stats = b.snapshot();
+    eprintln!(
+        "FIRETEST TIMEOUT non-blocking transfer assets + CoinCard candles: A=[{}] A.metrics=[{}] B=[{}] B.metrics=[{}]",
+        a_stats.summary(),
+        a.protocol_summary(),
+        b_stats.summary(),
+        b.protocol_summary()
+    );
+    log_err_emu_pair("non-blocking transfer assets + CoinCard candles", a, b);
+    false
+}
+
+fn has_initial_health(st: &SessionStats) -> bool {
+    let news_healthy = st.kernel_license_state.is_some_and(|license| {
+        !license.news_service_active(MoonTime::now())
+            || (st.news_history_events > 0
+                && st.news_history_count > 0
+                && st.news_history_tags_seen
+                && st.news_snapshot_count > 0
+                && st.news_tags_present)
+    });
+    st.connected_now
+        && st.strategy_snapshot_events > 0
+        && st.strategy_schema_events > 0
+        && st.strategy_schema_kinds > 0
+        && st.strategy_schema_fields > 0
+        && st.kernel_health_events > 0
+        && st.kernel_health.is_some_and(kernel_health_is_complete)
+        && news_healthy
+        && st.trades_apply > 0
+        && st.orderbook_apply > 0
+        && st.parse_failed == 0
+}
+
+fn session_profit_snapshot_counts(snapshot: &MoonStateSnapshot) -> (usize, usize, usize) {
+    let mut markets = 0usize;
+    let mut known = 0usize;
+    let mut nonzero = 0usize;
+    for market in snapshot.markets().iter() {
+        markets += 1;
+        if let Some(value) = market.session_profit() {
+            known += 1;
+            if value != 0.0 {
+                nonzero += 1;
+            }
+        }
+    }
+    (markets, known, nonzero)
+}
+
+fn run_session_profit_and_hl_limit_gate(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    assert!(
+        pump_pair_until(a, b, cfg.wait, "session profit state", |a, b| a
+            .session_profit_events
+            > 0
+            && b.session_profit_events > 0),
+        "FireTest did not receive session-profit state within {:?}: A=[{}] B=[{}]",
+        cfg.wait,
+        a.snapshot().summary(),
+        b.snapshot().summary()
+    );
+
+    let a_is_hyperliquid = matches!(
+        a.state_snapshot().server_info().exchange_code,
+        Some(ExchangeCode::Hyper | ExchangeCode::FHyper)
+    );
+    let b_is_hyperliquid = matches!(
+        b.state_snapshot().server_info().exchange_code,
+        Some(ExchangeCode::Hyper | ExchangeCode::FHyper)
+    );
+    if a_is_hyperliquid || b_is_hyperliquid {
+        assert!(
+            pump_pair_until(a, b, cfg.wait, "HyperLiquid request-limit state", |a, b| {
+                (!a_is_hyperliquid || a.hyperliquid_request_limit_events > 0)
+                    && (!b_is_hyperliquid || b.hyperliquid_request_limit_events > 0)
+            }),
+            "FireTest did not receive HyperLiquid request-limit state within {:?}: A=[{}] B=[{}]",
+            cfg.wait,
+            a.snapshot().summary(),
+            b.snapshot().summary()
+        );
+    }
+
+    for session in [&*a, &*b] {
+        let stats = session.snapshot();
+        let snapshot = session.state_snapshot();
+        let (markets, known, nonzero) = session_profit_snapshot_counts(snapshot.as_ref());
+        assert!(
+            markets > 0 && known == markets,
+            "FireTest {}: session-profit full snapshot covers {known}/{markets} markets",
+            stats.label
+        );
+        assert_eq!(
+            nonzero, stats.session_profit_nonzero_count,
+            "FireTest {}: session-profit event/state nonzero count mismatch",
+            stats.label
+        );
+
+        let exchange = snapshot.server_info().exchange_code;
+        let is_hyperliquid = matches!(exchange, Some(ExchangeCode::Hyper | ExchangeCode::FHyper));
+        if is_hyperliquid {
+            assert!(
+                stats.hyperliquid_request_limit_events > 0,
+                "FireTest {}: HyperLiquid core did not publish request-limit state",
+                stats.label
+            );
+            println!(
+                "OK: FIRETEST {}: HyperLiquid requests left={:?}",
+                stats.label,
+                snapshot.settings().hyperliquid_requests_left
+            );
+        } else {
+            assert_eq!(
+                snapshot.settings().hyperliquid_requests_left,
+                None,
+                "FireTest {}: non-HyperLiquid core published a request quota",
+                stats.label
+            );
+            println!(
+                "FIRETEST SKIPPED {}: HyperLiquid request-limit state is not applicable to exchange={}",
+                stats.label,
+                exchange.map_or("Unknown", ExchangeCode::name)
+            );
+        }
+        println!(
+            "OK: FIRETEST {}: session profits known={}/{} nonzero={}",
+            stats.label, known, markets, nonzero
+        );
+    }
+}
+
+fn kernel_health_is_complete(health: KernelHealth) -> bool {
+    health.process_cpu_percent <= 100
+        && health.system_cpu_percent <= 100
+        && health.used_memory_mb.is_some()
+        && health.free_physical_memory_mb.is_some()
+        && health.logical_cpu_count.is_some_and(|cores| cores > 0)
+        && health.core_round_trip_ms.is_some_and(|ms| ms > 0)
+}
+
+fn has_transfer_assets_refresh(st: &SessionStats) -> bool {
+    st.transfer_asset_updated_mask == 0b111 && st.transfer_asset_failures == 0
+}
+
+fn run_transfer_assets_refresh_coalescing_gate(
+    a: &mut Session,
+    b: &mut Session,
+    timeout: Duration,
+) {
+    let before = a.snapshot().transfer_asset_refresh_completed;
+    for _ in 0..FIRETEST_TRANSFER_ASSETS_BURST_CALLS {
+        a.client
+            .balances()
+            .refresh_transfer_assets()
+            .expect("transfer-assets burst intent must queue");
+    }
+    assert!(
+        pump_pair_until(
+            a,
+            b,
+            timeout,
+            "transfer-assets refresh coalescing",
+            |a, _| a.transfer_asset_refresh_completed > before
+        ),
+        "transfer-assets burst did not complete within {timeout:?}"
+    );
+
+    let settle_started = Instant::now();
+    while settle_started.elapsed() < FIRETEST_TRANSFER_ASSETS_SETTLE {
+        a.pump(PUMP_SLICE);
+        b.pump(PUMP_SLICE);
+    }
+    let completed = a
+        .snapshot()
+        .transfer_asset_refresh_completed
+        .saturating_sub(before);
+    assert_eq!(
+        completed, 1,
+        "{} immediate full-refresh intents must produce one server batch",
+        FIRETEST_TRANSFER_ASSETS_BURST_CALLS
+    );
+    println!(
+        "OK: {} transfer-assets refresh intents produced one server batch",
+        FIRETEST_TRANSFER_ASSETS_BURST_CALLS
+    );
+}
+
+fn has_coin_card_candles(st: &SessionStats) -> bool {
+    st.coin_card_updates > 0
+        && st.coin_card_failures == 0
+        && st.coin_card_last_count >= FIRETEST_MIN_COIN_CARD_CANDLES
+}
+
+fn has_market_consistency(st: &SessionStats) -> bool {
+    if !st.connected_now || st.parse_failed != 0 || st.market_invariant_error.is_some() {
+        return false;
+    }
+    if st.market_index.is_none() {
+        return false;
+    }
+    let Some(bid) = st.last_book_bid else {
+        return false;
+    };
+    let Some(ask) = st.last_book_ask else {
+        return false;
+    };
+    let Some(trade_price) = st.last_trade_price else {
+        return false;
+    };
+    let Some(market_price) = st.last_market_price else {
+        return false;
+    };
+    !st.market.is_empty()
+        && st.target_orderbook_full > 0
+        && st.target_orderbook_update > 0
+        && st.target_trade_packets > 0
+        && bid > 0.0
+        && ask > bid
+        && market_price.bid > 0.0
+        && market_price.ask >= market_price.bid
+        && price_near_envelope(trade_price, bid, ask)
+        && price_near_envelope(market_price.bid, bid, ask)
+        && price_near_envelope(market_price.ask, bid, ask)
+}
+
+fn price_near_envelope(price: f64, bid: f64, ask: f64) -> bool {
+    if price <= 0.0 || bid <= 0.0 || ask <= 0.0 || ask < bid {
+        return false;
+    }
+    let lower = bid * (1.0 - PRICE_NEIGHBORHOOD_PCT);
+    let upper = ask * (1.0 + PRICE_NEIGHBORHOOD_PCT);
+    price >= lower && price <= upper
+}
+
+fn log_err_emu_pair(label: &str, a: &Session, b: &Session) {
+    let a_stats = a.snapshot();
+    let b_stats = b.snapshot();
+    log_err_emu_snapshot(
+        label,
+        "A",
+        &a.client.err_emu_diagnostics_snapshot(),
+        &a_stats.parse_failures,
+    );
+    log_err_emu_snapshot(
+        label,
+        "B",
+        &b.client.err_emu_diagnostics_snapshot(),
+        &b_stats.parse_failures,
+    );
+}
+
+fn log_protocol_cpu_pair(label: &str, a: &Session, b: &Session) {
+    println!("FIRETEST CPU {label} A: {}", a.protocol_summary());
+    println!("FIRETEST CPU {label} B: {}", b.protocol_summary());
+    assert_protocol_cpu_gate(&format!("{label} A"), &a.client.protocol_metrics_snapshot());
+    assert_protocol_cpu_gate(&format!("{label} B"), &b.client.protocol_metrics_snapshot());
+}
+
+fn log_err_emu_snapshot(
+    label: &str,
+    session: &str,
+    diag: &ErrEmuDiagnostics,
+    parse_failures: &[ParseFailureRecord],
+) {
+    if diag.valid_packets == 0 {
+        eprintln!(
+            "FIRETEST ErrEmu {label} {session}: no packets counted while err_emu was enabled"
+        );
+        return;
+    }
+    let actual_drop = diag.dropped_packets as f64 / diag.valid_packets.max(1) as f64 * 100.0;
+    eprintln!(
+        "FIRETEST ErrEmu {label} {session}: configured={} rx_valid={} rx_delivered={} rx_dropped={} rx_actual_drop={:.2}% tx_sent={} tx_blackholed={}",
+        diag.configured_rate,
+        diag.valid_packets,
+        diag.delivered_packets,
+        diag.dropped_packets,
+        actual_drop,
+        diag.outgoing_packets,
+        diag.outgoing_blackholed_packets
+    );
+    for raw in [
+        Command::Sliced.to_byte(),
+        Command::SlicedACK.to_byte(),
+        Command::UI.to_byte(),
+        Command::API.to_byte(),
+        Command::WhoAreYou.to_byte(),
+        Command::Fine.to_byte(),
+        Command::WrongHello.to_byte(),
+        Command::WantNewHello.to_byte(),
+        Command::NeedHelloAgain.to_byte(),
+        Command::Ping.to_byte(),
+    ] {
+        if let Some(cmd) = diag.by_cmd.iter().find(|cmd| cmd.raw_cmd == raw) {
+            let cmd_drop = cmd.dropped_packets as f64 / cmd.valid_packets.max(1) as f64 * 100.0;
+            eprintln!(
+                "FIRETEST ErrEmu {label} {session}: cmd={:?}/{} valid={} delivered={} dropped={} actual_drop={:.2}%",
+                Command::from_byte(raw),
+                raw,
+                cmd.valid_packets,
+                cmd.delivered_packets,
+                cmd.dropped_packets,
+                cmd_drop
+            );
+        }
+    }
+
+    for raw in [
+        Command::Hello.to_byte(),
+        Command::HelloAgain.to_byte(),
+        Command::ImFriend.to_byte(),
+        Command::LogOff.to_byte(),
+        Command::Ping.to_byte(),
+        Command::SlicedACK.to_byte(),
+    ] {
+        if let Some(cmd) = diag.outgoing_by_cmd.iter().find(|cmd| cmd.raw_cmd == raw) {
+            eprintln!(
+                "FIRETEST ErrEmu {label} {session}: tx_cmd={:?}/{} sent={}",
+                Command::from_byte(raw),
+                raw,
+                cmd.valid_packets,
+            );
+        }
+        if let Some(cmd) = diag
+            .outgoing_blackholed_by_cmd
+            .iter()
+            .find(|cmd| cmd.raw_cmd == raw)
+        {
+            eprintln!(
+                "FIRETEST ErrEmu {label} {session}: tx_cmd={:?}/{} blackholed={}",
+                Command::from_byte(raw),
+                raw,
+                cmd.valid_packets,
+            );
+        }
+    }
+
+    log_parse_failure_correlations(label, session, diag, parse_failures);
+
+    let candidates: Vec<_> = diag
+        .sliced
+        .iter()
+        .filter(|dg| is_sliced_response_candidate(dg))
+        .collect();
+    if candidates.is_empty() {
+        eprintln!(
+            "FIRETEST ErrEmu {label} {session}: no observed Sliced API/UI response datagrams"
+        );
+    } else {
+        let total = candidates.len();
+        for (idx, dg) in candidates.iter().enumerate() {
+            if idx == 8 && total > 24 {
+                eprintln!(
+                    "FIRETEST ErrEmu {label} {session}: ... skipped {} middle Sliced candidates ...",
+                    total - 24
+                );
+            }
+            if idx >= 8 && idx + 16 < total {
+                continue;
+            }
+            eprintln!(
+                "FIRETEST ErrEmu {label} {session}: Sliced candidate {}/{}: {}",
+                idx + 1,
+                total,
+                describe_sliced_candidate(diag.configured_rate, dg)
+            );
+        }
+    }
+}
+
+fn log_parse_failure_correlations(
+    label: &str,
+    session: &str,
+    diag: &ErrEmuDiagnostics,
+    parse_failures: &[ParseFailureRecord],
+) {
+    for pf in parse_failures.iter().rev().take(8).rev() {
+        let dump = pf
+            .dump
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        eprintln!(
+            "FIRETEST ErrEmu {label} {session}: parse_failed event={} cmd={:?} len={} hash={:016X} dump={}",
+            pf.event_no, pf.cmd, pf.len, pf.hash, dump
+        );
+        let matches = diag
+            .sliced
+            .iter()
+            .filter(|dg| dg.completed_payload_hash == Some(pf.hash))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            eprintln!(
+                "FIRETEST ErrEmu {label} {session}: parse_failed hash {:016X} has no completed Sliced match in current diagnostics window",
+                pf.hash
+            );
+        } else {
+            for dg in matches {
+                eprintln!(
+                    "FIRETEST ErrEmu {label} {session}: parse_failed hash {:016X} matched {}",
+                    pf.hash,
+                    describe_sliced_candidate(diag.configured_rate, dg)
+                );
+            }
+        }
+    }
+}
+
+fn is_sliced_response_candidate(dg: &ErrEmuSlicedDatagramDiagnostics) -> bool {
+    let completed_settings =
+        dg.completed_cmd == Some(Command::UI.to_byte()) && dg.completed_ui_cmd_id == Some(1);
+    let completed_orderbook = dg.completed_cmd == Some(Command::OrderBook.to_byte());
+    let block0_ui = dg
+        .block0_wire_cmd
+        .map(|cmd| Command::from_byte(cmd & 0x7F) == Command::UI)
+        .unwrap_or(false);
+    let block0_orderbook = dg
+        .block0_wire_cmd
+        .map(|cmd| Command::from_byte(cmd & 0x7F) == Command::OrderBook)
+        .unwrap_or(false);
+    let block0_known_settings = dg.block0_ui_cmd_id == Some(1);
+    let completed_api = dg.completed_cmd == Some(Command::API.to_byte());
+    let completed_strat = dg.completed_cmd == Some(Command::Strat.to_byte());
+    let block0_api = dg
+        .block0_wire_cmd
+        .map(|cmd| Command::from_byte(cmd & 0x7F) == Command::API)
+        .unwrap_or(false);
+    let block0_strat = dg
+        .block0_wire_cmd
+        .map(|cmd| Command::from_byte(cmd & 0x7F) == Command::Strat)
+        .unwrap_or(false);
+    completed_api
+        || block0_api
+        || completed_strat
+        || block0_strat
+        || completed_orderbook
+        || block0_orderbook
+        || completed_settings
+        || (block0_ui && (block0_known_settings || dg.block0_ui_cmd_id.is_none()))
+}
+
+fn describe_sliced_candidate(configured_rate: u8, dg: &ErrEmuSlicedDatagramDiagnostics) -> String {
+    let missing = dg.missing_blocks();
+    let missing_preview = preview_u8(&missing, 24);
+    let unobserved = dg.unobserved_blocks();
+    let unobserved_preview = preview_u8(&unobserved, 24);
+    let observed_attempts = dg.delivered_packets + dg.dropped_packets;
+    let p = configured_rate as f64 / 100.0;
+    let pure_err_emu_p = if missing.is_empty() {
+        Some(0.0)
+    } else {
+        let mut acc = 1.0f64;
+        let mut attributable = true;
+        for block in &missing {
+            let drops = dg.block_drop_count(*block);
+            if drops == 0 {
+                attributable = false;
+                break;
+            }
+            acc *= p.powi(drops.min(i32::MAX as u64) as i32);
+        }
+        attributable.then_some(acc)
+    };
+    let pure_err = pure_err_emu_p
+        .map(|v| format!("{:.8}%", v * 100.0))
+        .unwrap_or_else(|| "not attributable to observed ErrEmu drops".to_string());
+    let payload_head = dg
+        .completed_payload_head
+        .map(|head| hex_preview(&head[..dg.completed_payload_head_len.min(head.len())], 8))
+        .unwrap_or_else(|| "none".to_string());
+    let payload_hash = dg
+        .completed_payload_hash
+        .map(|hash| format!("{hash:016X}"))
+        .unwrap_or_else(|| "none".to_string());
+    let observation = if dg.completed_cmd.is_some() && !unobserved.is_empty() {
+        format!(
+            " observation=completed-with-partial-diagnostics-window unobserved=[{}]",
+            unobserved_preview
+        )
+    } else {
+        String::new()
+    };
+    let orderbook = if dg.completed_cmd == Some(Command::OrderBook.to_byte()) {
+        format!(
+            " orderbook_market={:?} orderbook_kind={:?} orderbook_seq={:?} orderbook_full={:?} orderbook_buys={:?} orderbook_sells={:?}",
+            dg.completed_orderbook_market_index,
+            dg.completed_orderbook_kind,
+            dg.completed_orderbook_seq,
+            dg.completed_orderbook_is_full,
+            dg.completed_orderbook_buys,
+            dg.completed_orderbook_sells
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "Sliced d={} blocks={}/{} attempts={} delivered_packets={} dropped_packets={} wire_cmd={:?} ui_cmd={:?} complete_cmd={:?} complete_ui={:?} complete_strat_cmd={:?} complete_strat_uid={:?} complete_api_method={:?} complete_api_uid={:?} complete_api_success={:?}{} payload_len={:?} payload_hash={} payload_head={} missing=[{}] pure_err_emu_fail_p={}{}",
+        dg.datagram_num,
+        dg.delivered_unique_blocks(),
+        dg.blocks_count,
+        observed_attempts,
+        dg.delivered_packets,
+        dg.dropped_packets,
+        dg.block0_wire_cmd.map(Command::from_byte),
+        dg.block0_ui_cmd_id,
+        dg.completed_cmd.map(Command::from_byte),
+        dg.completed_ui_cmd_id,
+        dg.completed_strat_cmd_id,
+        dg.completed_strat_uid,
+        dg.completed_api_method.map(EngineMethod::from_byte),
+        dg.completed_api_uid,
+        dg.completed_api_success,
+        orderbook,
+        dg.completed_payload_len,
+        payload_hash,
+        payload_head,
+        missing_preview,
+        pure_err,
+        observation,
+    )
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
+fn preview_u8(values: &[u8], limit: usize) -> String {
+    if values.is_empty() {
+        return "none".to_string();
+    }
+    let mut out: Vec<String> = values
+        .iter()
+        .take(limit)
+        .map(|value| value.to_string())
+        .collect();
+    if values.len() > limit {
+        out.push("...".to_string());
+    }
+    out.join(",")
+}
+
+fn select_field(strategy: &StrategySnapshot, preferred: &str) -> String {
+    try_select_field(strategy, preferred).unwrap_or_else(|| {
+        panic!(
+            "strategy_id={} has neither string field `{preferred}` nor any fallback string field",
+            strategy.strategy_id
+        )
+    })
+}
+
+fn try_select_field(strategy: &StrategySnapshot, preferred: &str) -> Option<String> {
+    if matches!(strategy.fields.get(preferred), Some(FieldValue::String(_))) {
+        return Some(preferred.to_string());
+    }
+    strategy
+        .fields
+        .iter()
+        .find_map(|(name, value)| matches!(value, FieldValue::String(_)).then(|| name.to_string()))
+}
+
+fn strategy_field_string<'a>(
+    stats: &'a SessionStats,
+    strategy_id: u64,
+    field: &str,
+) -> Option<&'a str> {
+    match stats
+        .strategies_by_id
+        .get(&strategy_id)
+        .and_then(|s| s.fields.get(field))
+    {
+        Some(FieldValue::String(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn with_strategy_string(
+    mut strategy: StrategySnapshot,
+    field: &str,
+    value: String,
+    version_bump: i32,
+) -> StrategySnapshot {
+    strategy.strategy_ver = strategy.strategy_ver.saturating_add(version_bump.max(1));
+    strategy.last_date = now_epoch_ms();
+    strategy.fields.insert(field, FieldValue::String(value));
+    strategy
+}
+
+fn firetest_strategy(cfg: &FireConfig) -> StrategySnapshot {
+    let strategy_id = cfg.strategy_id.unwrap_or(FIRETEST_STRATEGY_ID);
+    let mut fields = StrategyFields::new();
+    fields.insert(
+        "StrategyName",
+        FieldValue::String("MoonProto FireTest".to_string()),
+    );
+    fields.insert(
+        "Comment",
+        FieldValue::String("firetest-initial".to_string()),
+    );
+    fields.insert("AcceptCommands", FieldValue::Bool(true));
+    fields.insert("OrderSize", FieldValue::Double(0.0));
+    StrategySnapshot::new(
+        strategy_id,
+        1,
+        now_epoch_ms(),
+        false,
+        StrategyKind::TELEGRAM,
+        "FireTest",
+        fields,
+    )
+}
+
+fn is_firetest_moonshot_strategy(strategy: &StrategySnapshot) -> bool {
+    strategy.strategy_id == FIRETEST_MOONSHOT_STRATEGY_ID
+        || strategy
+            .strategy_name()
+            .map(|name| name == FIRETEST_MOONSHOT_NAME)
+            .unwrap_or(false)
+}
+
+fn firetest_moonshot_strategy_ids(snapshot: &MoonStateSnapshot) -> Vec<u64> {
+    let mut ids = snapshot
+        .strategy_snapshots()
+        .filter(|strategy| is_firetest_moonshot_strategy(strategy))
+        .map(|strategy| strategy.strategy_id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn firetest_moonshot_snapshot(session: &Session) -> Option<StrategySnapshot> {
+    session.maybe_state_snapshot().and_then(|snapshot| {
+        snapshot
+            .strategy_snapshots()
+            .find(|strategy| is_firetest_moonshot_strategy(strategy))
+            .cloned()
+    })
+}
+
+fn firetest_strategy_schema(session: &Session) -> StrategySchema {
+    session
+        .state_snapshot()
+        .strats()
+        .strategy_schema()
+        .expect("FireTest MoonShot gate requires live TStratSchema")
+        .clone()
+}
+
+fn sync_firetest_moonshot_snapshot(a: &mut Session, strategy: StrategySnapshot) {
+    let mut strategies = a.state_snapshot().strategy_snapshot_vec();
+    strategies.retain(|existing| !is_firetest_moonshot_strategy(existing));
+    strategies.push(strategy);
+    a.sync_local_strategies(&strategies);
+}
+
+fn delete_firetest_moonshot_if_present(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    let mut ids = firetest_moonshot_strategy_ids(&a.state_snapshot());
+    ids.extend(firetest_moonshot_strategy_ids(&b.state_snapshot()));
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return;
+    }
+    println!("FIRETEST MoonShot strategy: deleting old test strategies ids={ids:?}");
+    for id in &ids {
+        a.client
+            .strategies()
+            .delete(*id, "")
+            .expect("MoonClient strategy delete must queue");
+    }
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "old MoonShot FireTest strategy delete echo",
+            |a, b| firetest_moonshot_strategy_ids(&a.state_snapshot()).is_empty()
+                && firetest_moonshot_strategy_ids(&b.state_snapshot()).is_empty()
+        ),
+        "old MoonShot FireTest strategy was not deleted from both clients within {:?}",
+        cfg.connect_timeout
+    );
+}
+
+fn build_firetest_moonshot(
+    schema: &StrategySchema,
+    base: Option<&StrategySnapshot>,
+    checked: bool,
+    ignore_filters: bool,
+    white_list: &str,
+    black_list: &str,
+) -> StrategySnapshot {
+    let mut strategy = match base {
+        Some(base) => MoonShotStrategy::from_snapshot(schema, base)
+            .expect("existing FireTest MoonShot snapshot must parse through typed editor"),
+        None => MoonShotStrategy::new(FIRETEST_MOONSHOT_STRATEGY_ID),
+    };
+    strategy.name = FIRETEST_MOONSHOT_NAME.to_string();
+    strategy.path = FIRETEST_MOONSHOT_FOLDER.to_string();
+    strategy.checked = checked;
+    strategy.auto_buy = true;
+    strategy.emulator_mode = true;
+    strategy.ignore_filters = ignore_filters;
+    strategy.mshot_price_min = 3.0;
+    strategy.mshot_price = 5.0;
+    strategy.order_size = FIRETEST_MOONSHOT_ORDER_SIZE_USD;
+    strategy.coins_white_list = white_list.to_string();
+    strategy.coins_black_list = black_list.to_string();
+    strategy
+        .into_snapshot(schema)
+        .expect("FireTest MoonShot typed strategy must match live schema")
+}
+
+fn chart_filter_lines(session: &Session, market: &str) -> Option<Vec<String>> {
+    session
+        .maybe_state_snapshot()
+        .and_then(|snapshot| snapshot.chart_text().get(market).cloned())
+        .map(|snapshot| snapshot.filter_lines)
+}
+
+fn line_mentions_blacklist(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    line.contains("blacklist") || (line.contains("black") && line.contains("list"))
+}
+
+fn line_mentions_firetest_moonshot(line: &str) -> bool {
+    line.contains(FIRETEST_MOONSHOT_NAME)
+}
+
+fn firetest_moonshot_has_state(
+    strategy: &StrategySnapshot,
+    checked: bool,
+    ignore_filters: bool,
+    white_list: &str,
+    black_list: &str,
+) -> bool {
+    strategy.checked == checked
+        && strategy.strategy_name() == Some(FIRETEST_MOONSHOT_NAME)
+        && strategy.fields.get_bool("IgnoreFilters").unwrap_or(false) == ignore_filters
+        && strategy.fields.get_string("CoinsWhiteList").unwrap_or("") == white_list
+        && strategy.fields.get_string("CoinsBlackList").unwrap_or("") == black_list
+}
+
+fn moonshot_order_size_candidates(order: &Order) -> Vec<(&'static str, f64)> {
+    let mut out = Vec::with_capacity(10);
+    out.push(("buy.total_btc", order.buy_order.total_btc.abs()));
+    out.push(("buy.spent_btc", order.buy_order.spent_btc.abs()));
+    out.push(("buy.quantity_base", order.buy_order.quantity_base.abs()));
+    out.push(("buy.quantity", order.buy_order.quantity.abs()));
+    if order.buy_order.actual_q.abs() > EPS && order.buy_order.actual_price.abs() > EPS {
+        out.push((
+            "buy.actual_q*actual_price",
+            (order.buy_order.actual_q * order.buy_order.actual_price).abs(),
+        ));
+    }
+    if order.buy_order.actual_q.abs() > EPS && order.buy_order.mean_price.abs() > EPS {
+        out.push((
+            "buy.actual_q*mean_price",
+            (order.buy_order.actual_q * order.buy_order.mean_price).abs(),
+        ));
+    }
+    if order.buy_order.quantity.abs() > EPS && order.buy_price.abs() > EPS {
+        out.push((
+            "buy.quantity*order.buy_price",
+            (order.buy_order.quantity * order.buy_price).abs(),
+        ));
+    }
+    out
+}
+
+fn moonshot_order_size_match(order: &Order) -> Option<(&'static str, f64)> {
+    moonshot_order_size_candidates(order)
+        .into_iter()
+        .find(|(_, value)| {
+            value.is_finite()
+                && *value >= FIRETEST_MOONSHOT_ORDER_SIZE_MIN_USD
+                && *value <= FIRETEST_MOONSHOT_ORDER_SIZE_MAX_USD
+        })
+}
+
+fn find_firetest_moonshot_order(
+    snapshot: &MoonStateSnapshot,
+) -> Option<(&Order, &'static str, f64)> {
+    snapshot.orders().iter().find_map(|order| {
+        if order.market_name != FIRETEST_MOONSHOT_MARKET
+            || order.strat_id != FIRETEST_MOONSHOT_STRATEGY_ID
+            || !order.emulator_mode
+        {
+            return None;
+        }
+        moonshot_order_size_match(order).map(|(field, size)| (order, field, size))
+    })
+}
+
+fn assert_strategy_field_visible_for_firetest(
+    session: &Session,
+    cfg: &FireConfig,
+    strategy: &StrategySnapshot,
+) {
+    let snapshot = session.state_snapshot();
+    let schema = snapshot
+        .strats()
+        .strategy_schema()
+        .expect("FireTest strategy schema must be loaded before local strategy mutation");
+    let field = schema.field(&cfg.strategy_field).unwrap_or_else(|| {
+        panic!(
+            "FireTest strategy_field `{}` is absent from schema",
+            cfg.strategy_field
+        )
+    });
+    assert!(
+        field.visible_for_strategy_kind(strategy.kind()),
+        "FireTest strategy_field `{}` is not visible for kind {}:{}; choose a schema-visible field/kind pair",
+        cfg.strategy_field,
+        strategy.kind().ordinal(),
+        schema
+            .kind_name_for_strategy_kind(strategy.kind())
+            .unwrap_or("?")
+    );
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis() as u64
+}
+
+struct ErrEmuGuard {
+    active: bool,
+}
+
+impl ErrEmuGuard {
+    fn set(percent: u8) -> Self {
+        set_err_emu(percent);
+        println!("FIRETEST: client-side err_emu={percent}% enabled before connect");
+        Self {
+            active: percent > 0,
+        }
+    }
+
+    fn set_for_gate(&mut self, percent: u8, gate: &str) {
+        set_err_emu(percent);
+        self.active = percent > 0;
+        println!("FIRETEST: client-side err_emu={percent}% enabled for {gate}");
+    }
+
+    fn reset(&mut self, gate: &str) {
+        if self.active {
+            set_err_emu(0);
+            self.active = false;
+            println!("FIRETEST: client-side err_emu reset to 0% after {gate}");
+        }
+    }
+}
+
+impl Drop for ErrEmuGuard {
+    fn drop(&mut self) {
+        if self.active {
+            set_err_emu(0);
+            println!("FIRETEST: client-side err_emu reset to 0%");
+        }
+    }
+}
+
+fn log_high_loss_recovery_math() {
+    let service_drop = (FIRETEST_HIGH_LOSS_ERR_EMU_PERCENT / 2) as f64 / 100.0;
+    let service_deliver = 1.0 - service_drop;
+    let client_only_reconnect_attempt = service_deliver;
+    let both_sides_reconnect_attempt = service_deliver * service_deliver;
+    let client_only_fail =
+        (1.0 - client_only_reconnect_attempt).powi(FIRETEST_RECONNECT_MATH_ATTEMPTS);
+    let both_sides_fail =
+        (1.0 - both_sides_reconnect_attempt).powi(FIRETEST_RECONNECT_MATH_ATTEMPTS);
+
+    println!(
+        "FIRETEST high-loss math: err_emu={}%, Delphi service drop={}%, delivery={:.2}%; reconnect attempt p(client-side)={:.2}%, fail after {} attempts={:.6}%; p(client+server)={:.2}%, fail after {} attempts={:.6}%",
+        FIRETEST_HIGH_LOSS_ERR_EMU_PERCENT,
+        FIRETEST_HIGH_LOSS_ERR_EMU_PERCENT / 2,
+        service_deliver * 100.0,
+        client_only_reconnect_attempt * 100.0,
+        FIRETEST_RECONNECT_MATH_ATTEMPTS,
+        client_only_fail * 100.0,
+        both_sides_reconnect_attempt * 100.0,
+        FIRETEST_RECONNECT_MATH_ATTEMPTS,
+        both_sides_fail * 100.0,
+    );
+}
+
+fn log_sliced_recovery_math(label: &str, err_emu_percent: u8) {
+    let p = err_emu_percent.min(100) as f64 * 0.01;
+    let attempts = FIRETEST_SLICED_MAX_RETRIES + 1;
+    let one_block_fail = p.powi(attempts);
+    let any_block_fail = |blocks: i32| 1.0 - (1.0 - one_block_fail).powi(blocks);
+    let request_response_fail = 1.0 - (1.0 - one_block_fail).powi(2);
+    let startup_engine_api_count = 4;
+    let any_startup_api_fail = 1.0 - (1.0 - request_response_fail).powi(startup_engine_api_count);
+    println!(
+        "FIRETEST Sliced recovery math {label}: err_emu={}%, MaxRetries={} -> attempts={} per block; pure client-drop fail probability: 1-block={:.8}%, EngineAPI request+response={:.8}%, any of {} startup EngineAPI pairs={:.8}%, 6-block={:.8}%, 32-block={:.8}%, 255-block={:.8}%. If one startup Engine API/Sliced response times out, do not blame randomness unless diagnostics show every attempt for a missing block was actually dropped.",
+        err_emu_percent,
+        FIRETEST_SLICED_MAX_RETRIES,
+        attempts,
+        one_block_fail * 100.0,
+        request_response_fail * 100.0,
+        startup_engine_api_count,
+        any_startup_api_fail * 100.0,
+        any_block_fail(6) * 100.0,
+        any_block_fail(32) * 100.0,
+        any_block_fail(255) * 100.0,
+    );
+}
+
+fn quick_profile_config(cfg: &FireConfig) -> FireConfig {
+    let mut quick = cfg.clone();
+    quick.connect_timeout = quick
+        .connect_timeout
+        .min(Duration::from_secs(QUICK_CONNECT_TIMEOUT_SECS));
+    quick.wait = quick
+        .wait
+        .min(Duration::from_secs(QUICK_STREAM_TIMEOUT_SECS));
+    quick
+}
+
+#[derive(Default)]
+struct MoonClientPathStats {
+    lifecycle_connected: bool,
+    lifecycle_ready: bool,
+    lifecycle_connected_at_s: Option<f64>,
+    lifecycle_ready_at_s: Option<f64>,
+    first_schema_at_s: Option<f64>,
+    first_trade_at_s: Option<f64>,
+    first_orderbook_at_s: Option<f64>,
+    first_transfer_done_at_s: Option<f64>,
+    first_coin_card_at_s: Option<f64>,
+    candles_ready_at_s: Option<f64>,
+    first_market_price_at_s: Option<f64>,
+    first_retained_history_at_s: Option<f64>,
+    runtime_state_events: u64,
+    runtime_state: Option<RuntimeStateProbe>,
+    kernel_license_state: Option<KernelLicenseProbe>,
+    hyperliquid_request_limit_events: u64,
+    hyperliquid_requests_left: Option<u64>,
+    kernel_health_events: u64,
+    kernel_health: Option<KernelHealth>,
+    news_history_events: u64,
+    news_history_count: usize,
+    news_history_tags_seen: bool,
+    news_snapshot_count: usize,
+    news_tags_present: bool,
+    init_step_at_s: HashMap<&'static str, f64>,
+    engine_method_counts: HashMap<u8, u64>,
+    engine_method_first_at_s: HashMap<u8, f64>,
+    parse_failed: u64,
+    strategy_snapshot_events: u64,
+    strategy_schema_events: u64,
+    strategy_schema_kinds: usize,
+    strategy_schema_fields: usize,
+    session_profit_events: u64,
+    session_profit_nonzero_count: usize,
+    session_profit_known_markets: usize,
+    market_count: usize,
+    trades_apply: u64,
+    orderbook_apply: u64,
+    target_orderbook_full: u64,
+    target_orderbook_update: u64,
+    transfer_asset_updated_mask: u8,
+    transfer_asset_failures: u64,
+    transfer_asset_refresh_done: bool,
+    coin_card_updates: u64,
+    coin_card_failures: u64,
+    coin_card_last_count: usize,
+    candles_ready: bool,
+    candles_markets: usize,
+    candles_rows: usize,
+    retained_candles_5m: usize,
+    retained_candles_5m_newest_age_s: Option<f64>,
+    last_book_bid: Option<f64>,
+    last_book_ask: Option<f64>,
+    last_trade_price: Option<f64>,
+    last_market_price: Option<MarketProbePrice>,
+    retained_last_prices: usize,
+    retained_futures_trades: usize,
+    retained_spot_trades: usize,
+    derived_trade_vol_1m: f64,
+    derived_trade_vol_5m: f64,
+    derived_candle_vol_1h: f64,
+    market_invariant_error: Option<String>,
+}
+
+impl MoonClientPathStats {
+    fn engine_method_count(&self, method: EngineMethod) -> u64 {
+        self.engine_method_counts
+            .get(&(method.to_byte()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn has_engine_method(&self, method: EngineMethod) -> bool {
+        self.engine_method_count(method) > 0
+    }
+
+    fn has_init_step(&self, step: &'static str) -> bool {
+        self.init_step_at_s.contains_key(step)
+    }
+
+    fn record_lifecycle(&mut self, event: &LifecycleEvent, elapsed_s: f64) {
+        match event {
+            LifecycleEvent::Connected { fresh: true } => {
+                self.lifecycle_connected = true;
+                self.lifecycle_connected_at_s.get_or_insert(elapsed_s);
+            }
+            LifecycleEvent::Ready => {
+                self.lifecycle_ready = true;
+                self.lifecycle_ready_at_s.get_or_insert(elapsed_s);
+            }
+            LifecycleEvent::InitStepCompleted { step, elapsed_ms } => {
+                self.init_step_at_s
+                    .entry(*step)
+                    .or_insert((*elapsed_ms as f64) * 0.001);
+            }
+            LifecycleEvent::ConnectFailed { error } => {
+                self.market_invariant_error = Some(format!("MoonClient connect failed: {error}"));
+            }
+            _ => {}
+        }
+    }
+
+    fn record_event(&mut self, event: &Event, target_market: &str, elapsed_s: f64) {
+        match event {
+            Event::EngineResponse(resp) => {
+                *self
+                    .engine_method_counts
+                    .entry(resp.method.to_byte())
+                    .or_insert(0) += 1;
+                self.engine_method_first_at_s
+                    .entry(resp.method.to_byte())
+                    .or_insert(elapsed_s);
+            }
+            Event::ParseFailed { .. } => {
+                self.parse_failed += 1;
+            }
+            Event::Strat(StratEvent::SnapshotFull { .. })
+            | Event::Strat(StratEvent::SnapshotPartial { .. }) => {
+                self.strategy_snapshot_events += 1;
+            }
+            Event::Strat(StratEvent::SchemaApplied {
+                kind_count,
+                field_count,
+                ..
+            }) => {
+                self.first_schema_at_s.get_or_insert(elapsed_s);
+                self.strategy_schema_events += 1;
+                self.strategy_schema_kinds = self.strategy_schema_kinds.max(*kind_count);
+                self.strategy_schema_fields = self.strategy_schema_fields.max(*field_count);
+            }
+            Event::Strat(StratEvent::SchemaParseFailed { .. }) => {
+                self.parse_failed += 1;
+            }
+            Event::Trade(TradesEvent::Applied { .. }) => {
+                self.first_trade_at_s.get_or_insert(elapsed_s);
+                self.trades_apply += 1;
+            }
+            Event::OrderBook(OrderBookEvent::Apply {
+                market_name,
+                kind,
+                is_full,
+                top,
+                ..
+            }) if market_name.as_deref() == Some(target_market) => {
+                self.first_orderbook_at_s.get_or_insert(elapsed_s);
+                self.orderbook_apply += 1;
+                if *is_full {
+                    self.target_orderbook_full += 1;
+                } else {
+                    self.target_orderbook_update += 1;
+                }
+                if let (Some(bid), Some(ask)) = (top.bid, top.ask) {
+                    self.last_book_bid = Some(bid.rate);
+                    self.last_book_ask = Some(ask.rate);
+                    if bid.rate <= 0.0 || ask.rate <= 0.0 || ask.rate <= bid.rate {
+                        let raw_kind = kind.as_u8();
+                        self.market_invariant_error = Some(format!(
+                            "bad MoonClient book top for {target_market} kind={raw_kind}: bid={:.8} ask={:.8}",
+                            bid.rate, ask.rate
+                        ));
+                    }
+                }
+            }
+            Event::TransferAssets(ev) => match ev {
+                moonproto::TransferAssetsEvent::Updated { kind, .. } => {
+                    self.transfer_asset_updated_mask |= 1 << kind.as_index();
+                }
+                moonproto::TransferAssetsEvent::RefreshCompleted {
+                    updated, failed, ..
+                } => {
+                    self.first_transfer_done_at_s.get_or_insert(elapsed_s);
+                    self.transfer_asset_refresh_done = *updated == ExchangeKind::ALL.len();
+                    self.transfer_asset_failures += *failed as u64;
+                }
+                moonproto::TransferAssetsEvent::UpdateFailed { .. } => {
+                    self.transfer_asset_failures += 1;
+                }
+                moonproto::TransferAssetsEvent::TransferApplied { .. } => {}
+            },
+            Event::CoinCardCandles(ev) => match ev {
+                moonproto::CoinCardCandlesEvent::Updated { count, .. } => {
+                    self.first_coin_card_at_s.get_or_insert(elapsed_s);
+                    self.coin_card_updates += 1;
+                    self.coin_card_last_count = *count;
+                }
+                moonproto::CoinCardCandlesEvent::UpdateFailed { .. } => {
+                    self.coin_card_failures += 1;
+                }
+            },
+            Event::CandlesSnapshot(ev) => match ev {
+                moonproto::state::CandlesSnapshotEvent::Ready { summary, .. } => {
+                    self.candles_ready_at_s.get_or_insert(elapsed_s);
+                    self.candles_ready = true;
+                    self.candles_markets = summary.retained_markets;
+                    self.candles_rows = summary.retained_candles;
+                }
+                moonproto::state::CandlesSnapshotEvent::Failed { error, .. } => {
+                    self.market_invariant_error =
+                        Some(format!("MoonClient auto candles failed: {error}"));
+                }
+            },
+            Event::Balance(BalanceEvent::SessionProfitsApplied { nonzero_count, .. }) => {
+                self.session_profit_events += 1;
+                self.session_profit_nonzero_count = *nonzero_count;
+            }
+            Event::Settings(SettingsEvent::RuntimeStateUpdated) => {
+                self.runtime_state_events += 1;
+            }
+            Event::Settings(SettingsEvent::HyperliquidRequestLimitUpdated) => {
+                self.hyperliquid_request_limit_events += 1;
+            }
+            Event::KernelHealth(health) => {
+                self.kernel_health_events += 1;
+                self.kernel_health = Some(*health);
+            }
+            Event::News(NewsEvent::HistoryApplied {
+                news_count,
+                tags_included,
+            }) => {
+                self.news_history_events += 1;
+                self.news_history_count = self.news_history_count.max(*news_count);
+                self.news_history_tags_seen |= *tags_included;
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_from_snapshot(
+        &mut self,
+        snapshot: &MoonStateSnapshot,
+        target_market: &str,
+        elapsed_s: f64,
+    ) {
+        let health = snapshot.kernel_health();
+        if health != KernelHealth::default() {
+            self.kernel_health = Some(health);
+        }
+        self.news_snapshot_count = snapshot.news().len();
+        self.news_tags_present = snapshot.news().tags_json().is_some();
+        self.runtime_state = snapshot
+            .settings()
+            .runtime_state
+            .map(RuntimeStateProbe::from);
+        self.kernel_license_state = snapshot
+            .settings()
+            .kernel_license_state
+            .map(KernelLicenseProbe::from);
+        self.hyperliquid_requests_left = snapshot.settings().hyperliquid_requests_left;
+        self.market_count = snapshot.markets().iter().count();
+        self.session_profit_known_markets = snapshot
+            .markets()
+            .iter()
+            .filter(|market| market.session_profit().is_some())
+            .count();
+        let Some(market) = snapshot.markets().get(target_market) else {
+            return;
+        };
+
+        {
+            let price = market.price();
+            self.first_market_price_at_s.get_or_insert(elapsed_s);
+            self.last_market_price = Some(MarketProbePrice::from(&price));
+            if price.bid <= 0.0 || price.ask <= 0.0 || price.ask < price.bid {
+                self.market_invariant_error = Some(format!(
+                    "bad MoonClient UpdateMarketsList price for {target_market}: bid={:.8} ask={:.8}",
+                    price.bid, price.ask
+                ));
+            }
+        }
+
+        let state = market.trade_state();
+        if state.last_trade_price > 0.0 {
+            self.last_trade_price = Some(state.last_trade_price);
+        }
+        if let Some(top) = snapshot.top_of_book_for(&market, OrderBookKind::Futures) {
+            if let (Some(bid), Some(ask)) = (top.bid, top.ask) {
+                self.last_book_bid = Some(bid.rate);
+                self.last_book_ask = Some(ask.rate);
+            }
+        }
+        if let Some(readers) = snapshot.market_history_readers_for(&market) {
+            if let Some(reader) = readers.last_prices.as_ref() {
+                self.retained_last_prices = reader.bounds().len;
+            }
+            if let Some(reader) = readers.futures_trades.as_ref() {
+                self.retained_futures_trades = reader.bounds().len;
+            }
+            if let Some(reader) = readers.spot_trades.as_ref() {
+                self.retained_spot_trades = reader.bounds().len;
+            }
+            if let Some(reader) = readers.candles_5m.as_ref() {
+                self.retained_candles_5m = reader.bounds().len;
+                let mut newest = Vec::new();
+                reader.copy_last(1, &mut newest);
+                self.retained_candles_5m_newest_age_s = newest
+                    .last()
+                    .map(|row| moon_time_abs_age_s(moon_now_for_test(), row.time()));
+            }
+            if self.retained_last_prices + self.retained_futures_trades + self.retained_spot_trades
+                > 0
+            {
+                self.first_retained_history_at_s.get_or_insert(elapsed_s);
+            }
+        }
+        if let Some(derived) =
+            snapshot.market_history_derived_snapshot_for(&market, moon_now_for_test())
+        {
+            self.derived_trade_vol_1m = derived.trade_volumes.one_minute.total_value();
+            self.derived_trade_vol_5m = derived.trade_volumes.five_minutes.total_value();
+            self.derived_candle_vol_1h = derived.candle_volumes.one_hour;
+        }
+        if let Some(candles) = snapshot.coin_card_candles_for(&market, FIRETEST_COIN_CARD_KIND) {
+            self.coin_card_last_count = self.coin_card_last_count.max(candles.len());
+        }
+    }
+
+    fn healthy(&self, require_auto_candles: bool, require_orderbook_update: bool) -> bool {
+        if self.parse_failed != 0 || self.market_invariant_error.is_some() {
+            return false;
+        }
+        let Some(bid) = self.last_book_bid else {
+            return false;
+        };
+        let Some(ask) = self.last_book_ask else {
+            return false;
+        };
+        let Some(trade_price) = self.last_trade_price else {
+            return false;
+        };
+        let Some(market_price) = self.last_market_price else {
+            return false;
+        };
+        let news_healthy = self.kernel_license_state.is_some_and(|license| {
+            !license.news_service_active(MoonTime::now())
+                || (self.news_history_events > 0
+                    && self.news_history_count > 0
+                    && self.news_history_tags_seen
+                    && self.news_snapshot_count > 0
+                    && self.news_tags_present)
+        });
+        // Mandatory Init is a lifecycle/state contract. Some Delphi-style
+        // pending steps (notably GetMarketsList) are applied by the owner after
+        // response delivery and are not required to surface as raw EngineResponse
+        // events in the public UI stream.
+        self.strategy_snapshot_events > 0
+            && self.lifecycle_connected
+            && self.lifecycle_ready
+            && self.kernel_health_events > 0
+            && self.kernel_health.is_some_and(kernel_health_is_complete)
+            && self.session_profit_events > 0
+            && self.market_count > 0
+            && self.session_profit_known_markets == self.market_count
+            && news_healthy
+            && self.strategy_schema_events > 0
+            && self.strategy_schema_kinds > 0
+            && self.strategy_schema_fields > 0
+            && self.has_init_step("BaseCheck")
+            && self.has_init_step("AuthCheck")
+            && self.has_init_step("GetMarketsList")
+            && self.has_init_step("UpdateMarketsList")
+            && self.has_engine_method(EngineMethod::SubscribeAllTrades)
+            && self.has_engine_method(EngineMethod::SubscribeOrderBook)
+            && self.trades_apply > 0
+            && self.orderbook_apply > 0
+            && self.target_orderbook_full > 0
+            && (!require_orderbook_update || self.target_orderbook_update > 0)
+            && self.transfer_asset_updated_mask == 0b111
+            && self.transfer_asset_failures == 0
+            && self.transfer_asset_refresh_done
+            && self.coin_card_updates > 0
+            && self.coin_card_failures == 0
+            && self.coin_card_last_count >= FIRETEST_MIN_COIN_CARD_CANDLES
+            && self.retained_last_prices > 0
+            && self.retained_futures_trades + self.retained_spot_trades > 0
+            && (!require_auto_candles
+                || (self.candles_ready
+                    && self.candles_rows > 0
+                    && self.retained_candles_5m > 0
+                    && self
+                        .retained_candles_5m_newest_age_s
+                        .is_some_and(|age| age <= FIRETEST_RETAINED_CANDLE_MAX_AGE_SECS)))
+            && bid > 0.0
+            && ask > bid
+            && market_price.bid > 0.0
+            && market_price.ask >= market_price.bid
+            && price_near_envelope(trade_price, bid, ask)
+            && price_near_envelope(market_price.bid, bid, ask)
+            && price_near_envelope(market_price.ask, bid, ask)
+    }
+
+    fn summary(&self) -> String {
+        let method_at = |method: EngineMethod| {
+            self.engine_method_first_at_s
+                .get(&method.to_byte())
+                .copied()
+        };
+        let init_at = |step: &'static str| self.init_step_at_s.get(step).copied();
+        let base = format!(
+            "phase connected_at={:?}s ready_at={:?}s init_step BaseCheck={:?}s AuthCheck={:?}s GetMarketsList={:?}s GetMarketsIndexes={:?}s UpdateMarketsList={:?}s StrategySchema={:?}s PostInitFlush={:?}s StartupSnapshot={:?}s StartupEvents={:?}s engine_event_at BaseCheck={:?}s AuthCheck={:?}s GetMarketsList={:?}s GetMarketsIndexes={:?}s UpdateMarketsList={:?}s SubscribeAllTrades={:?}s SubscribeOrderBook={:?}s schema_event_at={:?}s price_at={:?}s trade_at={:?}s book_at={:?}s retained_at={:?}s transfer_done_at={:?}s coin_card_at={:?}s candles_ready_at={:?}s lifecycle connected={} ready={} runtime_state_events={} runtime_state={:?} methods BaseCheck={} AuthCheck={} GetMarketsList={} GetMarketsIndexes={} UpdateMarketsList={} SubscribeAllTrades={} SubscribeOrderBook={} strats={} schemas={} schema_kinds={} schema_fields={} trades={} books={} full={} update={} bid={:?} ask={:?} trade={:?} market_price={:?} transfer_mask={:#05b} transfer_done={} transfer_fail={} coin_card_updates={} coin_card_count={} candles_ready={} candles_markets={} candles_rows={} retained_candles_5m={} newest_age_s={:?} retained_last={} retained_trades={}/{} derived_vol_1m={:.4} derived_vol_5m={:.4} candle_vol_1h={:.4} parse_failed={} err={}",
+            self.lifecycle_connected_at_s,
+            self.lifecycle_ready_at_s,
+            init_at("BaseCheck"),
+            init_at("AuthCheck"),
+            init_at("GetMarketsList"),
+            init_at("GetMarketsIndexes"),
+            init_at("UpdateMarketsList"),
+            init_at("StrategySchema"),
+            init_at("PostInitFlush"),
+            init_at("StartupSnapshot"),
+            init_at("StartupEvents"),
+            method_at(EngineMethod::BaseCheck),
+            method_at(EngineMethod::AuthCheck),
+            method_at(EngineMethod::GetMarketsList),
+            method_at(EngineMethod::GetMarketsIndexes),
+            method_at(EngineMethod::UpdateMarketsList),
+            method_at(EngineMethod::SubscribeAllTrades),
+            method_at(EngineMethod::SubscribeOrderBook),
+            self.first_schema_at_s,
+            self.first_market_price_at_s,
+            self.first_trade_at_s,
+            self.first_orderbook_at_s,
+            self.first_retained_history_at_s,
+            self.first_transfer_done_at_s,
+            self.first_coin_card_at_s,
+            self.candles_ready_at_s,
+            self.lifecycle_connected,
+            self.lifecycle_ready,
+            self.runtime_state_events,
+            self.runtime_state,
+            self.engine_method_count(EngineMethod::BaseCheck),
+            self.engine_method_count(EngineMethod::AuthCheck),
+            self.engine_method_count(EngineMethod::GetMarketsList),
+            self.engine_method_count(EngineMethod::GetMarketsIndexes),
+            self.engine_method_count(EngineMethod::UpdateMarketsList),
+            self.engine_method_count(EngineMethod::SubscribeAllTrades),
+            self.engine_method_count(EngineMethod::SubscribeOrderBook),
+            self.strategy_snapshot_events,
+            self.strategy_schema_events,
+            self.strategy_schema_kinds,
+            self.strategy_schema_fields,
+            self.trades_apply,
+            self.orderbook_apply,
+            self.target_orderbook_full,
+            self.target_orderbook_update,
+            self.last_book_bid,
+            self.last_book_ask,
+            self.last_trade_price,
+            self.last_market_price.map(|p| (p.bid, p.ask, p.mark_price, p.mark_price_found)),
+            self.transfer_asset_updated_mask,
+            self.transfer_asset_refresh_done,
+            self.transfer_asset_failures,
+            self.coin_card_updates,
+            self.coin_card_last_count,
+            self.candles_ready,
+            self.candles_markets,
+            self.candles_rows,
+            self.retained_candles_5m,
+            self.retained_candles_5m_newest_age_s,
+            self.retained_last_prices,
+            self.retained_futures_trades,
+            self.retained_spot_trades,
+            self.derived_trade_vol_1m,
+            self.derived_trade_vol_5m,
+            self.derived_candle_vol_1h,
+            self.parse_failed,
+            self.market_invariant_error.as_deref().unwrap_or("none")
+        );
+        format!(
+            "{base} kernel_license={:?} kernel_health_events={} kernel_health={:?} hl_limit_events={} hl_requests_left={:?} session_profit_events={} session_profit_nonzero={} session_profit_known={}/{} news_history_events={} news_history_count={} news_history_tags={} news_retained={} news_tags_present={}",
+            self.kernel_license_state,
+            self.kernel_health_events,
+            self.kernel_health,
+            self.hyperliquid_request_limit_events,
+            self.hyperliquid_requests_left,
+            self.session_profit_events,
+            self.session_profit_nonzero_count,
+            self.session_profit_known_markets,
+            self.market_count,
+            self.news_history_events,
+            self.news_history_count,
+            self.news_history_tags_seen,
+            self.news_snapshot_count,
+            self.news_tags_present,
+        )
+    }
+}
+
+fn record_public_client_tick(
+    client: &MoonClient,
+    stats: &mut MoonClientPathStats,
+    cfg: &FireConfig,
+    start: Instant,
+) {
+    let elapsed_s = start.elapsed().as_secs_f64();
+    for event in client.drain_lifecycle_events() {
+        stats.record_lifecycle(&event, elapsed_s);
+    }
+    for event in client.drain_events() {
+        stats.record_event(&event, &cfg.market, elapsed_s);
+    }
+    if let Some(snapshot) = client.snapshot() {
+        stats.refresh_from_snapshot(&snapshot, &cfg.market, elapsed_s);
+    }
+}
+
+fn run_moonclient_public_smoke(
+    label: &str,
+    cfg: &FireConfig,
+    keys: ImportedKeys,
+    startup_timeout: Duration,
+    stream_after_ready: Duration,
+    require_auto_candles: bool,
+    require_orderbook_update: bool,
+) -> MoonClientPathStats {
+    let init = InitConfig {
+        subscribe_trades: Some(TradesStreamMode::TradesOnly),
+        subscribe_orderbooks: vec![cfg.market.clone()],
+        step_timeout: None,
+        initial_strategies: Some(InitialStrategies::new(0, Vec::new())),
+    };
+    let client = MoonClient::connect(
+        ClientConfig::new(&cfg.host, cfg.port, keys.master_key, keys.mac_key)
+            .with_transport_mode(cfg.transport_mode)
+            .with_client_id(rand::random()),
+        ConnectConfig::new(init).with_connect_timeout(cfg.connect_timeout),
+    )
+    .unwrap_or_else(|err| panic!("FIRETEST {label}: MoonClient connect failed: {err}"));
+
+    client
+        .balances()
+        .refresh_transfer_assets()
+        .unwrap_or_else(|err| panic!("FIRETEST {label}: refresh_transfer_assets failed: {err}"));
+    client
+        .candles()
+        .request_coin_card(&cfg.market, FIRETEST_COIN_CARD_KIND)
+        .unwrap_or_else(|err| panic!("FIRETEST {label}: request_coin_card_candles failed: {err}"));
+
+    let start = Instant::now();
+    let startup_deadline = start + startup_timeout;
+    let mut ready_at: Option<Instant> = None;
+    let mut stats = MoonClientPathStats::default();
+    loop {
+        record_public_client_tick(&client, &mut stats, cfg, start);
+        if stats.lifecycle_ready && ready_at.is_none() {
+            ready_at = Some(Instant::now());
+        }
+        if stats.healthy(require_auto_candles, require_orderbook_update) {
+            break;
+        }
+        let deadline = ready_at.map_or(startup_deadline, |ready| ready + stream_after_ready);
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(PUMP_SLICE);
+    }
+    record_public_client_tick(&client, &mut stats, cfg, start);
+
+    let runtime_deadline = Instant::now() + cfg.wait;
+    while stats.runtime_state.is_none() && Instant::now() < runtime_deadline {
+        record_public_client_tick(&client, &mut stats, cfg, start);
+        if stats.runtime_state.is_some() {
+            break;
+        }
+        std::thread::sleep(PUMP_SLICE);
+    }
+    let runtime_state = stats
+        .runtime_state
+        .unwrap_or_else(|| panic!("FIRETEST {label}: missing RuntimeState before AutoDetect gate"));
+    let before_runtime_events = stats.runtime_state_events;
+    client
+        .settings()
+        .set_auto_detect_active(runtime_state.auto_detect_active)
+        .unwrap_or_else(|err| panic!("FIRETEST {label}: set_auto_detect_active failed: {err}"));
+    let echo_deadline = Instant::now() + cfg.wait;
+    let mut auto_detect_echoed = false;
+    while Instant::now() < echo_deadline {
+        record_public_client_tick(&client, &mut stats, cfg, start);
+        if stats.runtime_state_events > before_runtime_events
+            && stats.runtime_state == Some(runtime_state)
+        {
+            auto_detect_echoed = true;
+            break;
+        }
+        std::thread::sleep(PUMP_SLICE);
+    }
+    assert!(
+        auto_detect_echoed,
+        "FIRETEST {label}: TAutoDetectCommand no-op did not echo RuntimeState within {:?}: {}",
+        cfg.wait,
+        stats.summary()
+    );
+    println!(
+        "OK: FIRETEST {label}: TAutoDetectCommand no-op echoed RuntimeState active={}",
+        runtime_state.auto_detect_active
+    );
+
+    let healthy = stats.healthy(require_auto_candles, require_orderbook_update);
+    let slow_startup = stats
+        .lifecycle_ready_at_s
+        .is_some_and(|ready| ready > FIRETEST_SLOW_STARTUP_DIAG_SECS)
+        || stats
+            .init_step_at_s
+            .get("BaseCheck")
+            .is_some_and(|base| *base > FIRETEST_SLOW_STARTUP_DIAG_SECS);
+    if !healthy || slow_startup {
+        eprintln!(
+            "FIRETEST {label}: MoonClient diagnostics reason={} summary={}",
+            if healthy { "slow-startup" } else { "failure" },
+            stats.summary()
+        );
+        log_err_emu_snapshot(label, "public", &client.err_emu_diagnostics_snapshot(), &[]);
+    }
+    let _ = client.disconnect();
+    let _ = client.wait_finished();
+
+    assert!(
+        healthy,
+        "FIRETEST {label}: MoonClient public path did not reach health within startup={startup_timeout:?} + stream_after_ready={stream_after_ready:?}: {}",
+        stats.summary()
+    );
+    let health = stats
+        .kernel_health
+        .expect("healthy MoonClient path must retain kernel telemetry");
+    println!(
+        "OK: FIRETEST {label}: kernel CPU process={}%, system={}%, memory used={}MB free={}MB cores={}, core RTT={:?}ms, order API latency={:?}ms",
+        health.process_cpu_percent,
+        health.system_cpu_percent,
+        health.used_memory_mb.unwrap(),
+        health.free_physical_memory_mb.unwrap(),
+        health.logical_cpu_count.unwrap(),
+        health.core_round_trip_ms,
+        health.order_api_latency_ms
+    );
+    let license = stats
+        .kernel_license_state
+        .expect("healthy MoonClient path must retain kernel license state");
+    if license.news_service_active(MoonTime::now()) {
+        println!(
+            "OK: FIRETEST {label}: news history={} retained={} tags_present={}",
+            stats.news_history_count, stats.news_snapshot_count, stats.news_tags_present
+        );
+    } else {
+        println!(
+            "FIRETEST SKIPPED {label}: news history/tags check; no active News service subscription (news_valid_until={:?})",
+            license.news_valid_until
+        );
+    }
+    let metrics = client.protocol_metrics_snapshot();
+    println!(
+        "FIRETEST CPU {label}: {}",
+        protocol_metrics_summary(&metrics)
+    );
+    assert_protocol_cpu_gate(label, &metrics);
+    println!(
+        "OK: FIRETEST {label}: MoonClient public path healthy after {:.2}s [{}]",
+        start.elapsed().as_secs_f64(),
+        stats.summary()
+    );
+    stats
+}
+
+fn run_quick_fire_test(cfg: &FireConfig, keys: ImportedKeys) {
+    let start = Instant::now();
+    let cfg = quick_profile_config(cfg);
+    let err_emu_percent = firetest_err_emu_percent();
+    let _err_emu = ErrEmuGuard::set(err_emu_percent);
+
+    println!(
+        "FIRETEST quick target: <= {}s; MoonClient public path, err_emu={}%, connect_timeout={:?}, stream_timeout={:?}",
+        QUICK_TOTAL_TARGET_SECS,
+        err_emu_percent,
+        cfg.connect_timeout,
+        cfg.wait
+    );
+    log_sliced_recovery_math("quick startup", err_emu_percent);
+
+    let public_path_startup_timeout = cfg.connect_timeout + cfg.wait;
+    let _stats = run_moonclient_public_smoke(
+        "quick/public",
+        &cfg,
+        keys,
+        public_path_startup_timeout,
+        cfg.wait,
+        false,
+        false,
+    );
+    assert!(
+        start.elapsed() <= Duration::from_secs(QUICK_TOTAL_TARGET_SECS),
+        "quick FireTest exceeded {}s target: {:.2}s",
+        QUICK_TOTAL_TARGET_SECS,
+        start.elapsed().as_secs_f64()
+    );
+    println!(
+        "FIRETEST_QUICK_PASS after {:.2}s",
+        start.elapsed().as_secs_f64()
+    );
+}
+
+fn request_settings_until(session: &mut Session, timeout: Duration) -> ClientSettingsCommand {
+    let start = Instant::now();
+    let before_events = session.snapshot().settings_events;
+    let mut attempts = 0u32;
+    let mut next_retry = start;
+    loop {
+        if Instant::now() >= next_retry {
+            attempts += 1;
+            session
+                .client
+                .settings()
+                .refresh()
+                .expect("MoonClient request_client_settings must queue");
+            next_retry = Instant::now() + Duration::from_secs(2);
+        }
+        session.pump(PUMP_SLICE);
+        let st = session.snapshot();
+        if let Some(settings) = st.last_settings.clone() {
+            if st.settings_events > before_events || before_events == 0 {
+                println!(
+                    "OK: settings snapshot uid={} attempts={} after {:.2}s",
+                    settings.uid,
+                    attempts,
+                    start.elapsed().as_secs_f64()
+                );
+                return settings;
+            }
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "settings request failed after {attempts} non-blocking attempts within {timeout:?}"
+        );
+    }
+}
+
+fn request_balance_until(session: &mut Session, timeout: Duration) {
+    let start = Instant::now();
+    let before = session.snapshot();
+    let mut attempts = 0u32;
+    let mut next_retry = start;
+    loop {
+        if Instant::now() >= next_retry {
+            attempts += 1;
+            session
+                .client
+                .balances()
+                .refresh()
+                .expect("MoonClient request_balance_snapshot must queue");
+            next_retry = Instant::now() + Duration::from_secs(2);
+        }
+        session.pump(PUMP_SLICE);
+        let st = session.snapshot();
+        if st.balance_events > before.balance_events
+            || st.balance_snapshot_events > before.balance_snapshot_events
+        {
+            println!(
+                "OK: high-loss balance stream refresh events={} snapshots={} attempts={} after {:.2}s",
+                st.balance_events - before.balance_events,
+                st.balance_snapshot_events - before.balance_snapshot_events,
+                attempts,
+                start.elapsed().as_secs_f64()
+            );
+            return;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "high-loss balance refresh produced no Balance event after {attempts} non-blocking attempts within {timeout:?}"
+        );
+    }
+}
+
+fn request_orders_until(session: &mut Session, timeout: Duration) {
+    let start = Instant::now();
+    let before = session.snapshot();
+    let mut attempts = 0u32;
+    let mut next_retry = start;
+    loop {
+        if Instant::now() >= next_retry {
+            attempts += 1;
+            session
+                .client
+                .orders()
+                .request_snapshot()
+                .expect("MoonClient request_order_snapshot must queue");
+            next_retry = Instant::now() + Duration::from_secs(2);
+        }
+        session.pump(PUMP_SLICE);
+        let st = session.snapshot();
+        if st.order_events > before.order_events
+            || st.order_status_by_uid.len() > before.order_status_by_uid.len()
+        {
+            println!(
+                "OK: high-loss order refresh events_delta={} current_seen={} attempts={} after {:.2}s",
+                st.order_events - before.order_events,
+                st.order_status_by_uid.len(),
+                attempts,
+                start.elapsed().as_secs_f64()
+            );
+            return;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "high-loss order refresh produced no order state after {attempts} non-blocking attempts within {timeout:?}"
+        );
+    }
+}
+
+fn request_engine_until(session: &mut Session, method: EngineMethod, timeout: Duration) {
+    let start = Instant::now();
+    let mut attempts = 0u32;
+    let mut next_retry = start;
+    let before_account_revision = session
+        .maybe_state_snapshot()
+        .map(|snapshot| snapshot.account().revision())
+        .unwrap_or(0);
+    loop {
+        if Instant::now() >= next_retry {
+            attempts += 1;
+            match method {
+                EngineMethod::CheckAPIExpirationTime => session
+                    .client
+                    .account()
+                    .refresh_api_expiration_time()
+                    .expect("MoonClient refresh_api_expiration_time must queue"),
+                EngineMethod::QueryHedgeMode => session
+                    .client
+                    .account()
+                    .refresh_hedge_mode()
+                    .expect("MoonClient refresh_hedge_mode must queue"),
+                _ => panic!("FireTest non-blocking Engine API gate does not support {method:?}"),
+            }
+            next_retry = Instant::now() + Duration::from_secs(2);
+        }
+        session.pump(PUMP_SLICE);
+        if let Some(snapshot) = session.maybe_state_snapshot() {
+            let account = snapshot.account();
+            let ok = match method {
+                EngineMethod::CheckAPIExpirationTime => account.api_expiration().is_some(),
+                EngineMethod::QueryHedgeMode => account.hedge_mode().is_some(),
+                _ => false,
+            };
+            if ok && account.revision() > before_account_revision {
+                println!(
+                    "OK: high-loss Engine API {:?} non-blocking account refresh attempts={} after {:.2}s",
+                    method,
+                    attempts,
+                    start.elapsed().as_secs_f64()
+                );
+                return;
+            }
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "high-loss Engine API {:?} failed after {} non-blocking attempts within {:?}",
+                method, attempts, timeout
+            );
+        }
+    }
+}
+
+fn run_high_loss_simple_ops_gate(
+    a: &mut Session,
+    b: &mut Session,
+    err_emu: &mut ErrEmuGuard,
+    timeout: Duration,
+) {
+    // Do not "fix" this by disabling err_emu as flaky random. Delphi halves
+    // MoonProtoErrEmu for service/handshake packets, so at 50% configured loss
+    // reconnect service delivery is still 75%. A client-side-only reconnect
+    // attempt needs one incoming Fine, so 10 attempts fail with 0.25^10 =
+    // 0.000095%. Even if both client and server apply 50% ErrEmu, one attempt is
+    // 0.75*0.75 = 56.25%, and 10 attempts fail with ~0.0257%. If this gate fails
+    // consistently, it is a protocol/reconnect bug, not "FireTest randomness".
+    a.client
+        .debug_reset_err_emu_diagnostics()
+        .expect("reset A err_emu diagnostics");
+    b.client
+        .debug_reset_err_emu_diagnostics()
+        .expect("reset B err_emu diagnostics");
+    err_emu.set_for_gate(
+        FIRETEST_HIGH_LOSS_ERR_EMU_PERCENT,
+        "50% simple operations/reconnect gate",
+    );
+    log_high_loss_recovery_math();
+
+    request_engine_until(a, EngineMethod::CheckAPIExpirationTime, timeout);
+    request_engine_until(a, EngineMethod::QueryHedgeMode, timeout);
+    let _settings = request_settings_until(a, timeout);
+    request_balance_until(a, timeout);
+    request_orders_until(a, timeout);
+
+    let before_streams = a.snapshot();
+    let streams_ok = pump_pair_until(a, b, timeout, "high-loss live streams", |a, _| {
+        a.trades_apply > before_streams.trades_apply
+            && a.orderbook_apply > before_streams.orderbook_apply
+            && a.parse_failed == before_streams.parse_failed
+    });
+    if !streams_ok {
+        let after = a.snapshot();
+        log_err_emu_pair("high-loss live streams failure", a, b);
+        panic!(
+            "client A high-loss stream gate failed under err_emu={} within {:?}: before=[{}] after=[{}]",
+            FIRETEST_HIGH_LOSS_ERR_EMU_PERCENT,
+            timeout,
+            before_streams.summary(),
+            after.summary()
+        );
+    }
+    println!("OK: high-loss live streams delivered");
+
+    let before_blackhole = a.snapshot();
+    a.client
+        .debug_set_outgoing_blackhole(true)
+        .expect("enable outgoing blackhole");
+    let disconnected = pump_pair_until(
+        a,
+        b,
+        timeout,
+        "high-loss forced reconnect detection",
+        |a, _| a.reconnecting > before_blackhole.reconnecting,
+    );
+    a.client
+        .debug_set_outgoing_blackhole(false)
+        .expect("disable outgoing blackhole");
+    assert!(
+        disconnected,
+        "client A did not enter reconnecting state under err_emu={} within {:?}",
+        FIRETEST_HIGH_LOSS_ERR_EMU_PERCENT, timeout
+    );
+
+    let before_reconnect = a.snapshot();
+    let reconnected = pump_pair_until(a, b, timeout, "high-loss reconnect", |a, _| {
+        a.connected_again > before_reconnect.connected_again
+    });
+    assert!(
+        reconnected && a.snapshot().connected_now,
+        "client A did not reconnect under err_emu={} within {:?}",
+        FIRETEST_HIGH_LOSS_ERR_EMU_PERCENT,
+        timeout
+    );
+    println!("OK: high-loss reconnect completed");
+
+    let after_reconnect = a.snapshot();
+    let streams_after_reconnect_ok = pump_pair_until(
+        a,
+        b,
+        timeout,
+        "high-loss streams after reconnect",
+        |a, _| {
+            a.trades_apply > after_reconnect.trades_apply
+                && a.orderbook_apply > after_reconnect.orderbook_apply
+                && a.parse_failed == after_reconnect.parse_failed
+        },
+    );
+    if !streams_after_reconnect_ok {
+        let after = a.snapshot();
+        log_err_emu_pair("high-loss streams after reconnect failure", a, b);
+        panic!(
+            "client A high-loss post-reconnect stream gate failed within {:?}: before=[{}] after=[{}]",
+            timeout,
+            after_reconnect.summary(),
+            after.summary()
+        );
+    }
+    println!("OK: high-loss streams after reconnect delivered");
+    log_err_emu_pair("high-loss simple ops gate", a, b);
+}
+
+fn ensure_server_emulator_mode(
+    cfg: &FireConfig,
+    a: &mut Session,
+    b: &mut Session,
+) -> Option<ClientSettingsCommand> {
+    let original = request_settings_until(a, cfg.connect_timeout);
+    if original.emu_mode {
+        println!("OK: server emulator mode is already enabled");
+        return None;
+    }
+
+    let mut enabled = original.clone();
+    enabled.emu_mode = true;
+    println!("FIRETEST order flow: enabling server emulator mode through UI settings");
+    a.client
+        .settings()
+        .send(enabled.clone())
+        .expect("MoonClient send_settings must queue");
+    assert!(
+        pump_pair_until(a, b, cfg.connect_timeout, "enable emulator mode", |a, b| {
+            a.last_settings
+                .as_ref()
+                .map(|settings| settings.emu_mode)
+                .unwrap_or(false)
+                && b.last_settings
+                    .as_ref()
+                    .map(|settings| settings.emu_mode)
+                    .unwrap_or(false)
+        }),
+        "server emulator mode was not confirmed within {:?}",
+        cfg.connect_timeout
+    );
+    Some(original)
+}
+
+fn ensure_server_real_order_mode(
+    cfg: &FireConfig,
+    a: &mut Session,
+    b: &mut Session,
+) -> Option<ClientSettingsCommand> {
+    let original = request_settings_until(a, cfg.connect_timeout);
+    if !original.emu_mode {
+        println!("OK: server emulator mode is already disabled");
+        return None;
+    }
+
+    let mut real = original.clone();
+    real.emu_mode = false;
+    println!("FIRETEST real order cancel: disabling server emulator mode through UI settings");
+    a.client
+        .settings()
+        .send(real.clone())
+        .expect("MoonClient send_settings must queue");
+    assert!(
+        pump_pair_until(
+            a,
+            b,
+            cfg.connect_timeout,
+            "disable emulator mode",
+            |a, b| {
+                a.last_settings
+                    .as_ref()
+                    .map(|settings| !settings.emu_mode)
+                    .unwrap_or(false)
+                    && b.last_settings
+                        .as_ref()
+                        .map(|settings| !settings.emu_mode)
+                        .unwrap_or(false)
+            }
+        ),
+        "server emulator mode=false was not confirmed within {:?}",
+        cfg.connect_timeout
+    );
+    Some(original)
+}
+
+fn restore_server_emulator_mode(
+    cfg: &FireConfig,
+    a: &mut Session,
+    b: &mut Session,
+    original: Option<ClientSettingsCommand>,
+) {
+    let Some(original) = original else {
+        return;
+    };
+    println!(
+        "FIRETEST order flow: restoring server emulator mode to {}",
+        original.emu_mode
+    );
+    a.client
+        .settings()
+        .send(original.clone())
+        .expect("MoonClient send_settings must queue");
+    assert!(
+        pump_pair_until(
+            a,
+            b,
+            cfg.connect_timeout,
+            "restore emulator mode",
+            |a, b| {
+                a.last_settings
+                    .as_ref()
+                    .map(|settings| settings.emu_mode == original.emu_mode)
+                    .unwrap_or(false)
+                    && b.last_settings
+                        .as_ref()
+                        .map(|settings| settings.emu_mode == original.emu_mode)
+                        .unwrap_or(false)
+            }
+        ),
+        "server emulator mode was not restored within {:?}",
+        cfg.connect_timeout
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MarketBalanceProbe {
+    initial_balance: f64,
+    locked_balance: f64,
+    pos_size: f64,
+    pos_price: f64,
+    asset_balance: f64,
+    asset_balance_full: f64,
+    total_profit: f64,
+    balance_hash: u64,
+    epoch: u16,
+}
+
+impl MarketBalanceProbe {
+    fn summary(self) -> String {
+        format!(
+            "init={:.8} locked={:.8} pos={:.8}@{:.8} asset={:.8}/{:.8} pnl={:.8} hash={} epoch={}",
+            self.initial_balance,
+            self.locked_balance,
+            self.pos_size,
+            self.pos_price,
+            self.asset_balance,
+            self.asset_balance_full,
+            self.total_profit,
+            self.balance_hash,
+            self.epoch
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GlobalBalanceProbe {
+    btc_balance_total: f64,
+    btc_balance_locked: f64,
+    btc_balance_full: f64,
+    special_coin_balance: f64,
+    total_pnl: f64,
+}
+
+impl GlobalBalanceProbe {
+    fn summary(self) -> String {
+        format!(
+            "btc_total={:.8} btc_locked={:.8} btc_full={:.8} special_coin={:.8} total_pnl={:.8}",
+            self.btc_balance_total,
+            self.btc_balance_locked,
+            self.btc_balance_full,
+            self.special_coin_balance,
+            self.total_pnl
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveBalanceProbe {
+    market: MarketBalanceProbe,
+    global: GlobalBalanceProbe,
+}
+
+impl ActiveBalanceProbe {
+    fn summary(self) -> String {
+        format!(
+            "market=[{}] global=[{}]",
+            self.market.summary(),
+            self.global.summary()
+        )
+    }
+}
+
+fn active_balance_probe(session: &Session, market: &str) -> ActiveBalanceProbe {
+    let snapshot = session.state_snapshot();
+    let handle = snapshot
+        .markets()
+        .get(market)
+        .unwrap_or_else(|| panic!("market {market} is not present in ActiveLib MarketsState"));
+    let pos = handle.balance_position();
+    let global = snapshot.balances().global();
+    ActiveBalanceProbe {
+        market: MarketBalanceProbe {
+            initial_balance: pos.initial_balance,
+            locked_balance: pos.locked_balance,
+            pos_size: pos.pos_size,
+            pos_price: pos.pos_price,
+            asset_balance: pos.asset_balance,
+            asset_balance_full: pos.asset_balance_full,
+            total_profit: pos.total_profit(),
+            balance_hash: pos.balance_hash,
+            epoch: pos.last_balance_epoch,
+        },
+        global: GlobalBalanceProbe {
+            btc_balance_total: global.btc_balance_total,
+            btc_balance_locked: global.btc_balance_locked,
+            btc_balance_full: global.btc_balance_full,
+            special_coin_balance: global.special_coin_balance,
+            total_pnl: global.total_pnl,
+        },
+    }
+}
+
+fn market_live_ask(session: &Session, market: &str) -> Option<f64> {
+    session
+        .maybe_state_snapshot()
+        .and_then(|snapshot| snapshot.markets().price(market))
+        .and_then(|price| {
+            [price.ask, price.last_ask, price.bid, price.mark_price]
+                .into_iter()
+                .find(|value| value.is_finite() && *value > EPS)
+        })
+}
+
+fn matching_new_order_uids(
+    session: &Session,
+    before_uids: &[u64],
+    market: &str,
+    is_short: bool,
+    requested_price: f64,
+    requested_size_usd: f64,
+    emulator_mode: bool,
+) -> Vec<u64> {
+    // OrdersProto does not echo the outbound request UID. Match this test-owned
+    // order by the canonical facts that the public snapshot actually exposes.
+    let price_tolerance = (requested_price.abs() * 0.001).max(EPS);
+    let size_tolerance = (requested_size_usd.abs() * 0.25).max(EPS);
+    session
+        .state_snapshot()
+        .orders()
+        .iter()
+        .filter(|order| {
+            if before_uids.contains(&order.uid)
+                || order.market_name != market
+                || order.is_short != is_short
+                || order.strat_id != 0
+                || order.emulator_mode != emulator_mode
+            {
+                return false;
+            }
+            let observed_price = if order.buy_price > EPS {
+                order.buy_price
+            } else {
+                order.pending_buy_cond_price.unwrap_or_default()
+            };
+            (observed_price - requested_price).abs() <= price_tolerance
+                && (order.buy_size - requested_size_usd).abs() <= size_tolerance
+        })
+        .map(|order| order.uid)
+        .collect()
+}
+
+fn matching_pending_order_uids(
+    session: &Session,
+    before_uids: &[u64],
+    market: &str,
+    is_short: bool,
+    trigger_price: f64,
+    requested_size_usd: f64,
+) -> Vec<u64> {
+    let price_tolerance = (trigger_price.abs() * 0.001).max(EPS);
+    let size_tolerance = (requested_size_usd.abs() * 0.25).max(EPS);
+    session
+        .state_snapshot()
+        .orders()
+        .iter()
+        .filter(|order| {
+            !before_uids.contains(&order.uid)
+                && order.market_name == market
+                && order.is_short == is_short
+                && order.strat_id == 0
+                && order.emulator_mode
+                && order.status == OrderWorkerStatus::None
+                && order
+                    .pending_buy_cond_price
+                    .is_some_and(|price| (price - trigger_price).abs() <= price_tolerance)
+                && (order.buy_size - requested_size_usd).abs() <= size_tolerance
+        })
+        .map(|order| order.uid)
+        .collect()
+}
+
+fn cancel_if_known(
+    session: &mut Session,
+    before_uids: &[u64],
+    market: &str,
+    price: f64,
+    emulator_mode: bool,
+) -> Option<u64> {
+    let candidates = matching_new_order_uids(
+        session,
+        before_uids,
+        market,
+        false,
+        price,
+        FIRETEST_ORDER_SIZE_USD,
+        emulator_mode,
+    );
+    let [uid] = candidates.as_slice() else {
+        return None;
+    };
+    let uid = *uid;
+    if session.cancel_order(uid) {
+        println!("FIRETEST real order cancel: cleanup cancel queued uid={uid}");
+    } else {
+        println!("FIRETEST real order cancel: cleanup cancel gate refused uid={uid}");
+    }
+    Some(uid)
+}
+
+fn order_is_present(session: &Session, uid: u64) -> bool {
+    session
+        .maybe_state_snapshot()
+        .map(|snapshot| snapshot.orders().iter().any(|order| order.uid == uid))
+        .unwrap_or(false)
+}
+
+fn assert_balance_stream_seen(session: &Session) {
+    let st = session.snapshot();
+    let snapshot = session.state_snapshot();
+    let global = snapshot.balances().global();
+    assert!(
+        st.balance_events >= 2 && st.balance_snapshot_events >= 1,
+        "FireTest balance stream: session {} saw too few balance events: total={} snapshots={} increments={}",
+        st.label,
+        st.balance_events,
+        st.balance_snapshot_events,
+        st.balance_incremental_events
+    );
+    assert!(
+        global.btc_balance_total.abs()
+            + global.btc_balance_full.abs()
+            + global.special_coin_balance.abs()
+            > EPS,
+        "FireTest balance stream: session {} has zero global balances after balance events",
+        st.label
+    );
+    println!(
+        "OK: balance stream session={} events={} snapshots={} increments={} global=[btc_total={:.8} btc_locked={:.8} btc_full={:.8} special_coin={:.8}]",
+        st.label,
+        st.balance_events,
+        st.balance_snapshot_events,
+        st.balance_incremental_events,
+        global.btc_balance_total,
+        global.btc_balance_locked,
+        global.btc_balance_full,
+        global.special_coin_balance
+    );
+}
+
+fn firetest_report_db_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("firetest_report_replica.sqlite")
+}
+
+fn remove_firetest_report_db(path: &std::path::Path) {
+    for candidate in [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        match fs::remove_file(&candidate) {
+            Ok(()) => println!("FIRETEST report DB: removed {}", candidate.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!(
+                "FireTest report DB: cannot remove {}: {err}",
+                candidate.display()
+            ),
+        }
+    }
+}
+
+fn quote_sqlite_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn sqlite_table_columns(connection: &rusqlite::Connection, table: &str) -> Vec<(String, String)> {
+    let sql = format!("PRAGMA table_info({})", quote_sqlite_identifier(table));
+    let mut statement = connection
+        .prepare(&sql)
+        .unwrap_or_else(|err| panic!("FireTest report DB: prepare {sql:?} failed: {err}"));
+    statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .unwrap_or_else(|err| panic!("FireTest report DB: query {sql:?} failed: {err}"))
+        .map(|row| row.expect("FireTest report DB: table_info row must decode"))
+        .collect()
+}
+
+fn assert_report_table_matches_schema(
+    connection: &rusqlite::Connection,
+    schema: &ReportSchema,
+    require_wire_order: bool,
+) {
+    let columns = sqlite_table_columns(connection, FIRETEST_REPORT_TABLE);
+    let expected_names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    let actual_names = columns
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    if require_wire_order {
+        assert_eq!(
+            actual_names, expected_names,
+            "fresh report DB columns must preserve schema order"
+        );
+    } else {
+        assert_eq!(actual_names.len(), expected_names.len());
+        assert_eq!(
+            actual_names.iter().cloned().collect::<HashSet<_>>(),
+            expected_names.iter().cloned().collect::<HashSet<_>>(),
+            "migrated report DB must contain every schema field"
+        );
+    }
+    for field in schema.fields() {
+        let (_, declared_type) = columns
+            .iter()
+            .find(|(name, _)| name == &field.name)
+            .expect("schema field must exist in SQLite table_info");
+        let expected_type = field.sql_spec.split_whitespace().next().unwrap_or("");
+        assert!(
+            declared_type.eq_ignore_ascii_case(expected_type),
+            "SQLite type mismatch for {}: actual={declared_type:?} expected={expected_type:?}",
+            field.name
+        );
+    }
+}
+
+fn create_and_migrate_firetest_report_db(
+    path: &std::path::Path,
+    schema: &ReportSchema,
+) -> rusqlite::Connection {
+    remove_firetest_report_db(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|err| {
+            panic!(
+                "FireTest report DB: cannot create {}: {err}",
+                parent.display()
+            )
+        });
+    }
+
+    {
+        let connection = rusqlite::Connection::open(path)
+            .unwrap_or_else(|err| panic!("FireTest report DB: full create open failed: {err}"));
+        let ddl = schema.sqlite_create_table_sql(FIRETEST_REPORT_TABLE);
+        connection
+            .execute_batch(&ddl)
+            .unwrap_or_else(|err| panic!("FireTest report DB: full schema create failed: {err}"));
+        assert_report_table_matches_schema(&connection, schema, true);
+        println!(
+            "OK: report DB full create fields={} path={}",
+            schema.revision(),
+            path.display()
+        );
+    }
+
+    remove_firetest_report_db(path);
+    let connection = rusqlite::Connection::open(path)
+        .unwrap_or_else(|err| panic!("FireTest report DB: partial create open failed: {err}"));
+    let rec_id = schema
+        .field_by_name("newRecID")
+        .expect("report schema must contain newRecID");
+    let mut initial_fields = schema
+        .fields()
+        .iter()
+        .filter(|field| field.index != rec_id.index)
+        .take(FIRETEST_REPORT_PARTIAL_FIELDS)
+        .collect::<Vec<_>>();
+    initial_fields.push(rec_id);
+    initial_fields.sort_by_key(|field| field.index);
+
+    let mut definitions = initial_fields
+        .iter()
+        .map(|field| {
+            format!(
+                "{} {}",
+                quote_sqlite_identifier(&field.name),
+                field.sql_spec
+            )
+        })
+        .collect::<Vec<_>>();
+    definitions.push(format!(
+        "PRIMARY KEY ({})",
+        quote_sqlite_identifier(&rec_id.name)
+    ));
+    let partial_ddl = format!(
+        "CREATE TABLE {} ({})",
+        quote_sqlite_identifier(FIRETEST_REPORT_TABLE),
+        definitions.join(", ")
+    );
+    connection
+        .execute_batch(&partial_ddl)
+        .unwrap_or_else(|err| panic!("FireTest report DB: partial schema create failed: {err}"));
+
+    let mut existing = sqlite_table_columns(&connection, FIRETEST_REPORT_TABLE)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<HashSet<_>>();
+    let initial_count = existing.len();
+    for field in schema.fields() {
+        if existing.insert(field.name.clone()) {
+            connection
+                .execute_batch(&schema.sqlite_add_column_sql(FIRETEST_REPORT_TABLE, field))
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "FireTest report DB: append field {} failed: {err}",
+                        field.name
+                    )
+                });
+        }
+    }
+    connection
+        .execute_batch(&schema.sqlite_unique_index_sql(FIRETEST_REPORT_TABLE))
+        .unwrap_or_else(|err| panic!("FireTest report DB: unique index create failed: {err}"));
+    assert_report_table_matches_schema(&connection, schema, false);
+    println!(
+        "OK: report DB append-only migration initial_fields={} appended={} final_fields={}",
+        initial_count,
+        schema.revision().saturating_sub(initial_count),
+        schema.revision()
+    );
+    connection
+}
+
+fn wait_report_schema(session: &mut Session, timeout: Duration) -> Arc<ReportSchema> {
+    if let Some(schema) = session.state_snapshot().report_schema() {
+        return Arc::new(schema.clone());
+    }
+    session
+        .client
+        .reports()
+        .refresh_schema()
+        .expect("MoonReports::refresh_schema must queue");
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        session.pump(PUMP_SLICE);
+        if let Some(schema) = session.state_snapshot().report_schema() {
+            let schema = Arc::new(schema.clone());
+            println!(
+                "OK: report schema received fields={} format={}",
+                schema.revision(),
+                schema.format_version()
+            );
+            session.take_report_events();
+            return schema;
+        }
+    }
+    panic!("report schema was not received within {timeout:?}")
+}
+
+fn wait_report_sync<F>(
+    session: &mut Session,
+    request: ReportSyncRequest,
+    timeout: Duration,
+    on_event: F,
+) -> ReportSyncComplete
+where
+    F: FnMut(&ReportEvent),
+{
+    session.take_report_events();
+    let ticket = session
+        .client
+        .reports()
+        .sync(request)
+        .expect("MoonReports::sync must queue");
+    wait_report_sync_ticket(session, ticket, request.from_rec_id, timeout, on_event)
+}
+
+fn wait_report_sync_from<F>(
+    session: &mut Session,
+    checkpoint: ReportSyncCheckpoint,
+    timeout: Duration,
+    on_event: F,
+) -> ReportSyncComplete
+where
+    F: FnMut(&ReportEvent),
+{
+    session.take_report_events();
+    let ticket = session
+        .client
+        .reports()
+        .sync_from(checkpoint)
+        .expect("MoonReports::sync_from must queue");
+    wait_report_sync_ticket(
+        session,
+        ticket,
+        checkpoint.next_from_rec_id,
+        timeout,
+        on_event,
+    )
+}
+
+fn wait_report_sync_ticket<F>(
+    session: &mut Session,
+    ticket: moonproto::ReportSyncTicket,
+    from_rec_id: i64,
+    timeout: Duration,
+    mut on_event: F,
+) -> ReportSyncComplete
+where
+    F: FnMut(&ReportEvent),
+{
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        session.pump(PUMP_SLICE);
+        let mut completed = None;
+        for event in session.take_report_events() {
+            on_event(&event);
+            match &event {
+                ReportEvent::SyncPage(page) if page.ticket == ticket => {
+                    session
+                        .client
+                        .reports()
+                        .page_applied(page)
+                        .expect("MoonReports::page_applied must queue after DB commit");
+                }
+                ReportEvent::SyncComplete(done) if done.ticket == ticket => {
+                    completed = Some(done.clone());
+                }
+                ReportEvent::SchemaRejected { reason } => {
+                    panic!("report schema rejected during sync: {reason}")
+                }
+                _ => {}
+            }
+        }
+        if let Some(done) = completed {
+            println!(
+                "OK: report sync sync_id={} from={} pages={} rows={} epoch={} max_rec_id={} next={} elapsed={:.2}s",
+                done.ticket.sync_id,
+                from_rec_id,
+                done.page_count,
+                done.total_rows,
+                done.epoch,
+                done.max_rec_id,
+                done.next_from_rec_id,
+                started.elapsed().as_secs_f64()
+            );
+            return done;
+        }
+    }
+    panic!(
+        "report sync sync_id={} from={} did not complete within {:?}",
+        ticket.sync_id, from_rec_id, timeout
+    )
+}
+
+fn wait_report_alive_map(
+    session: &mut Session,
+    completed: &ReportSyncComplete,
+    timeout: Duration,
+) -> ReportAliveMapComplete {
+    session.take_report_events();
+    let ticket = session
+        .client
+        .reports()
+        .reconcile_alive(completed)
+        .expect("MoonReports::reconcile_alive must queue");
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        session.pump(PUMP_SLICE);
+        for event in session.take_report_events() {
+            match event {
+                ReportEvent::AliveMapComplete(done) if done.ticket == ticket => {
+                    println!(
+                        "OK: report alive-map sync sync_id={} epoch={} covered_up_to={} outcome={} elapsed={:.2}s",
+                        done.ticket.sync_id,
+                        done.epoch,
+                        done.covered_up_to,
+                        match &done.outcome {
+                            ReportAliveMapOutcome::DatabaseRecreated => "database-recreated",
+                            ReportAliveMapOutcome::Snapshot => "snapshot",
+                        },
+                        started.elapsed().as_secs_f64()
+                    );
+                    return done;
+                }
+                ReportEvent::SchemaRejected { reason } => {
+                    panic!("report schema rejected during alive-map sync: {reason}")
+                }
+                _ => {}
+            }
+        }
+    }
+    panic!(
+        "report alive-map sync sync_id={} did not complete within {:?}",
+        ticket.sync_id, timeout
+    )
+}
+
+fn restore_report_row_for_cleanup(report: &mut Session, rec_id: i64) {
+    const CLEANUP_ATTEMPTS: usize = 3;
+
+    for attempt in 1..=CLEANUP_ATTEMPTS {
+        report.take_report_events();
+        report
+            .client
+            .reports()
+            .restore_rows(&[], &[rec_id])
+            .expect("report cleanup restore must queue");
+        if wait_report_rows_deleted_echo_one(
+            report,
+            rec_id,
+            false,
+            FIRETEST_REPORT_MUTATION_TIMEOUT,
+        ) {
+            println!(
+                "OK: report cleanup restore confirmed for rec_id={} attempt={}",
+                rec_id, attempt
+            );
+            return;
+        }
+    }
+
+    panic!(
+        "report cleanup restore for rec_id={} was not confirmed after {} attempts",
+        rec_id, CLEANUP_ATTEMPTS
+    );
+}
+
+fn sqlite_value(value: &ReportValue) -> rusqlite::types::Value {
+    match value {
+        ReportValue::Integer(value) => rusqlite::types::Value::Integer(*value),
+        ReportValue::Float(value) => rusqlite::types::Value::Real(*value),
+        ReportValue::Text(value) => rusqlite::types::Value::Text(value.clone()),
+    }
+}
+
+fn apply_report_row_to_db(
+    connection: &rusqlite::Connection,
+    schema: &ReportSchema,
+    row: &ReportRow,
+) {
+    let rec_id_index = schema.rec_id_field_index();
+    let mut columns = vec!["newRecID".to_string()];
+    let mut values = vec![rusqlite::types::Value::Integer(row.rec_id)];
+    for field_value in &row.fields {
+        if field_value.field_index == rec_id_index {
+            continue;
+        }
+        let Some(field) = schema.field(field_value.field_index) else {
+            continue;
+        };
+        columns.push(field.name.clone());
+        values.push(sqlite_value(&field_value.value));
+    }
+
+    let quoted_columns = columns
+        .iter()
+        .map(|column| quote_sqlite_identifier(column))
+        .collect::<Vec<_>>();
+    let placeholders = vec!["?"; columns.len()].join(", ");
+    let updates = columns
+        .iter()
+        .skip(1)
+        .map(|column| {
+            let column = quote_sqlite_identifier(column);
+            format!("{column}=excluded.{column}")
+        })
+        .collect::<Vec<_>>();
+    let conflict = if updates.is_empty() {
+        "DO NOTHING".to_string()
+    } else {
+        format!("DO UPDATE SET {}", updates.join(", "))
+    };
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) {}",
+        quote_sqlite_identifier(FIRETEST_REPORT_TABLE),
+        quoted_columns.join(", "),
+        placeholders,
+        quote_sqlite_identifier("newRecID"),
+        conflict
+    );
+    connection
+        .execute(&sql, rusqlite::params_from_iter(values))
+        .unwrap_or_else(|err| {
+            panic!(
+                "FireTest report DB: upsert rec_id={} failed: {err}; sql={sql}",
+                row.rec_id
+            )
+        });
+}
+
+fn apply_report_event_to_db(
+    connection: &rusqlite::Connection,
+    schema: &ReportSchema,
+    event: &ReportEvent,
+) {
+    match event {
+        ReportEvent::RowUpsert(row) => apply_report_row_to_db(connection, schema, row),
+        ReportEvent::RowDelete { rec_id } => {
+            connection
+                .execute(
+                    &format!(
+                        "DELETE FROM {} WHERE {}=?",
+                        quote_sqlite_identifier(FIRETEST_REPORT_TABLE),
+                        quote_sqlite_identifier("newRecID")
+                    ),
+                    [rec_id],
+                )
+                .unwrap_or_else(|err| {
+                    panic!("FireTest report DB: delete rec_id={rec_id} failed: {err}")
+                });
+        }
+        ReportEvent::RowsDeleted(change) => {
+            let deleted = if change.deleted { 1i64 } else { 0i64 };
+            let table = quote_sqlite_identifier(FIRETEST_REPORT_TABLE);
+            let rec_id = quote_sqlite_identifier("newRecID");
+            for range in change.ranges.iter() {
+                connection
+                    .execute(
+                        &format!(
+                            "UPDATE {table} SET {}=? WHERE {rec_id} BETWEEN ? AND ?",
+                            quote_sqlite_identifier("deleted")
+                        ),
+                        rusqlite::params![deleted, range.from_rec_id, range.to_rec_id],
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "FireTest report DB: set deleted={} range={}..{} failed: {err}",
+                            change.deleted, range.from_rec_id, range.to_rec_id
+                        )
+                    });
+            }
+            for selected_rec_id in change.singles.iter() {
+                connection
+                    .execute(
+                        &format!(
+                            "UPDATE {table} SET {}=? WHERE {rec_id}=?",
+                            quote_sqlite_identifier("deleted")
+                        ),
+                        rusqlite::params![deleted, selected_rec_id],
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "FireTest report DB: set deleted={} rec_id={} failed: {err}",
+                            change.deleted, selected_rec_id
+                        )
+                    });
+            }
+        }
+        ReportEvent::SyncPage(page) => {
+            assert!(
+                !page.database_recreated,
+                "FireTest report DB unexpectedly moved behind cursor {} (server max={})",
+                page.from_rec_id, page.max_rec_id
+            );
+            let transaction = connection
+                .unchecked_transaction()
+                .expect("FireTest report DB: page transaction must start");
+            for row in page.rows.iter() {
+                apply_report_row_to_db(&transaction, schema, row);
+            }
+            transaction
+                .commit()
+                .expect("FireTest report DB: page transaction must commit before page_applied");
+        }
+        _ => {}
+    }
+}
+
+fn run_report_database_gate(cfg: &FireConfig, keys: ImportedKeys, pump_peer: &mut Session) {
+    println!("FIRETEST report DB: starting schema/migration/offline catch-up gate");
+    let seeded_strategy = firetest_strategy(cfg);
+    let mut report_a = Session::connect("ReportDB-A", cfg, keys, Some(seeded_strategy.clone()));
+    let schema = wait_report_schema(&mut report_a, cfg.connect_timeout);
+    for required in ["newRecID", "TaskID", "Status", "Emulator", "deleted"] {
+        assert!(
+            schema.field_by_name(required).is_some(),
+            "report schema must contain {required} for FireTest DB verification"
+        );
+    }
+    let db_path = firetest_report_db_path();
+    let connection = create_and_migrate_firetest_report_db(&db_path, &schema);
+
+    let baseline = wait_report_sync(
+        &mut report_a,
+        ReportSyncRequest::fresh(ReportHistoryDepth::Days(1)),
+        FIRETEST_REPORT_SYNC_TIMEOUT,
+        |_| {},
+    );
+    let offline_from_rec_id = baseline.next_from_rec_id.max(1);
+    report_a.take_report_events();
+
+    let restore_emu_mode = ensure_server_emulator_mode(cfg, &mut report_a, pump_peer);
+    let order_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_order_lifecycle_gate_body(cfg, &mut report_a, pump_peer)
+    }));
+    report_a.end_order_state_capture();
+    pump_peer.end_order_state_capture();
+    restore_server_emulator_mode(cfg, &mut report_a, pump_peer, restore_emu_mode);
+    let order_probe = match order_result {
+        Ok(probe) => probe,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    let expected_coin = order_probe
+        .market
+        .strip_suffix("USDT")
+        .unwrap_or(&order_probe.market);
+
+    let live_started = Instant::now();
+    let mut closed_row = None;
+    while live_started.elapsed() < cfg.connect_timeout {
+        report_a.pump(PUMP_SLICE);
+        pump_peer.pump(PUMP_SLICE);
+        for event in report_a.take_report_events() {
+            if let ReportEvent::RowUpsert(row) = event {
+                let task_id = row.integer_by_name(&schema, "TaskID");
+                let status = row.integer_by_name(&schema, "Status");
+                let emulator = row.integer_by_name(&schema, "Emulator");
+                let coin = row.text_by_name(&schema, "Coin");
+                let buy_price = row.float_by_name(&schema, "BuyPrice");
+                let bought_q = row.float_by_name(&schema, "BoughtQ");
+                println!(
+                    "FIRETEST report live candidate rec_id={} task_id={:?} coin={:?} status={:?} emulator={:?} buy_price={:?} bought_q={:?}",
+                    row.rec_id, task_id, coin, status, emulator, buy_price, bought_q
+                );
+                let price_matches = buy_price.is_some_and(|value| {
+                    (value - order_probe.buy_price).abs()
+                        <= order_probe.buy_price.abs().max(1.0) * 1e-9
+                });
+                let quantity_matches = bought_q.is_some_and(|value| {
+                    (value - order_probe.bought_q).abs()
+                        <= order_probe.bought_q.abs().max(1.0) * 1e-9
+                });
+                if row.rec_id >= offline_from_rec_id
+                    && status == Some(1)
+                    && row.integer_by_name(&schema, "Emulator") == Some(1)
+                    && coin == Some(expected_coin)
+                    && price_matches
+                    && quantity_matches
+                {
+                    closed_row = Some(row);
+                }
+            }
+        }
+        if closed_row.is_some() {
+            break;
+        }
+    }
+    let closed_row = closed_row.unwrap_or_else(|| {
+        panic!(
+            "ReportDB-A did not receive the closed emulator deal {:?} within {:?}",
+            order_probe, cfg.connect_timeout
+        )
+    });
+    let report_task_id = closed_row
+        .integer_by_name(&schema, "TaskID")
+        .expect("matched report row must contain TaskID");
+    assert!(
+        closed_row.rec_id >= offline_from_rec_id,
+        "closed deal rec_id={} must be newer than committed offline cursor {}",
+        closed_row.rec_id,
+        offline_from_rec_id
+    );
+    println!(
+        "OK: ReportDB-A live closed deal moonproto_uid={} report_task_id={} rec_id={} status=1 emulator=1 buy_price={:.8} bought_q={:.8}",
+        order_probe.server_uid,
+        report_task_id,
+        closed_row.rec_id,
+        order_probe.buy_price,
+        order_probe.bought_q
+    );
+
+    let mut report_b = Session::connect("ReportDB-B", cfg, keys, Some(seeded_strategy));
+    let b_schema = Arc::new(
+        report_b
+            .state_snapshot()
+            .report_schema()
+            .cloned()
+            .unwrap_or_else(|| schema.as_ref().clone()),
+    );
+    let complete = wait_report_sync(
+        &mut report_b,
+        ReportSyncRequest::resume(offline_from_rec_id),
+        FIRETEST_REPORT_SYNC_TIMEOUT,
+        |event| {
+            if let ReportEvent::Schema(received) = event {
+                assert_eq!(
+                    received.fields(),
+                    schema.fields(),
+                    "ReportDB-B schema must match ReportDB-A schema"
+                );
+            }
+            apply_report_event_to_db(&connection, &b_schema, event);
+        },
+    );
+    assert!(complete.next_from_rec_id >= offline_from_rec_id);
+
+    let sql = format!(
+        "SELECT {}, {}, {}, {}, {} FROM {} WHERE {}=?",
+        quote_sqlite_identifier("TaskID"),
+        quote_sqlite_identifier("Status"),
+        quote_sqlite_identifier("Emulator"),
+        quote_sqlite_identifier("BuyPrice"),
+        quote_sqlite_identifier("BoughtQ"),
+        quote_sqlite_identifier(FIRETEST_REPORT_TABLE),
+        quote_sqlite_identifier("newRecID")
+    );
+    let stored = connection
+        .query_row(&sql, [closed_row.rec_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, f64>(4)?,
+            ))
+        })
+        .unwrap_or_else(|err| {
+            panic!(
+                "ReportDB-B offline sync did not persist rec_id={}: {err}",
+                closed_row.rec_id
+            )
+        });
+    assert_eq!((stored.0, stored.1, stored.2), (report_task_id, 1, 1));
+    assert!(
+        (stored.3 - order_probe.buy_price).abs() <= order_probe.buy_price.abs().max(1.0) * 1e-9
+    );
+    assert!((stored.4 - order_probe.bought_q).abs() <= order_probe.bought_q.abs().max(1.0) * 1e-9);
+
+    report_b.take_report_events();
+    report_b
+        .client
+        .reports()
+        .check_open_rows(&[closed_row.rec_id])
+        .expect("MoonReports::check_open_rows must queue");
+    let check_started = Instant::now();
+    let mut check_row_seen = false;
+    let mut check_complete = false;
+    while check_started.elapsed() < FIRETEST_REPORT_SYNC_TIMEOUT {
+        report_b.pump(PUMP_SLICE);
+        for event in report_b.take_report_events() {
+            match event {
+                ReportEvent::RowUpsert(row) if row.rec_id == closed_row.rec_id => {
+                    check_row_seen = true;
+                    apply_report_row_to_db(&connection, &b_schema, &row);
+                }
+                ReportEvent::OpenRowsCheckComplete { rec_ids }
+                    if rec_ids.as_ref() == [closed_row.rec_id] =>
+                {
+                    check_complete = true;
+                }
+                _ => {}
+            }
+        }
+        if check_row_seen && check_complete {
+            break;
+        }
+    }
+    assert!(
+        check_row_seen && check_complete,
+        "ReportDB-B open-row check did not return an authoritative row and completion"
+    );
+    println!(
+        "OK: ReportDB-B paged offline catch-up + row check persisted report_task_id={} rec_id={} from_cursor={} path={}",
+        report_task_id,
+        closed_row.rec_id,
+        offline_from_rec_id,
+        db_path.display()
+    );
+
+    let baseline_alive =
+        wait_report_alive_map(&mut report_b, &complete, FIRETEST_REPORT_SYNC_TIMEOUT);
+    assert!(matches!(
+        &baseline_alive.outcome,
+        ReportAliveMapOutcome::Snapshot
+    ));
+    assert_eq!(baseline_alive.is_alive(closed_row.rec_id), Some(true));
+
+    let reconnect_checkpoint = complete.checkpoint();
+    report_b
+        .client
+        .disconnect()
+        .expect("ReportDB-B disconnect must queue");
+    report_b
+        .client
+        .wait_finished()
+        .expect("ReportDB-B runtime must stop before the offline mutation");
+    drop(report_b);
+
+    report_a.take_report_events();
+    let deleted_phase = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let delete_batches = report_a
+            .client
+            .reports()
+            .delete_rows(&[], &[closed_row.rec_id])
+            .expect("MoonReports::delete_rows must queue");
+        assert_eq!(delete_batches, 1);
+        let delete_a = wait_report_rows_deleted_echo_one(
+            &mut report_a,
+            closed_row.rec_id,
+            true,
+            FIRETEST_REPORT_MUTATION_TIMEOUT,
+        );
+        let local_before_reconnect = report_deleted_flag(&connection, closed_row.rec_id);
+
+        let mut report_b = Session::connect(
+            "ReportDB-B-Reconnect",
+            cfg,
+            keys,
+            Some(firetest_strategy(cfg)),
+        );
+        let reconnect_complete = wait_report_sync_from(
+            &mut report_b,
+            reconnect_checkpoint,
+            FIRETEST_REPORT_SYNC_TIMEOUT,
+            |event| apply_report_event_to_db(&connection, &b_schema, event),
+        );
+        let local_after_normal_sync = report_deleted_flag(&connection, closed_row.rec_id);
+        let alive_snapshot = wait_report_alive_map(
+            &mut report_b,
+            &reconnect_complete,
+            FIRETEST_REPORT_SYNC_TIMEOUT,
+        );
+        if let Some(alive) = alive_snapshot.is_alive(closed_row.rec_id) {
+            set_report_deleted_flag(&connection, closed_row.rec_id, !alive);
+        }
+        let local_after_alive_map = report_deleted_flag(&connection, closed_row.rec_id);
+
+        (
+            report_b,
+            reconnect_complete,
+            alive_snapshot,
+            delete_a,
+            local_before_reconnect,
+            local_after_normal_sync,
+            local_after_alive_map,
+        )
+    }));
+
+    let (
+        mut report_b,
+        reconnect_complete,
+        alive_snapshot,
+        delete_a,
+        local_before_reconnect,
+        local_after_normal_sync,
+        local_after_alive_map,
+    ) = match deleted_phase {
+        Ok(result) => result,
+        Err(payload) => {
+            restore_report_row_for_cleanup(&mut report_a, closed_row.rec_id);
+            std::panic::resume_unwind(payload);
+        }
+    };
+
+    let restore_batches = report_a
+        .client
+        .reports()
+        .restore_rows(&[], &[closed_row.rec_id])
+        .expect("MoonReports::restore_rows must queue");
+    assert_eq!(restore_batches, 1);
+    let (restore_a, restore_b) = wait_report_rows_deleted_echo(
+        &mut report_a,
+        &mut report_b,
+        &connection,
+        &b_schema,
+        closed_row.rec_id,
+        false,
+        FIRETEST_REPORT_MUTATION_TIMEOUT,
+    );
+    if !restore_a && !restore_b {
+        restore_report_row_for_cleanup(&mut report_a, closed_row.rec_id);
+    }
+    assert!(
+        restore_a || restore_b,
+        "report restore commit was not confirmed by either client"
+    );
+
+    assert!(
+        delete_a,
+        "deleting client did not receive its committed echo"
+    );
+    assert_eq!(
+        local_before_reconnect, 0,
+        "offline client replica changed without receiving the delete"
+    );
+    assert_eq!(
+        local_after_normal_sync, 0,
+        "newRecID catch-up unexpectedly repaired an older deleted flag"
+    );
+    assert!(matches!(
+        &alive_snapshot.outcome,
+        ReportAliveMapOutcome::Snapshot
+    ));
+    assert_eq!(
+        alive_snapshot.is_alive(closed_row.rec_id),
+        Some(false),
+        "alive map must include the offline soft-delete"
+    );
+    assert_eq!(
+        local_after_alive_map, 1,
+        "applying the alive map must repair the offline replica"
+    );
+
+    let restored_snapshot = wait_report_alive_map(
+        &mut report_b,
+        &reconnect_complete,
+        FIRETEST_REPORT_SYNC_TIMEOUT,
+    );
+    assert!(matches!(
+        &restored_snapshot.outcome,
+        ReportAliveMapOutcome::Snapshot
+    ));
+    assert_eq!(
+        restored_snapshot.is_alive(closed_row.rec_id),
+        Some(true),
+        "alive map must include the committed restore"
+    );
+
+    assert!(
+        restore_a && restore_b,
+        "report restore echo missing: A={restore_a} B={restore_b}"
+    );
+    assert_eq!(report_deleted_flag(&connection, closed_row.rec_id), 0);
+    println!(
+        "OK: offline soft-delete escaped normal catch-up, AliveMap repaired it, and restore returned the report row for rec_id={}",
+        closed_row.rec_id
+    );
+}
+
+fn wait_report_rows_deleted_echo(
+    report_a: &mut Session,
+    report_b: &mut Session,
+    connection: &rusqlite::Connection,
+    schema: &ReportSchema,
+    rec_id: i64,
+    deleted: bool,
+    timeout: Duration,
+) -> (bool, bool) {
+    let started = Instant::now();
+    let mut seen_a = false;
+    let mut seen_b = false;
+    while started.elapsed() < timeout {
+        report_a.pump(PUMP_SLICE);
+        report_b.pump(PUMP_SLICE);
+        for event in report_a.take_report_events() {
+            if let ReportEvent::RowsDeleted(change) = event {
+                if change.deleted == deleted && change.affects(rec_id) {
+                    seen_a = true;
+                }
+            }
+        }
+        for event in report_b.take_report_events() {
+            apply_report_event_to_db(connection, schema, &event);
+            if let ReportEvent::RowsDeleted(change) = event {
+                if change.deleted == deleted && change.affects(rec_id) {
+                    seen_b = true;
+                }
+            }
+        }
+        if seen_a && seen_b {
+            break;
+        }
+    }
+    (seen_a, seen_b)
+}
+
+fn report_deleted_flag(connection: &rusqlite::Connection, rec_id: i64) -> i64 {
+    connection
+        .query_row(
+            &format!(
+                "SELECT {} FROM {} WHERE {}=?",
+                quote_sqlite_identifier("deleted"),
+                quote_sqlite_identifier(FIRETEST_REPORT_TABLE),
+                quote_sqlite_identifier("newRecID")
+            ),
+            [rec_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|err| panic!("FireTest report DB missing rec_id={rec_id}: {err}"))
+}
+
+fn set_report_deleted_flag(connection: &rusqlite::Connection, rec_id: i64, deleted: bool) {
+    connection
+        .execute(
+            &format!(
+                "UPDATE {} SET {}=? WHERE {}=?",
+                quote_sqlite_identifier(FIRETEST_REPORT_TABLE),
+                quote_sqlite_identifier("deleted"),
+                quote_sqlite_identifier("newRecID")
+            ),
+            rusqlite::params![i64::from(deleted), rec_id],
+        )
+        .unwrap_or_else(|err| {
+            panic!("FireTest report DB cannot set deleted={deleted} for rec_id={rec_id}: {err}")
+        });
+}
+
+fn wait_report_rows_deleted_echo_one(
+    session: &mut Session,
+    rec_id: i64,
+    deleted: bool,
+    timeout: Duration,
+) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        session.pump(PUMP_SLICE);
+        if session.take_report_events().into_iter().any(|event| {
+            matches!(event, ReportEvent::RowsDeleted(change) if change.deleted == deleted && change.affects(rec_id))
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn run_order_lifecycle_gate(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    let restore_emu_mode = ensure_server_emulator_mode(cfg, a, b);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_manual_pending_gate_body(cfg, a, b);
+        let _ = run_order_lifecycle_gate_body(cfg, a, b);
+    }));
+    a.end_order_state_capture();
+    b.end_order_state_capture();
+    restore_server_emulator_mode(cfg, a, b, restore_emu_mode);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn run_manual_pending_gate_body(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    let market = &cfg.market;
+    let ask = market_live_ask(a, market)
+        .unwrap_or_else(|| panic!("FireTest pending order: no live price for {market}"));
+    let trigger_price = ask * 1.50;
+    let moved_trigger_price = ask * 1.60;
+    let before_uids = a
+        .state_snapshot()
+        .orders()
+        .iter()
+        .map(|order| order.uid)
+        .collect::<Vec<_>>();
+    let request_uid =
+        a.send_new_pending_order(market, false, trigger_price, FIRETEST_ORDER_SIZE_USD);
+    println!(
+        "FIRETEST pending order: sent request_uid={} market={} ask={:.8} trigger={:.8} size_usd={}",
+        request_uid, market, ask, trigger_price, FIRETEST_ORDER_SIZE_USD
+    );
+
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "manual pending creation broadcast",
+            |a, b| {
+                !matching_pending_order_uids(
+                    a,
+                    &before_uids,
+                    market,
+                    false,
+                    trigger_price,
+                    FIRETEST_ORDER_SIZE_USD,
+                )
+                .is_empty()
+                    && !matching_pending_order_uids(
+                        b,
+                        &before_uids,
+                        market,
+                        false,
+                        trigger_price,
+                        FIRETEST_ORDER_SIZE_USD,
+                    )
+                    .is_empty()
+            },
+        ),
+        "manual pending did not appear on both clients within {:?}",
+        cfg.connect_timeout
+    );
+    let candidates = matching_pending_order_uids(
+        a,
+        &before_uids,
+        market,
+        false,
+        trigger_price,
+        FIRETEST_ORDER_SIZE_USD,
+    );
+    assert_eq!(
+        candidates.len(),
+        1,
+        "manual pending correlation must be unique; candidates={candidates:?}"
+    );
+    let uid = candidates[0];
+
+    assert!(
+        a.replace_order(uid, moved_trigger_price),
+        "manual pending move did not pass the local order gate for uid={uid}"
+    );
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "manual pending trigger move broadcast",
+            |a, b| {
+                [a, b].into_iter().all(|session| {
+                    session
+                        .maybe_state_snapshot()
+                        .and_then(|snapshot| snapshot.orders().get(uid).cloned())
+                        .is_some_and(|order| {
+                            order.status == OrderWorkerStatus::None
+                                && order.pending_buy_cond_price.is_some_and(|price| {
+                                    (price - moved_trigger_price).abs()
+                                        <= moved_trigger_price * 0.001
+                                })
+                        })
+                })
+            },
+        ),
+        "manual pending uid={uid} did not retain the moved trigger on both clients"
+    );
+
+    assert!(
+        a.cancel_order(uid),
+        "manual pending cancel did not pass the local order gate for uid={uid}"
+    );
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "manual pending cancellation broadcast",
+            |a, b| !order_is_present(a, uid) && !order_is_present(b, uid),
+        ),
+        "manual pending uid={uid} was not removed from both clients"
+    );
+    println!(
+        "OK: manual pending uid={} created at {:.8}, moved to {:.8}, and cancelled without execution",
+        uid, trigger_price, moved_trigger_price
+    );
+}
+
+fn run_real_order_cancel_gate(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    let restore_emu_mode = ensure_server_real_order_mode(cfg, a, b);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_real_order_cancel_gate_body(a, b);
+    }));
+    a.end_order_state_capture();
+    b.end_order_state_capture();
+    restore_server_emulator_mode(cfg, a, b, restore_emu_mode);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn run_real_order_cancel_gate_body(a: &mut Session, b: &mut Session) {
+    a.begin_order_state_capture();
+    b.begin_order_state_capture();
+    let market = FIRETEST_REAL_BALANCE_ORDER_MARKET;
+    assert_balance_stream_seen(a);
+    assert_balance_stream_seen(b);
+
+    let ask = pump_pair_until_sessions(
+        a,
+        b,
+        FIRETEST_REAL_BALANCE_ORDER_TIMEOUT,
+        "SOL live price before real order cancel",
+        |a, _| market_live_ask(a, market).is_some(),
+    )
+    .then(|| market_live_ask(a, market))
+    .flatten()
+    .unwrap_or_else(|| {
+        panic!(
+            "FireTest real order cancel: no live ask/price for {market} within {:?}",
+            FIRETEST_REAL_BALANCE_ORDER_TIMEOUT
+        )
+    });
+    let price = ask * (1.0 - FIRETEST_REAL_BALANCE_ORDER_DISCOUNT);
+    let baseline = active_balance_probe(a, market);
+    let before_uids = a
+        .state_snapshot()
+        .orders()
+        .iter()
+        .map(|order| order.uid)
+        .collect::<Vec<_>>();
+    let request_uid = a.send_new_order(market, false, price, 0, FIRETEST_ORDER_SIZE_USD);
+    println!(
+        "FIRETEST real order cancel: sent long request_uid={} market={} ask={:.8} limit={:.8} size_usd={} baseline_balance=[{}]",
+        request_uid,
+        market,
+        ask,
+        price,
+        FIRETEST_ORDER_SIZE_USD,
+        baseline.summary()
+    );
+
+    let start = Instant::now();
+    let mut server_uid = None;
+    let mut cancel_event_from = None;
+    let mut logged_waiting_for_local_order = false;
+    while start.elapsed() < FIRETEST_REAL_BALANCE_ORDER_TIMEOUT {
+        a.pump(PUMP_SLICE);
+        b.pump(PUMP_SLICE);
+        let st = a.snapshot();
+        if server_uid.is_none() {
+            let candidates = matching_new_order_uids(
+                a,
+                &before_uids,
+                market,
+                false,
+                price,
+                FIRETEST_ORDER_SIZE_USD,
+                false,
+            );
+            assert!(
+                candidates.len() <= 1,
+                "FireTest real order cancel: ambiguous matching {market} orders {candidates:?}; new_market_orders=[{}]",
+                describe_new_market_orders(a, &before_uids, market)
+            );
+            server_uid = candidates.first().copied();
+        }
+        if let Some(uid) = server_uid {
+            let local_status = st.order_status_by_uid.get(&uid).copied();
+            if local_status.is_none() {
+                if !logged_waiting_for_local_order {
+                    println!(
+                        "FIRETEST real order cancel: server uid={uid} is known, waiting for local ActiveLib order state before cancel"
+                    );
+                    logged_waiting_for_local_order = true;
+                }
+                continue;
+            }
+            assert!(
+                matches!(
+                    local_status,
+                    Some(
+                        OrderWorkerStatus::None
+                            | OrderWorkerStatus::BuySet
+                            | OrderWorkerStatus::SellSet
+                    )
+                ),
+                "real order uid={uid} reached non-cancelable local status {local_status:?} before FireTest cancel"
+            );
+            assert!(
+                a.cancel_order(uid),
+                "cancel_order did not pass Delphi local gate for uid={uid} status={local_status:?}"
+            );
+            cancel_event_from = Some((a.order_state_event_count(), b.order_state_event_count()));
+            println!(
+                "FIRETEST real order cancel: server uid={} arrived after {:.2}s; cancel queued immediately",
+                uid,
+                start.elapsed().as_secs_f64()
+            );
+            break;
+        }
+    }
+
+    let Some(server_uid) = server_uid else {
+        let _ = cancel_if_known(a, &before_uids, market, price, false);
+        panic!(
+            "FireTest real order cancel: server order uid for {market} did not arrive within {:?}",
+            FIRETEST_REAL_BALANCE_ORDER_TIMEOUT
+        );
+    };
+    let (a_cancel_event_from, b_cancel_event_from) =
+        cancel_event_from.expect("cancel event baseline must be captured with server uid");
+
+    let cancel_start = Instant::now();
+    let removed = loop {
+        if cancel_start.elapsed() >= FIRETEST_REAL_BALANCE_ORDER_TIMEOUT {
+            break false;
+        }
+        a.pump(PUMP_SLICE);
+        b.pump(PUMP_SLICE);
+        let terminal_a = captured_order_state_since(a, a_cancel_event_from, server_uid, |event| {
+            event.status == OrderWorkerStatus::BuyCancel && event.job_is_done
+        });
+        let terminal_b = captured_order_state_since(b, b_cancel_event_from, server_uid, |event| {
+            event.status == OrderWorkerStatus::BuyCancel && event.job_is_done
+        });
+        if !order_is_present(a, server_uid)
+            && !order_is_present(b, server_uid)
+            && terminal_a
+            && terminal_b
+        {
+            let current = active_balance_probe(a, market);
+            println!(
+                "FIRETEST real order cancel: terminal BuyCancel broadcast and order removed from both clients after {:.2}s uid={} current_balance=[{}]",
+                cancel_start.elapsed().as_secs_f64(),
+                server_uid,
+                current.summary()
+            );
+            break true;
+        }
+        if matches!(
+            a.snapshot().order_status_by_uid.get(&server_uid).copied(),
+            Some(OrderWorkerStatus::BuyDone | OrderWorkerStatus::SellDone)
+        ) {
+            panic!(
+                "FireTest real order cancel: uid={server_uid} unexpectedly filled/closed; limit was 5% below market"
+            );
+        }
+    };
+    assert!(
+        removed,
+        "FireTest real order cancel: {market} order uid={server_uid} did not broadcast terminal BuyCancel and disappear from both clients within {:?}; A.events=[{}] B.events=[{}]",
+        FIRETEST_REAL_BALANCE_ORDER_TIMEOUT,
+        describe_captured_order_states(a, server_uid),
+        describe_captured_order_states(b, server_uid)
+    );
+    assert_balance_stream_seen(a);
+    assert_balance_stream_seen(b);
+    println!("OK: real non-emulator SOL order was created, canceled, and removed; balance stream was observed independently");
+}
+
+#[test]
+#[ignore = "live MoonBot server required; creates and removes strategy order fixtures"]
+fn fire_test_strategy_order_sync() {
+    let _lock = firetest_live_test_lock();
+    let cfg = FireConfig::load_required();
+    assert!(cfg.allow_mutation);
+    let keys = parse_key_info(&cfg.key_b64)
+        .expect("invalid FireTest key")
+        .keys;
+    let _loss = ErrEmuGuard::set(0);
+    let mut a = Session::connect("Order-A", &cfg, keys, None);
+    let mut b = Session::connect("Order-B", &cfg, keys, None);
+    run_strategy_order_sync_gate(&cfg, keys, &mut a, &mut b);
+}
+
+#[test]
+#[ignore = "live updated MoonBot core required; creates and removes folder fixtures"]
+fn fire_test_strategy_folder_sync() {
+    let _lock = firetest_live_test_lock();
+    let cfg = FireConfig::load_required();
+    assert!(cfg.allow_mutation);
+    let keys = parse_key_info(&cfg.key_b64)
+        .expect("invalid FireTest key")
+        .keys;
+    let _loss = ErrEmuGuard::set(0);
+    let mut a = Session::connect("Folders-A", &cfg, keys, None);
+    let mut b = Session::connect("Folders-B", &cfg, keys, None);
+    run_strategy_folder_sync_gate(&cfg, keys, &mut a, &mut b);
+}
+
+fn strategy_folder_paths(session: &Session) -> Vec<String> {
+    session
+        .state_snapshot()
+        .strats()
+        .folder_paths()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn run_strategy_folder_sync_gate(
+    cfg: &FireConfig,
+    keys: ImportedKeys,
+    a: &mut Session,
+    b: &mut Session,
+) {
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "versioned folder tree",
+            |a, b| {
+                [a, b]
+                    .iter()
+                    .all(|s| s.state_snapshot().strats().folders_last_modified() > 0)
+            }
+        ),
+        "core has not sent a versioned folder tree; update the server first"
+    );
+    let id = rand::random::<u64>();
+    let prefix = format!("FireTestFolders-{id}");
+    let old = format!("{prefix}/Old");
+    let new = format!("{prefix}/New");
+    let empty = format!("{prefix}/Empty/Child");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let order_before = a.state_snapshot().strats().last_modified();
+        let mut paths = strategy_folder_paths(a);
+        paths.extend([old.clone(), empty.clone()]);
+        a.client.strategies().sync_local_folders(paths).unwrap();
+        assert!(pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "empty nested folders A to B",
+            |a, b| {
+                [a, b].iter().all(|s| {
+                    let paths = strategy_folder_paths(s);
+                    paths.contains(&old) && paths.contains(&empty)
+                })
+            }
+        ));
+        assert_eq!(a.state_snapshot().strats().last_modified(), order_before);
+
+        let mut rows = b.state_snapshot().strategy_snapshot_vec();
+        let mut fixture = firetest_strategy(cfg);
+        fixture.strategy_id = id;
+        fixture.checked = false;
+        fixture.path = old.clone().into();
+        rows.push(fixture);
+        b.sync_local_strategies(&rows);
+        assert!(pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "folder fixture",
+            |a, b| { a.strategy_snapshot(id).is_some() && b.strategy_snapshot(id).is_some() }
+        ));
+
+        let mut rows = b.state_snapshot().strategy_snapshot_vec();
+        let fixture = rows.iter_mut().find(|s| s.strategy_id == id).unwrap();
+        fixture.path = new.clone().into();
+        fixture.last_date = fixture.last_date.max(now_epoch_ms()).saturating_add(1);
+        let mut paths = strategy_folder_paths(b);
+        paths.retain(|p| p != &old);
+        paths.push(new.clone());
+        b.client
+            .strategies()
+            .sync_local_strategies_with_folders(rows, paths)
+            .unwrap();
+        assert!(pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "atomic folder rename B to A",
+            |a, b| {
+                [a, b].iter().all(|s| {
+                    let paths = strategy_folder_paths(s);
+                    !paths.contains(&old)
+                        && paths.contains(&new)
+                        && paths.contains(&empty)
+                        && s.strategy_snapshot(id)
+                            .is_some_and(|row| row.path.as_ref() == new)
+                })
+            }
+        ));
+
+        let mut c = Session::connect("Folders-cold", cfg, keys, None);
+        assert!(pump_pair_until_sessions(
+            a,
+            &mut c,
+            cfg.connect_timeout,
+            "cold folder recovery",
+            |_, c| {
+                let paths = strategy_folder_paths(c);
+                paths.contains(&new) && paths.contains(&empty) && !paths.contains(&old)
+            }
+        ));
+        c.client.disconnect().unwrap();
+        c.client.wait_finished().unwrap();
+
+        let mut paths = strategy_folder_paths(a);
+        paths.retain(|p| p != &empty && p != &format!("{prefix}/Empty"));
+        a.client.strategies().sync_local_folders(paths).unwrap();
+        assert!(pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "empty subtree deletion",
+            |a, b| {
+                [a, b].iter().all(|s| {
+                    !strategy_folder_paths(s)
+                        .iter()
+                        .any(|p| p.starts_with(&format!("{prefix}/Empty")))
+                })
+            }
+        ));
+        let mut c = Session::connect("Folders-after-delete", cfg, keys, None);
+        assert!(pump_pair_until_sessions(
+            a,
+            &mut c,
+            cfg.connect_timeout,
+            "deleted folder stays absent on reconnect",
+            |a, c| {
+                let state = c.state_snapshot();
+                state.strats().folders_last_modified()
+                    == a.state_snapshot().strats().folders_last_modified()
+                    && state.strats().folder_paths().any(|p| p == new)
+                    && !state
+                        .strats()
+                        .folder_paths()
+                        .any(|p| p == old || p == empty)
+            }
+        ));
+        c.client.disconnect().unwrap();
+        c.client.wait_finished().unwrap();
+    }));
+    a.client
+        .strategies()
+        .delete(id, "")
+        .expect("delete folder fixture");
+    let rows_cleaned = pump_pair_until_sessions(
+        a,
+        b,
+        cfg.connect_timeout,
+        "folder fixture cleanup",
+        |a, b| a.strategy_snapshot(id).is_none() && b.strategy_snapshot(id).is_none(),
+    );
+    let mut paths = strategy_folder_paths(a);
+    paths.retain(|p| p != &prefix && !p.starts_with(&format!("{prefix}/")));
+    a.client
+        .strategies()
+        .sync_local_folders(paths)
+        .expect("remove only test folders");
+    let folders_cleaned =
+        pump_pair_until_sessions(a, b, cfg.connect_timeout, "folder tree cleanup", |a, b| {
+            [a, b].iter().all(|s| {
+                !strategy_folder_paths(s)
+                    .iter()
+                    .any(|p| p == &prefix || p.starts_with(&format!("{prefix}/")))
+            })
+        });
+    assert!(
+        rows_cleaned && folders_cleaned,
+        "folder fixtures were not fully removed"
+    );
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+    println!("OK: empty/nested folders, bidirectional rename with rows, cold/reconnected clients, deletion and cleanup");
+}
+
+fn strategy_order(session: &Session) -> Vec<u64> {
+    session
+        .state_snapshot()
+        .strategy_snapshots()
+        .map(|s| s.strategy_id)
+        .collect()
+}
+
+fn run_strategy_order_sync_gate(
+    cfg: &FireConfig,
+    keys: ImportedKeys,
+    a: &mut Session,
+    b: &mut Session,
+) {
+    let ids = [rand::random::<u64>(), rand::random::<u64>()];
+    let folder = format!("FireTestOrder-{}", ids[0]);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut strategies = a.state_snapshot().strategy_snapshot_vec();
+        for (i, id) in ids.iter().enumerate() {
+            let mut fixture = firetest_strategy(cfg);
+            fixture.strategy_id = *id;
+            fixture.checked = false;
+            fixture.path = folder.clone().into();
+            fixture.fields.insert(
+                "StrategyName",
+                FieldValue::String(format!("FireTest Order {i}")),
+            );
+            strategies.push(fixture);
+        }
+        a.sync_local_strategies(&strategies);
+        assert!(pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "strategy order fixtures",
+            |a, b| {
+                ids.iter().all(|id| {
+                    a.strategy_snapshot(*id).is_some() && b.strategy_snapshot(*id).is_some()
+                }) && strategy_order(a) == strategy_order(b)
+            }
+        ));
+
+        for step in 0..4 {
+            let source = if step % 2 == 0 { &mut *a } else { &mut *b };
+            let mut desired = source.state_snapshot().strategy_snapshot_vec();
+            let positions = ids.map(|id| desired.iter().position(|s| s.strategy_id == id).unwrap());
+            desired.swap(positions[0], positions[1]);
+            let comment = format!("Order and content step {step}");
+            if step % 2 == 1 {
+                let fixture = desired
+                    .iter_mut()
+                    .find(|s| s.strategy_id == ids[0])
+                    .unwrap();
+                fixture.last_date = fixture.last_date.max(now_epoch_ms()).saturating_add(1);
+                fixture
+                    .fields
+                    .insert("Comment", FieldValue::String(comment.clone()));
+            }
+            let expected: Vec<_> = desired.iter().map(|s| s.strategy_id).collect();
+            source.sync_local_strategies(&desired);
+            assert!(
+                pump_pair_until_sessions(
+                    a,
+                    b,
+                    cfg.connect_timeout,
+                    "bidirectional strategy order",
+                    |a, b| {
+                        strategy_order(a) == expected
+                            && strategy_order(b) == expected
+                            && (step % 2 == 0
+                                || [a, b].iter().all(|s| {
+                                    s.strategy_snapshot(ids[0]).unwrap().fields.get("Comment")
+                                        == Some(&FieldValue::String(comment.clone()))
+                                }))
+                    }
+                ),
+                "step {step}: global order or edited content was not confirmed on both clients"
+            );
+            println!(
+                "FIRETEST strategy order step={step}: rows={} date={}",
+                expected.len(),
+                a.state_snapshot().strats().last_modified()
+            );
+        }
+
+        let expected = strategy_order(a);
+        // Unknown order dates must be repaired by canonical Full even without content deltas.
+        for label in ["Order-cold", "Order-reconnected"] {
+            let mut c = Session::connect(label, cfg, keys, None);
+            assert!(pump_pair_until_sessions(
+                a,
+                &mut c,
+                cfg.connect_timeout,
+                label,
+                |_, c| strategy_order(c) == expected
+            ));
+            c.client.disconnect().unwrap();
+            c.client.wait_finished().unwrap();
+        }
+    }));
+    for id in ids {
+        a.client
+            .strategies()
+            .delete(id, "")
+            .expect("delete order fixture");
+    }
+    let cleaned = pump_pair_until_sessions(
+        a,
+        b,
+        cfg.connect_timeout,
+        "strategy order cleanup",
+        |a, b| {
+            ids.iter()
+                .all(|id| a.strategy_snapshot(*id).is_none() && b.strategy_snapshot(*id).is_none())
+        },
+    );
+    a.client
+        .strategies()
+        .delete(0, folder)
+        .expect("delete empty test folder");
+    assert!(cleaned, "test strategies were not removed from the core");
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+    println!("OK: strategy order, edit+order, cold/reconnected clients; test strategies removed");
+}
+
+fn run_moonshot_strategy_gate(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    let restore_strategies_running = wait_strategy_runtime_state(cfg, a, b);
+    let restore_emu_mode = ensure_server_emulator_mode(cfg, a, b);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_moonshot_strategy_gate_body(cfg, a, b);
+    }));
+    let _ = a.client.chart_text().clear_visible_market();
+    disable_firetest_moonshot_strategy(cfg, a, b, restore_strategies_running);
+    restore_server_emulator_mode(cfg, a, b, restore_emu_mode);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn strategy_runtime_state(session: &Session) -> Option<bool> {
+    session.state_snapshot().strats().strategies_running()
+}
+
+fn ui_runtime_state(session: &Session) -> Option<RuntimeStateProbe> {
+    session
+        .state_snapshot()
+        .settings()
+        .runtime_state
+        .map(RuntimeStateProbe::from)
+}
+
+fn kernel_license_state(session: &Session) -> Option<KernelLicenseProbe> {
+    session
+        .state_snapshot()
+        .settings()
+        .kernel_license_state
+        .map(KernelLicenseProbe::from)
+}
+
+fn wait_ui_runtime_state(cfg: &FireConfig, a: &mut Session, b: &mut Session) -> RuntimeStateProbe {
+    assert!(
+        pump_pair_until_sessions(a, b, cfg.connect_timeout, "UI runtime state", |a, b| {
+            ui_runtime_state(a).is_some() && ui_runtime_state(b).is_some()
+        }),
+        "server did not send TRuntimeStateCommand to both clients within {:?}",
+        cfg.connect_timeout
+    );
+    let a_state = ui_runtime_state(a).expect("A UI runtime state was just observed");
+    let b_state = ui_runtime_state(b).expect("B UI runtime state was just observed");
+    assert_eq!(
+        a_state, b_state,
+        "clients disagree on UI runtime state: A={a_state:?} B={b_state:?}"
+    );
+    println!(
+        "FIRETEST UI RuntimeState: is_started={} auto_detect_active={}",
+        a_state.is_started, a_state.auto_detect_active
+    );
+    a_state
+}
+
+fn retained_shared_config(session: &Session) -> Option<SharedConfig> {
+    session
+        .maybe_state_snapshot()
+        .and_then(|snapshot| snapshot.settings().shared_config.clone())
+}
+
+fn run_shared_config_gate(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "automatic shared-config initialization",
+            |a, b| retained_shared_config(a).is_some() && retained_shared_config(b).is_some()
+        ),
+        "FireTest shared config was not received automatically by both clients within {:?}",
+        cfg.connect_timeout
+    );
+
+    let original = a
+        .client
+        .settings()
+        .build_shared_config()
+        .expect("shared config received by A must be editable");
+    let b_original = b
+        .client
+        .settings()
+        .build_shared_config()
+        .expect("shared config received by B must be editable");
+    assert_eq!(
+        original.trading.x_sell, b_original.trading.x_sell,
+        "both clients must receive the same Trading shared config"
+    );
+    assert_eq!(
+        original.visual.chart_time_scale, b_original.visual.chart_time_scale,
+        "both clients must receive the same Visual shared config"
+    );
+
+    let mut changed = original.clone();
+    changed.trading.x_sell = changed.trading.x_sell.saturating_add(1);
+    if changed.trading.x_sell == original.trading.x_sell {
+        changed.trading.x_sell = original.trading.x_sell.saturating_sub(1);
+    }
+    changed.visual.chart_time_scale = changed.visual.chart_time_scale.saturating_add(1);
+    if changed.visual.chart_time_scale == original.visual.chart_time_scale {
+        changed.visual.chart_time_scale = original.visual.chart_time_scale.saturating_sub(1);
+    }
+
+    let changed_x_sell = changed.trading.x_sell;
+    let changed_time_scale = changed.visual.chart_time_scale;
+    let mutation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        a.client
+            .settings()
+            .send_shared_config(&changed)
+            .expect("shared-config mutation must queue");
+        assert!(
+            pump_pair_until_sessions(
+                a,
+                b,
+                cfg.connect_timeout,
+                "shared-config mutation broadcast",
+                |a, b| {
+                    [a, b].into_iter().all(|session| {
+                        let Some(snapshot) = session.maybe_state_snapshot() else {
+                            return false;
+                        };
+                        let settings = snapshot.settings();
+                        settings.shared_config.as_ref().is_some_and(|shared| {
+                            shared.trading.x_sell == changed_x_sell
+                                && shared.visual.chart_time_scale == changed_time_scale
+                        }) && settings
+                            .client_settings
+                            .as_ref()
+                            .is_some_and(|compact| compact.x_sell == changed_x_sell)
+                    })
+                }
+            ),
+            "shared-config mutation was not applied and broadcast to both clients"
+        );
+
+        for session in [&*a, &*b] {
+            let built = session
+                .client
+                .settings()
+                .build_shared_config()
+                .expect("mutated shared config must remain editable");
+            assert_eq!(built.trading.x_sell, changed_x_sell);
+            assert_eq!(built.visual.chart_time_scale, changed_time_scale);
+        }
+    }));
+
+    a.client
+        .settings()
+        .send_shared_config(&original)
+        .expect("shared-config restore must queue");
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "shared-config restore broadcast",
+            |a, b| {
+                [a, b].into_iter().all(|session| {
+                    let Some(snapshot) = session.maybe_state_snapshot() else {
+                        return false;
+                    };
+                    let settings = snapshot.settings();
+                    settings.shared_config.as_ref().is_some_and(|shared| {
+                        shared.trading.x_sell == original.trading.x_sell
+                            && shared.visual.chart_time_scale == original.visual.chart_time_scale
+                    }) && settings
+                        .client_settings
+                        .as_ref()
+                        .is_some_and(|compact| compact.x_sell == original.trading.x_sell)
+                })
+            }
+        ),
+        "shared-config restore was not applied and broadcast to both clients"
+    );
+
+    println!(
+        "OK: shared config auto-init, Trading/Visual mutation, compact echo, and restore passed (core_config_version={})",
+        original.core_config_version()
+    );
+    if let Err(payload) = mutation {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn run_auto_detect_echo_gate(cfg: &FireConfig, a: &mut Session, initial: RuntimeStateProbe) {
+    let before = a.snapshot().runtime_state_events;
+    a.client
+        .settings()
+        .set_auto_detect_active(initial.auto_detect_active)
+        .expect("MoonClient settings().set_auto_detect_active must queue");
+    assert!(
+        pump_session_until(
+            a,
+            cfg.wait,
+            "AutoDetect no-op runtime-state echo",
+            |a| {
+                a.snapshot().runtime_state_events > before
+                    && ui_runtime_state(a) == Some(initial)
+            }
+        ),
+        "TAutoDetectCommand no-op did not return a fresh TRuntimeStateCommand within {:?}: initial={initial:?} A=[{}]",
+        cfg.wait,
+        a.snapshot().summary()
+    );
+    println!(
+        "OK: TAutoDetectCommand no-op echoed RuntimeState active={}",
+        initial.auto_detect_active
+    );
+}
+
+fn wait_kernel_license_state(
+    cfg: &FireConfig,
+    a: &mut Session,
+    b: &mut Session,
+) -> KernelLicenseProbe {
+    assert!(
+        pump_pair_until_sessions(a, b, cfg.connect_timeout, "kernel license state", |a, b| {
+            kernel_license_state(a).is_some() && kernel_license_state(b).is_some()
+        }),
+        "server did not send TKernelLicenseStateCommand to both clients within {:?}",
+        cfg.connect_timeout
+    );
+    let a_state = kernel_license_state(a).expect("A kernel license state was just observed");
+    let b_state = kernel_license_state(b).expect("B kernel license state was just observed");
+    assert_eq!(
+        a_state, b_state,
+        "clients disagree on kernel license state: A={a_state:?} B={b_state:?}"
+    );
+    println!("FIRETEST KernelLicenseState: {a_state:?}");
+    a_state
+}
+
+fn run_kernel_license_state_gate(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    let _initial = wait_kernel_license_state(cfg, a, b);
+    let before_a = a.snapshot().kernel_license_state_events;
+    let before_b = b.snapshot().kernel_license_state_events;
+
+    a.client
+        .settings()
+        .request_kernel_license_state()
+        .expect("MoonClient A settings().request_kernel_license_state must queue");
+    b.client
+        .settings()
+        .request_kernel_license_state()
+        .expect("MoonClient B settings().request_kernel_license_state must queue");
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "kernel license state refresh",
+            |a, b| {
+                a.snapshot().kernel_license_state_events > before_a
+                    && b.snapshot().kernel_license_state_events > before_b
+                    && kernel_license_state(a).is_some()
+                    && kernel_license_state(b).is_some()
+            }
+        ),
+        "FireTest KernelLicenseStateRequest did not refresh both clients within {:?}: A=[{}] B=[{}]",
+        cfg.connect_timeout,
+        a.snapshot().summary(),
+        b.snapshot().summary()
+    );
+    println!("OK: KernelLicenseStateRequest refreshed kernel license state");
+}
+
+fn wait_strategy_runtime_state(cfg: &FireConfig, a: &mut Session, b: &mut Session) -> bool {
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "strategy runtime state",
+            |a, b| strategy_runtime_state(a).is_some() && strategy_runtime_state(b).is_some()
+        ),
+        "server did not send TStratRuntimeState to both clients within {:?}",
+        cfg.connect_timeout
+    );
+    let a_state = strategy_runtime_state(a).expect("A runtime state was just observed");
+    let b_state = strategy_runtime_state(b).expect("B runtime state was just observed");
+    assert_eq!(
+        a_state, b_state,
+        "clients disagree on strategy runtime state: A={a_state} B={b_state}"
+    );
+    println!("FIRETEST Strat RuntimeState: strategies_running={a_state}");
+    a_state
+}
+
+fn run_runtime_restart_now_gate(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    let original_runtime = wait_ui_runtime_state(cfg, a, b);
+    assert!(
+        original_runtime.is_started && original_runtime.auto_detect_active,
+        "FireTest RestartNow gate requires an already started/non-passive test server because the protocol has no inverse command to restore MarketActive/PassiveMode; initial runtime_state={original_runtime:?}"
+    );
+    let restore_strategies_running = wait_strategy_runtime_state(cfg, a, b);
+
+    a.client
+        .strategies()
+        .stop()
+        .expect("MoonClient strategy stop must queue before RestartNow gate");
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "RestartNow pre-stop strategies",
+            |a, b| strategy_runtime_state(a) == Some(false)
+                && strategy_runtime_state(b) == Some(false)
+        ),
+        "FireTest RestartNow gate could not stop strategies before restart within {:?}",
+        cfg.connect_timeout
+    );
+
+    let before_a_runtime_events = a.snapshot().runtime_state_events;
+    let before_b_runtime_events = b.snapshot().runtime_state_events;
+    a.client
+        .settings()
+        .restart_now()
+        .expect("MoonClient settings().restart_now must queue");
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "RestartNow starts checked strategies",
+            |a, b| {
+                let a_stats = a.snapshot();
+                let b_stats = b.snapshot();
+                strategy_runtime_state(a) == Some(true)
+                    && strategy_runtime_state(b) == Some(true)
+                    && a_stats.runtime_state_events > before_a_runtime_events
+                    && b_stats.runtime_state_events > before_b_runtime_events
+                    && a_stats
+                        .runtime_state
+                        .map(|state| state.is_started && state.auto_detect_active)
+                        .unwrap_or(false)
+                    && b_stats
+                        .runtime_state
+                        .map(|state| state.is_started && state.auto_detect_active)
+                        .unwrap_or(false)
+            }
+        ),
+        "FireTest RestartNow did not start strategies and broadcast TRuntimeStateCommand within {:?}: A=[{}] B=[{}]",
+        cfg.connect_timeout,
+        a.snapshot().summary(),
+        b.snapshot().summary()
+    );
+    println!("OK: RestartNow command restarted checked strategies and broadcast runtime state");
+
+    if !restore_strategies_running {
+        a.client
+            .strategies()
+            .stop()
+            .expect("MoonClient strategy stop must queue after RestartNow gate");
+        assert!(
+            pump_pair_until_sessions(
+                a,
+                b,
+                cfg.connect_timeout,
+                "RestartNow restore stopped strategies",
+                |a, b| strategy_runtime_state(a) == Some(false)
+                    && strategy_runtime_state(b) == Some(false)
+            ),
+            "FireTest RestartNow gate could not restore original strategies_running=false within {:?}",
+            cfg.connect_timeout
+        );
+    }
+}
+
+fn run_moonshot_strategy_gate_body(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    delete_firetest_moonshot_if_present(cfg, a, b);
+
+    let schema = firetest_strategy_schema(a);
+    let draft = build_firetest_moonshot(&schema, None, false, true, FIRETEST_MOONSHOT_COIN, "");
+    sync_firetest_moonshot_snapshot(a, draft.clone());
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "MoonShot FireTest strategy create echo",
+            |a, b| firetest_moonshot_snapshot(a)
+                .as_ref()
+                .map(|strategy| {
+                    strategy.strategy_id == FIRETEST_MOONSHOT_STRATEGY_ID
+                        && strategy.strategy_name() == Some(FIRETEST_MOONSHOT_NAME)
+                        && !strategy.checked
+                })
+                .unwrap_or(false)
+                && firetest_moonshot_snapshot(b)
+                    .as_ref()
+                    .map(|strategy| {
+                        strategy.strategy_id == FIRETEST_MOONSHOT_STRATEGY_ID
+                            && strategy.strategy_name() == Some(FIRETEST_MOONSHOT_NAME)
+                    })
+                    .unwrap_or(false)
+        ),
+        "MoonShot FireTest strategy was not created on both clients within {:?}",
+        cfg.connect_timeout
+    );
+
+    a.client
+        .chart_text()
+        .set_visible_market(FIRETEST_MOONSHOT_MARKET, true, false)
+        .expect("MoonClient chart text subscription must queue");
+    let blocked_base = firetest_moonshot_snapshot(a).unwrap_or(draft);
+    let blocked = build_firetest_moonshot(
+        &schema,
+        Some(&blocked_base),
+        true,
+        true,
+        FIRETEST_MOONSHOT_COIN,
+        FIRETEST_MOONSHOT_COIN,
+    );
+    sync_firetest_moonshot_snapshot(a, blocked.clone());
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "MoonShot BlackList snapshot echo",
+            |_, b| firetest_moonshot_snapshot(b)
+                .as_ref()
+                .map(|strategy| {
+                    firetest_moonshot_has_state(
+                        strategy,
+                        true,
+                        true,
+                        FIRETEST_MOONSHOT_COIN,
+                        FIRETEST_MOONSHOT_COIN,
+                    )
+                })
+                .unwrap_or(false)
+        ),
+        "MoonShot BlackList snapshot was not echoed by server within {:?}; B={:?}",
+        cfg.connect_timeout,
+        firetest_moonshot_snapshot(b)
+    );
+    a.client
+        .strategies()
+        .start()
+        .expect("MoonClient strategy start must queue");
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "MoonShot BlackList filter line",
+            |a, _| chart_filter_lines(a, FIRETEST_MOONSHOT_MARKET)
+                .map(|lines| {
+                    lines.iter().any(|line| {
+                        line_mentions_firetest_moonshot(line) && line_mentions_blacklist(line)
+                    })
+                })
+                .unwrap_or(false)
+        ),
+        "MoonShot BlackList filter line did not arrive for {} within {:?}; last_lines={:?}",
+        FIRETEST_MOONSHOT_MARKET,
+        cfg.connect_timeout,
+        chart_filter_lines(a, FIRETEST_MOONSHOT_MARKET)
+    );
+
+    let unblocked_base = firetest_moonshot_snapshot(a).unwrap_or(blocked);
+    let unblocked = build_firetest_moonshot(
+        &schema,
+        Some(&unblocked_base),
+        true,
+        true,
+        FIRETEST_MOONSHOT_COIN,
+        "",
+    );
+    sync_firetest_moonshot_snapshot(a, unblocked);
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "MoonShot unblocked snapshot echo",
+            |_, b| firetest_moonshot_snapshot(b)
+                .as_ref()
+                .map(|strategy| {
+                    firetest_moonshot_has_state(strategy, true, true, FIRETEST_MOONSHOT_COIN, "")
+                })
+                .unwrap_or(false)
+        ),
+        "MoonShot unblocked snapshot was not echoed by server within {:?}; B={:?}",
+        cfg.connect_timeout,
+        firetest_moonshot_snapshot(b)
+    );
+    a.client
+        .strategies()
+        .start()
+        .expect("MoonClient strategy restart must queue");
+
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "MoonShot filter lines cleared",
+            |a, _| chart_filter_lines(a, FIRETEST_MOONSHOT_MARKET)
+                .map(|lines| !lines
+                    .iter()
+                    .any(|line| line_mentions_firetest_moonshot(line)))
+                .unwrap_or(false)
+        ),
+        "MoonShot filter lines stayed non-empty after BlackList removal; last_lines={:?}",
+        chart_filter_lines(a, FIRETEST_MOONSHOT_MARKET)
+    );
+    let order_seen = pump_pair_until_sessions(
+        a,
+        b,
+        cfg.connect_timeout,
+        "MoonShot ETH emulator order",
+        |a, _| find_firetest_moonshot_order(&a.state_snapshot()).is_some(),
+    );
+    let snapshot = a.state_snapshot();
+    let order_debug = find_firetest_moonshot_order(&snapshot)
+        .map(|(order, size_field, size)| {
+            format!(
+                "{} size_by_{}={:.8}",
+                format_order_for_debug(order),
+                size_field,
+                size
+            )
+        })
+        .unwrap_or_else(|| {
+            let nearby = snapshot
+                .orders()
+                .iter()
+                .filter(|order| order.market_name == FIRETEST_MOONSHOT_MARKET)
+                .map(|order| {
+                    let sizes = moonshot_order_size_candidates(order)
+                        .into_iter()
+                        .map(|(field, value)| format!("{field}={value:.8}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{} sizes=[{}]", format_order_for_debug(order), sizes)
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            format!("<not found>; ETH orders=[{nearby}]")
+        });
+    assert!(
+        order_seen,
+        "MoonShot strategy did not place an emulator ETH order of roughly {} USD within {:?}: {}",
+        FIRETEST_MOONSHOT_ORDER_SIZE_USD, cfg.connect_timeout, order_debug
+    );
+    println!("OK: MoonShot strategy filter cycle and emulator ETH order: {order_debug}");
+}
+
+fn disable_firetest_moonshot_strategy(
+    cfg: &FireConfig,
+    a: &mut Session,
+    b: &mut Session,
+    restore_strategies_running: bool,
+) {
+    if let Some(base) = firetest_moonshot_snapshot(a) {
+        let schema = firetest_strategy_schema(a);
+        let disabled = build_firetest_moonshot(&schema, Some(&base), false, false, "", "");
+        sync_firetest_moonshot_snapshot(a, disabled);
+        let _ = a
+            .client
+            .strategies()
+            .set_checked(FIRETEST_MOONSHOT_STRATEGY_ID, false);
+        let _ = a.client.strategies().send_checked_delta();
+        let _ = pump_pair_until_sessions(
+            a,
+            b,
+            cfg.wait,
+            "MoonShot FireTest strategy unchecked",
+            |a, b| {
+                firetest_moonshot_snapshot(a)
+                    .map(|strategy| !strategy.checked)
+                    .unwrap_or(true)
+                    && firetest_moonshot_snapshot(b)
+                        .map(|strategy| !strategy.checked)
+                        .unwrap_or(true)
+            },
+        );
+    }
+
+    let restore_result = if restore_strategies_running {
+        a.client.strategies().start()
+    } else {
+        a.client.strategies().stop()
+    };
+    let _ = restore_result;
+    let _ = pump_pair_until_sessions(
+        a,
+        b,
+        cfg.wait,
+        "MoonShot global strategy runtime restored",
+        |a, b| {
+            strategy_runtime_state(a) == Some(restore_strategies_running)
+                && strategy_runtime_state(b) == Some(restore_strategies_running)
+        },
+    );
+}
+
+fn price_is_close_enough(actual: f64, requested: f64) -> bool {
+    actual > 0.0 && (actual - requested).abs() <= (requested.abs() * 0.001).max(EPS)
+}
+
+fn format_order_for_debug(order: &Order) -> String {
+    format!(
+        "uid={} market={} status={:?} pending_buy={:?} buy_price={:.8} sell_price={:.8} bulk_buy={} bulk_sell={} panic={} buy_type={:?} sell_type={:?} buy_mean={:.8} sell_mean={:.8} buy_actual_q={:.8} sell_actual_q={:.8} reason={}",
+        order.uid,
+        order.market_name,
+        order.status,
+        order.pending_buy_cond_price,
+        order.buy_price,
+        order.sell_price,
+        order.bulk_replace_buy,
+        order.bulk_replace_sell,
+        order.panic_sell,
+        order.buy_order.order_type,
+        order.sell_order.order_type,
+        order.buy_order.mean_price,
+        order.sell_order.mean_price,
+        order.buy_order.actual_q,
+        order.sell_order.actual_q,
+        order.sell_reason().description()
+    )
+}
+
+fn describe_session_order(session: &Session, uid: u64) -> String {
+    session
+        .maybe_state_snapshot()
+        .and_then(|snapshot| snapshot.orders().get(uid).map(format_order_for_debug))
+        .unwrap_or_else(|| format!("uid={uid} <not present in snapshot>"))
+}
+
+fn describe_new_market_orders(session: &Session, before_uids: &[u64], market: &str) -> String {
+    let Some(snapshot) = session.maybe_state_snapshot() else {
+        return "<snapshot unavailable>".to_owned();
+    };
+    let rows = snapshot
+        .orders()
+        .iter()
+        .filter(|order| !before_uids.contains(&order.uid) && order.market_name == market)
+        .map(format_order_for_debug)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        "<none>".to_owned()
+    } else {
+        rows.join(" | ")
+    }
+}
+
+fn captured_order_state_since<F>(session: &Session, from: usize, uid: u64, mut predicate: F) -> bool
+where
+    F: FnMut(&FireTestOrderStateEvent) -> bool,
+{
+    session
+        .captured_order_states()
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .any(|event| event.uid == uid && predicate(event))
+}
+
+fn describe_captured_order_states(session: &Session, uid: u64) -> String {
+    let rows = session
+        .captured_order_states()
+        .iter()
+        .filter(|event| event.uid == uid)
+        .rev()
+        .take(16)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return "<none>".to_owned();
+    }
+    rows.into_iter()
+        .rev()
+        .map(|event| {
+            format!(
+                "{:?}/{:?} buy={:.8}/{:.8} sell={:.8}/{:.8} pending={:?} replacing={}/{} panic={} done={}",
+                event.kind,
+                event.status,
+                event.buy_actual_price,
+                event.buy_mean_price,
+                event.sell_actual_price,
+                event.sell_mean_price,
+                event.pending_buy_cond_price,
+                event.bulk_replace_buy,
+                event.bulk_replace_sell,
+                event.panic_sell,
+                event.job_is_done
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn run_order_lifecycle_gate_body(
+    cfg: &FireConfig,
+    a: &mut Session,
+    b: &mut Session,
+) -> FireTestClosedOrderProbe {
+    a.begin_order_state_capture();
+    b.begin_order_state_capture();
+    let before_uids = a
+        .state_snapshot()
+        .orders()
+        .iter()
+        .map(|order| order.uid)
+        .collect::<Vec<_>>();
+    let probe = a.snapshot();
+    let ask = probe
+        .last_book_ask
+        .or_else(|| probe.last_market_price.map(|p| p.ask))
+        .expect("market consistency gate must provide an ask price before order flow");
+    let initial_price = ask * 0.98;
+    let fill_price = ask * 1.01;
+    let request_uid = a.send_new_order(
+        &cfg.market,
+        false,
+        initial_price,
+        0,
+        FIRETEST_ORDER_SIZE_USD,
+    );
+    println!(
+        "FIRETEST order flow: sent long request_uid={} market={} size_usd={} initial_price={:.8} fill_price={:.8}",
+        request_uid, cfg.market, FIRETEST_ORDER_SIZE_USD, initial_price, fill_price
+    );
+
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "order canonical state",
+            |a, _| {
+                !matching_new_order_uids(
+                    a,
+                    &before_uids,
+                    &cfg.market,
+                    false,
+                    initial_price,
+                    FIRETEST_ORDER_SIZE_USD,
+                    true,
+                )
+                .is_empty()
+            }
+        ),
+        "new order did not produce canonical state within {:?}",
+        cfg.connect_timeout
+    );
+    let candidates = matching_new_order_uids(
+        a,
+        &before_uids,
+        &cfg.market,
+        false,
+        initial_price,
+        FIRETEST_ORDER_SIZE_USD,
+        true,
+    );
+    assert_eq!(
+        candidates.len(),
+        1,
+        "order canonical-state correlation must be unique; candidates={candidates:?} new_market_orders=[{}]",
+        describe_new_market_orders(a, &before_uids, &cfg.market)
+    );
+    let server_uid = candidates[0];
+
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "order creation broadcast and BuySet",
+            |a, b| {
+                let created_a = captured_order_state_since(a, 0, server_uid, |event| {
+                    event.kind == FireTestOrderStateEventKind::Created
+                });
+                let created_b = captured_order_state_since(b, 0, server_uid, |event| {
+                    event.kind == FireTestOrderStateEventKind::Created
+                });
+                let buy_set = |session: &Session| {
+                    session
+                        .state_snapshot()
+                        .orders()
+                        .get(server_uid)
+                        .is_some_and(|order| order.status == OrderWorkerStatus::BuySet)
+                };
+                created_a && created_b && buy_set(a) && buy_set(b)
+            }
+        ),
+        "new order uid={} was not created and broadcast as BuySet to both clients; A.events=[{}] B.events=[{}] selected=[{}] new_market_orders=[{}]",
+        server_uid,
+        describe_captured_order_states(a, server_uid),
+        describe_captured_order_states(b, server_uid),
+        describe_session_order(a, server_uid),
+        describe_new_market_orders(a, &before_uids, &cfg.market)
+    );
+
+    let pre_replace = a
+        .state_snapshot()
+        .orders()
+        .get(server_uid)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "new order uid={} disappeared before replace; stats=[{}]",
+                server_uid,
+                a.snapshot().summary()
+            )
+        });
+    println!(
+        "FIRETEST order flow: pre-replace {}",
+        format_order_for_debug(&pre_replace)
+    );
+    let a_replace_event_from = a.order_state_event_count();
+    let b_replace_event_from = b.order_state_event_count();
+    assert!(
+        a.replace_order(server_uid, fill_price),
+        "replace_order intent was not queued into runtime for uid={server_uid}"
+    );
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "buy replace state broadcast",
+            |a, b| {
+                let authoritative_update = |session: &Session, from: usize| {
+                    captured_order_state_since(session, from, server_uid, |event| {
+                        event.kind == FireTestOrderStateEventKind::Updated
+                            && (event.bulk_replace_buy
+                                || (event.status == OrderWorkerStatus::BuyDone
+                                    && event.buy_mean_price > initial_price * 1.005))
+                    })
+                };
+                authoritative_update(a, a_replace_event_from)
+                    && authoritative_update(b, b_replace_event_from)
+            }
+        ),
+        "buy replace uid={} produced no server OrderEvent::Updated on both clients; A.events=[{}] B.events=[{}]",
+        server_uid,
+        describe_captured_order_states(a, server_uid),
+        describe_captured_order_states(b, server_uid)
+    );
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "stable BuyDone state broadcast",
+            |a, b| {
+                let saw_buy_done = |session: &Session, from: usize| {
+                    captured_order_state_since(session, from, server_uid, |event| {
+                        event.status == OrderWorkerStatus::BuyDone
+                            && event.buy_mean_price > initial_price * 1.005
+                    })
+                };
+                saw_buy_done(a, a_replace_event_from)
+                    && saw_buy_done(b, b_replace_event_from)
+            }
+        ),
+        "order uid={} did not expose the stable BuyDone IMAGE to both clients; A.events=[{}] B.events=[{}]",
+        server_uid,
+        describe_captured_order_states(a, server_uid),
+        describe_captured_order_states(b, server_uid)
+    );
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "order moved to SellSet on both clients",
+            |a, b| {
+                let sell_set = |session: &Session| {
+                    session
+                        .state_snapshot()
+                        .orders()
+                        .get(server_uid)
+                        .is_some_and(|order| order.status == OrderWorkerStatus::SellSet)
+                };
+                sell_set(a) && sell_set(b)
+            }
+        ),
+        "order uid={} did not reach SellSet on both clients after buy replace; A=[{}] B=[{}]",
+        server_uid,
+        describe_session_order(a, server_uid),
+        describe_session_order(b, server_uid)
+    );
+
+    let filled_order = a
+        .state_snapshot()
+        .orders()
+        .get(server_uid)
+        .cloned()
+        .expect("SellSet order must still be retained before PanicSell");
+    let closed_probe = FireTestClosedOrderProbe {
+        server_uid,
+        market: cfg.market.clone(),
+        buy_price: filled_order.buy_order.mean_price,
+        bought_q: filled_order.buy_order.actual_q,
+    };
+    assert!(
+        closed_probe.buy_price > 0.0 && closed_probe.bought_q > 0.0,
+        "filled order probe must contain canonical buy price and quantity: {closed_probe:?}"
+    );
+
+    let sell_price_before = filled_order.sell_order.actual_price;
+    let moved_sell_price = sell_price_before.max(ask) * 1.05;
+    let a_sell_event_from = a.order_state_event_count();
+    let b_sell_event_from = b.order_state_event_count();
+    assert!(
+        a.replace_order(server_uid, moved_sell_price),
+        "sell replace intent was not queued into runtime for uid={server_uid}"
+    );
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "sell replace state broadcast",
+            |a, b| {
+                let moved = |session: &Session, from: usize| {
+                    captured_order_state_since(session, from, server_uid, |event| {
+                        event.kind == FireTestOrderStateEventKind::Updated
+                            && event.status == OrderWorkerStatus::SellSet
+                            && (event.bulk_replace_sell
+                                || price_is_close_enough(
+                                    event.sell_actual_price,
+                                    moved_sell_price,
+                                ))
+                    })
+                };
+                moved(a, a_sell_event_from) && moved(b, b_sell_event_from)
+            }
+        ),
+        "sell replace uid={} produced no authoritative state on both clients; requested={:.8} A.events=[{}] B.events=[{}]",
+        server_uid,
+        moved_sell_price,
+        describe_captured_order_states(a, server_uid),
+        describe_captured_order_states(b, server_uid)
+    );
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "sell replace REST result",
+            |a, b| {
+                let actual = |session: &Session| {
+                    session
+                        .state_snapshot()
+                        .orders()
+                        .get(server_uid)
+                        .map(|order| order.sell_order.actual_price)
+                };
+                actual(a).is_some_and(|price| price_is_close_enough(price, moved_sell_price))
+                    && actual(b).is_some_and(|price| price_is_close_enough(price, moved_sell_price))
+            }
+        ),
+        "sell replace uid={} was not materialized on both clients; requested={:.8} A=[{}] B=[{}]",
+        server_uid,
+        moved_sell_price,
+        describe_session_order(a, server_uid),
+        describe_session_order(b, server_uid)
+    );
+
+    let a_terminal_event_from = a.order_state_event_count();
+    let b_terminal_event_from = b.order_state_event_count();
+    assert!(
+        a.panic_sell_order(server_uid, true),
+        "panic sell did not pass Delphi local gate for uid={server_uid}"
+    );
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "terminal SellDone state broadcast",
+            |a, b| {
+                let terminal = |session: &Session, from: usize| {
+                    captured_order_state_since(session, from, server_uid, |event| {
+                        event.status == OrderWorkerStatus::SellDone && event.job_is_done
+                    })
+                };
+                terminal(a, a_terminal_event_from) && terminal(b, b_terminal_event_from)
+            }
+        ),
+        "order uid={} did not broadcast terminal SellDone to both clients after PanicSell; A.events=[{}] B.events=[{}]",
+        server_uid,
+        describe_captured_order_states(a, server_uid),
+        describe_captured_order_states(b, server_uid)
+    );
+
+    let snapshot = a.state_snapshot();
+    if let Some(order) = snapshot.orders().get(server_uid) {
+        let delphi_delta_base =
+            delphi_sell_report_delta_base(&order.buy_order, &order.sell_order, false);
+        let approx_result_usd = delphi_delta_base;
+        println!(
+            "OK: order flow uid={} status={:?} reason={} buy_q={:.8} sell_q={:.8} sell_spent={:.8} sell_total={:.8} delphi_delta_base={:?} approx_result_usd={:?}",
+            server_uid,
+            order.status,
+            order.sell_reason().description(),
+            order.buy_order.actual_q,
+            order.sell_order.actual_q,
+            order.sell_order.spent_btc,
+            order.sell_order.total_btc,
+            delphi_delta_base,
+            approx_result_usd
+        );
+        if let Some(result) = delphi_delta_base {
+            assert!(
+                result.abs() < FIRETEST_ORDER_SIZE_USD * 0.10,
+                "order result looks insane by Delphi sell-report formula: delphi_delta_base={result:.8}"
+            );
+        }
+    } else {
+        println!(
+            "OK: order flow uid={} reached SellDone and was already removed from active Orders",
+            server_uid
+        );
+    }
+    closed_probe
+}
+
+fn delphi_sell_report_delta_base(
+    buy: &ExchangeOrder,
+    sell: &ExchangeOrder,
+    reverse_base_currency: bool,
+) -> Option<f64> {
+    if sell.spent_btc <= EPS || sell.total_btc <= EPS {
+        return None;
+    }
+    let mut delta = sell.total_btc - sell.spent_btc;
+    if sell.is_short() {
+        delta = -delta;
+    }
+    if reverse_base_currency {
+        delta = -delta;
+    }
+    if (sell.actual_q - buy.actual_q).abs() > EPS {
+        delta -= (sell.actual_q - buy.actual_q) * sell.mean_price;
+    }
+    Some(delta)
+}
+
+fn firetest_percent(part: u64, total: u64) -> f64 {
+    part as f64 / total.max(1) as f64 * 100.0
+}
+
+#[test]
+fn news_service_gate_uses_license_expiration() {
+    let now = MoonTime::from_unix_millis(10_000);
+    assert!(!news_service_active(None, now));
+    assert!(!news_service_active(Some(now), now));
+    assert!(!news_service_active(
+        Some(MoonTime::from_unix_millis(9_999)),
+        now
+    ));
+    assert!(news_service_active(
+        Some(MoonTime::from_unix_millis(10_001)),
+        now
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "live MoonBot server required; trims the FireTest process working set"]
+fn fire_test_retained_memory_warmup() {
+    use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    const BACKING_BYTES: usize = 32 * 1_024 * 1_024;
+    const WARMUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+    let _live_test_lock = firetest_live_test_lock();
+    let cfg = FireConfig::load_required();
+    let key_info = parse_key_info(&cfg.key_b64).expect("invalid MoonProto key in FireTest config");
+    let capacity = BACKING_BYTES / std::mem::size_of::<TradeHistoryRow>();
+    let history = MarketHistoryConfig {
+        futures_trades_capacity: capacity,
+        spot_trades_capacity: 0,
+        liquidation_capacity: 0,
+        mm_orders_capacity: 0,
+        last_price_capacity: 0,
+        mini_candles_capacity: 0,
+        candles_5m_capacity: 0,
+    };
+    let _err_emu = ErrEmuGuard::set(0);
+    let mut session = Session::connect_with_market_history(
+        "MemoryWarmup",
+        &cfg,
+        key_info.keys,
+        None,
+        MarketHistorySizing::fixed(history),
+    );
+    assert!(
+        session
+            .client
+            .diag_fill_market_history_to_capacity_default_span(
+                cfg.market.clone(),
+                MoonTime::now().unix_millis(),
+            )
+            .expect("retained-history diagnostics fill must complete"),
+        "retained-history diagnostics fill rejected market {}",
+        cfg.market
+    );
+
+    let reader_start = Instant::now();
+    let reader = loop {
+        session.pump(Duration::from_millis(25));
+        if let Some(reader) = session.client.snapshot().and_then(|snapshot| {
+            let market = snapshot.markets().get(&cfg.market)?;
+            snapshot
+                .market_history_readers_for(&market)
+                .and_then(|readers| readers.futures_trades)
+        }) {
+            break reader;
+        }
+        assert!(
+            reader_start.elapsed() < cfg.wait,
+            "warmup futures ring was not published within {:?}",
+            cfg.wait
+        );
+    };
+    let materialized = reader.diag_memory_residency();
+    assert!(materialized.materialized_pages > 1);
+
+    // SAFETY: the current-process pseudo-handle is always valid. This test is
+    // ignored because trimming affects every thread in the FireTest process.
+    assert_ne!(unsafe { K32EmptyWorkingSet(GetCurrentProcess()) }, 0);
+    let cold = reader.diag_memory_residency();
+    let cold_resident = cold
+        .resident_pages
+        .expect("Windows working-set residency query must succeed");
+    assert!(
+        cold_resident < cold.materialized_pages,
+        "EmptyWorkingSet left the whole retained ring resident"
+    );
+
+    let started = Instant::now();
+    let warm = loop {
+        std::thread::sleep(Duration::from_millis(25));
+        let residency = reader.diag_memory_residency();
+        if residency.resident_pages == Some(residency.materialized_pages) {
+            break residency;
+        }
+        assert!(
+            started.elapsed() < WARMUP_TIMEOUT,
+            "live history worker did not restore the retained ring within {WARMUP_TIMEOUT:?}: cold={cold:?}, current={residency:?}"
+        );
+    };
+
+    println!(
+        "OK: FIRETEST retained-memory warmup market={} pages={} resident_before={} resident_after={} elapsed={:?}",
+        cfg.market,
+        warm.materialized_pages,
+        cold_resident,
+        warm.resident_pages.unwrap(),
+        started.elapsed()
+    );
+}
+
+#[test]
+#[ignore = "live MoonBot server required; measures TStratRuntimeState delivery"]
+fn fire_test_strategy_runtime_state_delivery_stats() {
+    let _live_test_lock = firetest_live_test_lock();
+    let cfg = FireConfig::load_required();
+    let key_info = parse_key_info(&cfg.key_b64).expect("invalid MoonProto key in FireTest config");
+    let keys = key_info.keys;
+    let runs = std::env::var("MOONPROTO_RUNTIME_STATE_MEASURE_RUNS")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().unwrap_or_else(|err| {
+                panic!("bad MOONPROTO_RUNTIME_STATE_MEASURE_RUNS={value:?}: {err}")
+            })
+        })
+        .unwrap_or(10)
+        .max(1);
+    let err_emu_percent = firetest_err_emu_percent();
+    let _err_emu = ErrEmuGuard::set(err_emu_percent);
+    let wait = cfg.connect_timeout.min(Duration::from_secs(12));
+
+    let p = (err_emu_percent as f64) * 0.01;
+    let high_attempts = 3i32;
+    let expected_one_client_miss = p.powi(high_attempts);
+    let expected_any_client_miss = 1.0 - (1.0 - expected_one_client_miss).powi(2);
+    println!(
+        "FIRETEST StratRuntimeState delivery math: runs={} clients_per_run=2 err_emu={} high_attempts={} expected_one_client_miss={:.6}% expected_any_client_miss_per_run={:.6}%",
+        runs,
+        err_emu_percent,
+        high_attempts,
+        expected_one_client_miss * 100.0,
+        expected_any_client_miss * 100.0
+    );
+
+    let mut a_miss = 0usize;
+    let mut b_miss = 0usize;
+    let mut both_miss = 0usize;
+    let mut any_miss = 0usize;
+    let mut total_valid = 0u64;
+    let mut total_dropped = 0u64;
+    let mut total_delivered = 0u64;
+
+    for run in 1..=runs {
+        let mut a = Session::connect(&format!("R{run}A"), &cfg, keys, None);
+        let mut b = Session::connect(&format!("R{run}B"), &cfg, keys, None);
+        let ok = pump_pair_until_sessions(
+            &mut a,
+            &mut b,
+            wait,
+            "strategy runtime state stats",
+            |a, b| strategy_runtime_state(a).is_some() && strategy_runtime_state(b).is_some(),
+        );
+        let a_state = strategy_runtime_state(&a);
+        let b_state = strategy_runtime_state(&b);
+        let a_diag = a.client.err_emu_diagnostics_snapshot();
+        let b_diag = b.client.err_emu_diagnostics_snapshot();
+        total_valid += a_diag.valid_packets + b_diag.valid_packets;
+        total_dropped += a_diag.dropped_packets + b_diag.dropped_packets;
+        total_delivered += a_diag.delivered_packets + b_diag.delivered_packets;
+        if a_state.is_none() {
+            a_miss += 1;
+        }
+        if b_state.is_none() {
+            b_miss += 1;
+        }
+        if a_state.is_none() && b_state.is_none() {
+            both_miss += 1;
+        }
+        if !ok {
+            any_miss += 1;
+        }
+        println!(
+            "FIRETEST StratRuntimeState delivery run {run}/{runs}: ok={} A={:?} B={:?} A_events={} B_events={} rx_valid={} rx_dropped={} rx_drop={:.3}%",
+            ok,
+            a_state,
+            b_state,
+            a.snapshot().strategy_runtime_events,
+            b.snapshot().strategy_runtime_events,
+            a_diag.valid_packets + b_diag.valid_packets,
+            a_diag.dropped_packets + b_diag.dropped_packets,
+            firetest_percent(
+                a_diag.dropped_packets + b_diag.dropped_packets,
+                a_diag.valid_packets + b_diag.valid_packets
+            )
+        );
+    }
+
+    let clients = runs * 2;
+    println!(
+        "FIRETEST StratRuntimeState delivery result: runs={} clients={} a_miss={} b_miss={} both_miss={} any_run_miss={} observed_client_miss={:.6}% observed_any_run_miss={:.6}% total_rx_valid={} total_rx_dropped={} total_rx_delivered={} total_rx_drop={:.3}%",
+        runs,
+        clients,
+        a_miss,
+        b_miss,
+        both_miss,
+        any_miss,
+        (a_miss + b_miss) as f64 * 100.0 / clients as f64,
+        any_miss as f64 * 100.0 / runs as f64,
+        total_valid,
+        total_dropped,
+        total_delivered,
+        firetest_percent(total_dropped, total_valid)
+    );
+}
+
+#[test]
+#[ignore = "live MoonBot server required; mutates emulator settings and report DB"]
+fn fire_test_report_database_replication() {
+    let _live_test_lock = firetest_live_test_lock();
+    let cfg = FireConfig::load_required();
+    assert!(
+        cfg.allow_mutation,
+        "Report DB FireTest mutates live server settings/orders"
+    );
+    let key_info = parse_key_info(&cfg.key_b64).expect("invalid MoonProto key in FireTest config");
+    let keys = key_info.keys;
+    let mut err_emu = ErrEmuGuard::set(0);
+    let mut pump_peer =
+        Session::connect("ReportDB-Peer", &cfg, keys, Some(firetest_strategy(&cfg)));
+    run_report_database_gate(&cfg, keys, &mut pump_peer);
+    err_emu.reset("report database replication gate");
+}
+
+fn problems_state(session: &Session) -> &moonproto::state::ProblemsState {
+    &session
+        .latest_snapshot
+        .as_ref()
+        .expect("connected snapshot")
+        .settings()
+        .problems
+}
+
+fn clear_problems_from_b(cfg: &FireConfig, a: &mut Session, b: &mut Session) {
+    let before_a = a.stats.lock().unwrap().problems_snapshots;
+    let before_b = b.stats.lock().unwrap().problems_snapshots;
+    b.client
+        .settings()
+        .clear_problems()
+        .expect("clear core problems");
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "problems clear broadcast",
+            |a, b| {
+                a.stats.lock().unwrap().problems_snapshots > before_a
+                    && b.stats.lock().unwrap().problems_snapshots > before_b
+                    && problems_state(a).items().is_empty()
+                    && problems_state(b).items().is_empty()
+            }
+        ),
+        "clear reply must reach both clients; a detector may have reported a new real problem"
+    );
+}
+
+fn run_problems_gate(cfg: &FireConfig, keys: ImportedKeys, a: &mut Session, b: &mut Session) {
+    assert!(
+        cfg.allow_mutation,
+        "problem test adds a diagnostic fact on the core"
+    );
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "initial core problem lists",
+            |a, b| {
+                problems_state(a).snapshot_received() && problems_state(b).snapshot_received()
+            }
+        ),
+        "core problem snapshots missing; this test requires the detector relay extension"
+    );
+    for (label, session) in [("A", &*a), ("B", &*b)] {
+        println!(
+            "FIRETEST Problems {label}: initial confirmed={}",
+            problems_state(session).items().len()
+        );
+        for problem in problems_state(session).items() {
+            println!("FIRETEST Problems {label}: {problem:?}");
+        }
+    }
+
+    let allow_clear = std::env::var("MOONPROTO_FIRETEST_CLEAR_PROBLEMS").as_deref() == Ok("1");
+    if allow_clear {
+        println!("FIRETEST: explicit diagnostic clear enabled; existing core facts/hypotheses will be removed");
+        clear_problems_from_b(cfg, a, b);
+    } else if problems_state(a)
+        .items()
+        .iter()
+        .chain(problems_state(b).items())
+        .any(|p| p.kind_name == "test")
+    {
+        println!("FIRETEST SKIPPED problems mutation: test fact already exists; repeated confirmation is intentionally not broadcast. Set MOONPROTO_FIRETEST_CLEAR_PROBLEMS=1 on an isolated test core to clear it.");
+        return;
+    }
+
+    let marker = format!("FireTest-{:016X}", rand::random::<u64>());
+    let before_a = a.stats.lock().unwrap().problem_notifications;
+    let before_b = b.stats.lock().unwrap().problem_notifications;
+    a.client
+        .settings()
+        .test_problem(&marker)
+        .expect("publish core test signal");
+    let has_marker = |session: &Session| {
+        problems_state(session).items().iter().any(|p| {
+            p.kind_name == "test"
+                && p.message.contains(&marker)
+                && p.technical_details.contains(&marker)
+                && p.confirmations >= 1
+                && p.confirmed >= p.first_seen
+                && p.first_seen > MoonTime::ZERO
+                && p.category == moonproto::state::ProblemCategory::Other
+        })
+    };
+    assert!(
+        pump_pair_until_sessions(
+            a,
+            b,
+            cfg.connect_timeout,
+            "new core problem to two clients",
+            |a, b| {
+                has_marker(a)
+                    && has_marker(b)
+                    && a.stats.lock().unwrap().problem_notifications > before_a
+                    && b.stats.lock().unwrap().problem_notifications > before_b
+            }
+        ),
+        "test signal must pass through the detector worker and notify both clients"
+    );
+
+    let mut c = Session::connect("Problems-late", cfg, keys, None);
+    assert!(
+        pump_session_until(
+            &mut c,
+            cfg.connect_timeout,
+            "problem in late-client snapshot",
+            |c| { problems_state(c).snapshot_received() && has_marker(c) }
+        ),
+        "a late client must receive the existing test fact without another test request"
+    );
+    if allow_clear {
+        clear_problems_from_b(cfg, a, b);
+        assert!(pump_session_until(
+            &mut c,
+            cfg.connect_timeout,
+            "late-client clear",
+            |c| { problems_state(c).items().is_empty() }
+        ));
+    } else {
+        println!("FIRETEST SKIPPED problems clear: test fact left on core; clearing it would also remove real diagnostics. Explicit opt-in is required.");
+    }
+    for session in [&*a, &*b, &c] {
+        assert_eq!(
+            session.snapshot().parse_failed,
+            0,
+            "problem packets must parse"
+        );
+    }
+}
+
+#[test]
+#[ignore = "live MoonBot with detector relay required; adds a test diagnostic"]
+fn fire_test_core_problems() {
+    let _live_test_lock = firetest_live_test_lock();
+    let cfg = FireConfig::load_required();
+    assert!(cfg.allow_mutation, "problem test mutates core diagnostics");
+    let keys = parse_key_info(&cfg.key_b64)
+        .expect("invalid FireTest key")
+        .keys;
+    let _err_emu = ErrEmuGuard::set(0);
+    let mut a = Session::connect("Problems-A", &cfg, keys, None);
+    let mut b = Session::connect("Problems-B", &cfg, keys, None);
+    run_problems_gate(&cfg, keys, &mut a, &mut b);
+}
+
+#[test]
+#[ignore = "live MoonBot server required; create ../moonproto.firetest.conf"]
+fn fire_test_active_library_health() {
+    let _live_test_lock = firetest_live_test_lock();
+    let start = Instant::now();
+    let cfg = FireConfig::load_required();
+    let profile = FireProfile::from_env();
+    let key_info = parse_key_info(&cfg.key_b64).expect("invalid MoonProto key in FireTest config");
+    let keys = key_info.keys;
+
+    println!(
+        "FIRETEST config: profile={} path={} key={} server={}:{} transport_mode={} market={} strategy_field={} strategy_id={:?} err_emu={} high_loss_err_emu={} connect_timeout={:?} candles_timeout={:?} high_loss_timeout={:?}",
+        profile.as_str(),
+        cfg.path.display(),
+        key_info.display_name,
+        cfg.host,
+        cfg.port,
+        cfg.transport_mode.to_byte(),
+        cfg.market,
+        cfg.strategy_field,
+        cfg.strategy_id,
+        firetest_err_emu_percent(),
+        FIRETEST_HIGH_LOSS_ERR_EMU_PERCENT,
+        cfg.connect_timeout,
+        cfg.candles_timeout,
+        cfg.high_loss_timeout
+    );
+
+    if profile == FireProfile::Quick {
+        run_quick_fire_test(&cfg, keys);
+        return;
+    }
+
+    assert!(
+        cfg.allow_mutation,
+        "Full FireTest mutates live server settings/strategies/orders. Set allow_mutation=true in {} only for a test server.",
+        cfg.path.display()
+    );
+    let mut err_emu = ErrEmuGuard::set(firetest_err_emu_percent());
+    log_sliced_recovery_math("full initial gate", firetest_err_emu_percent());
+    let seeded_strategy = firetest_strategy(&cfg);
+    let seeded_strategy_id = seeded_strategy.strategy_id;
+
+    let _public_path_stats = run_moonclient_public_smoke(
+        "full/public-smoke",
+        &cfg,
+        keys,
+        cfg.connect_timeout + cfg.wait,
+        cfg.candles_timeout,
+        true,
+        true,
+    );
+
+    let mut a = Session::connect("A", &cfg, keys, Some(seeded_strategy.clone()));
+    let mut b = Session::connect("B", &cfg, keys, Some(seeded_strategy.clone()));
+    assert_strategy_field_visible_for_firetest(&a, &cfg, &seeded_strategy);
+    assert_strategy_field_visible_for_firetest(&b, &cfg, &seeded_strategy);
+    assert!(
+        a.strategy_snapshot(seeded_strategy_id).is_some()
+            && b.strategy_snapshot(seeded_strategy_id).is_some(),
+        "FireTest local strategies must be available through MoonStateSnapshot before stream checks"
+    );
+    write_strategy_info_dump(FireProfile::Full, &cfg, &[("A", &a), ("B", &b)]);
+
+    assert!(
+        pump_pair_until(&mut a, &mut b, cfg.wait, "initial health", |a, b| {
+            has_initial_health(a) && has_initial_health(b)
+        }),
+        "FireTest initial health failed: both clients must receive trades and configured orderbook within {:?}",
+        cfg.wait
+    );
+    let a_initial = a.snapshot();
+    let b_initial = b.snapshot();
+    for stats in [&a_initial, &b_initial] {
+        let health = stats
+            .kernel_health
+            .expect("initial health must retain kernel telemetry");
+        println!(
+            "OK: FIRETEST {}: kernel CPU process={}%, system={}%, memory used={}MB free={}MB cores={}, core RTT={:?}ms, order API latency={:?}ms",
+            stats.label,
+            health.process_cpu_percent,
+            health.system_cpu_percent,
+            health.used_memory_mb.unwrap(),
+            health.free_physical_memory_mb.unwrap(),
+            health.logical_cpu_count.unwrap(),
+            health.core_round_trip_ms,
+            health.order_api_latency_ms
+        );
+        let license = stats
+            .kernel_license_state
+            .expect("initial health must retain kernel license state");
+        if license.news_service_active(MoonTime::now()) {
+            println!(
+                "OK: FIRETEST {}: news history={} retained={} tags_present={}",
+                stats.label,
+                stats.news_history_count,
+                stats.news_snapshot_count,
+                stats.news_tags_present
+            );
+        } else {
+            println!(
+                "FIRETEST SKIPPED {}: news history/tags check; no active News service subscription (news_valid_until={:?})",
+                stats.label, license.news_valid_until
+            );
+        }
+    }
+    run_session_profit_and_hl_limit_gate(&cfg, &mut a, &mut b);
+    if a_initial.lev_manage_events == 0 || b_initial.lev_manage_events == 0 {
+        println!(
+            "FIRETEST NOTE initial health: LevManage was not observed on both clients (A={} B={}); live market/trades/orderbook health does not depend on this optional SrvConnect UI extension",
+            a_initial.lev_manage_events, b_initial.lev_manage_events
+        );
+    }
+    if a_initial.profit_state_events == 0 || b_initial.profit_state_events == 0 {
+        println!(
+            "FIRETEST NOTE initial health: ProfitState was not observed on both clients (A={} B={}); live market/trades/orderbook health does not depend on this optional SrvConnect UI extension",
+            a_initial.profit_state_events, b_initial.profit_state_events
+        );
+    }
+    assert!(
+        pump_pair_until_nonblocking_api_refresh(&mut a, &mut b, &cfg, cfg.connect_timeout),
+        "FireTest non-blocking API refresh failed within {:?}: A=[{}] B=[{}]",
+        cfg.connect_timeout,
+        a.snapshot().summary(),
+        b.snapshot().summary()
+    );
+    let _a_initial_settings = request_settings_until(&mut a, cfg.connect_timeout);
+    let _b_initial_settings = request_settings_until(&mut b, cfg.connect_timeout);
+    run_shared_config_gate(&cfg, &mut a, &mut b);
+    let initial_runtime_state = wait_ui_runtime_state(&cfg, &mut a, &mut b);
+    run_auto_detect_echo_gate(&cfg, &mut a, initial_runtime_state);
+    run_kernel_license_state_gate(&cfg, &mut a, &mut b);
+    assert!(
+        pump_pair_until(
+            &mut a,
+            &mut b,
+            cfg.wait,
+            "market book/trades/UpdateMarketsList consistency",
+            |a, b| has_market_consistency(a) && has_market_consistency(b)
+        ),
+        "FireTest market consistency failed within {:?}: A=[{}] B=[{}]",
+        cfg.wait,
+        a.snapshot().market_probe_summary(),
+        b.snapshot().market_probe_summary()
+    );
+    println!(
+        "OK: market consistency A=[{}] B=[{}]",
+        a.snapshot().market_probe_summary(),
+        b.snapshot().market_probe_summary()
+    );
+    run_candle_timeframe_state_gate(&cfg, &mut a, &mut b);
+    log_err_emu_pair("initial health 10% gate", &a, &b);
+    log_protocol_cpu_pair("initial health 10% gate", &a, &b);
+
+    a.request_candles_snapshot();
+    assert!(
+        pump_pair_until(
+            &mut a,
+            &mut b,
+            cfg.candles_timeout,
+            "full candles snapshot under err_emu",
+            |a, _| a
+                .candles_complete
+                .as_ref()
+                .map(CandlesSnapshotSummary::is_healthy)
+                .unwrap_or(false)
+                && a.retained_candles_healthy()
+                && a.parse_failed == 0
+        ),
+        "client A did not receive a complete candles snapshot within {:?}",
+        cfg.candles_timeout
+    );
+    let candles_stats = a.snapshot();
+    if let Some(candles) = candles_stats.candles_complete.as_ref() {
+        println!(
+            "OK: full candles snapshot {} retained_candles_5m={} newest_age_s={:?}",
+            candles.summary(),
+            candles_stats.retained_candles_5m,
+            candles_stats.retained_candles_5m_newest_age_s
+        );
+    }
+    log_protocol_cpu_pair("after candles 10% gate", &a, &b);
+    err_emu.reset("initial chunked response gates");
+    run_market_history_archive_gate(&cfg, &mut a, &mut b, cfg.candles_timeout);
+    log_protocol_cpu_pair("after three-market chart archive gate", &a, &b);
+    run_high_loss_simple_ops_gate(&mut a, &mut b, &mut err_emu, cfg.high_loss_timeout);
+    log_protocol_cpu_pair("after high-loss simple ops gate", &a, &b);
+    err_emu.reset("high-loss simple ops gate");
+    run_problems_gate(&cfg, keys, &mut a, &mut b);
+    a.client
+        .debug_reset_err_emu_diagnostics()
+        .expect("reset A err_emu diagnostics");
+    b.client
+        .debug_reset_err_emu_diagnostics()
+        .expect("reset B err_emu diagnostics");
+
+    run_transfer_assets_refresh_coalescing_gate(&mut a, &mut b, cfg.connect_timeout);
+
+    run_report_database_gate(&cfg, keys, &mut a);
+    run_order_lifecycle_gate(&cfg, &mut a, &mut b);
+    run_real_order_cancel_gate(&cfg, &mut a, &mut b);
+    run_strategy_order_sync_gate(&cfg, keys, &mut a, &mut b);
+
+    run_strategy_folder_sync_gate(&cfg, keys, &mut a, &mut b);
+    run_moonshot_strategy_gate(&cfg, &mut a, &mut b);
+    run_runtime_restart_now_gate(&cfg, &mut a, &mut b);
+
+    let a_initial = a.snapshot();
+    let original_settings = a_initial
+        .last_settings
+        .clone()
+        .expect("settings were counted but not stored");
+    let original_strategy = a
+        .strategy_snapshot(seeded_strategy_id)
+        .expect("seeded strategy missing from dispatcher state");
+    let field = select_field(&original_strategy, &cfg.strategy_field);
+    let original_field_value = match original_strategy.fields.get(field.as_str()) {
+        Some(FieldValue::String(value)) => value.clone(),
+        _ => panic!("selected field `{field}` missing from seeded strategy"),
+    };
+
+    let run_id = now_epoch_ms();
+    let mutated_field_value = format!("firetest-{run_id}");
+    let mutated_strategy = with_strategy_string(
+        original_strategy.clone(),
+        &field,
+        mutated_field_value.clone(),
+        1,
+    );
+    let mut mutated_settings = original_settings.clone();
+    mutated_settings.x_sell = if original_settings.x_sell == i32::MAX {
+        original_settings.x_sell - 1
+    } else {
+        original_settings.x_sell + 1
+    };
+
+    println!(
+        "FIRETEST mutation: strategy_id={} field={} {:?}->{:?}; x_sell {}->{}",
+        original_strategy.strategy_id,
+        field,
+        original_field_value,
+        mutated_field_value,
+        original_settings.x_sell,
+        mutated_settings.x_sell
+    );
+    a.sync_local_strategies(std::slice::from_ref(&mutated_strategy));
+    a.client
+        .settings()
+        .send(mutated_settings.clone())
+        .expect("MoonClient send_settings must queue");
+
+    let mutation_seen =
+        pump_pair_until(&mut a, &mut b, cfg.wait, "cross-client mutation", |a, b| {
+            strategy_field_string(a, original_strategy.strategy_id, &field)
+                .is_some_and(|value| value == mutated_field_value)
+                && b.last_settings
+                    .as_ref()
+                    .map(|s| s.x_sell == mutated_settings.x_sell)
+                    .unwrap_or(false)
+                && strategy_field_string(b, original_strategy.strategy_id, &field)
+                    .map(|value| value == mutated_field_value)
+                    .unwrap_or(false)
+        });
+
+    let restored_strategy = with_strategy_string(
+        original_strategy.clone(),
+        &field,
+        original_field_value.clone(),
+        2,
+    );
+    a.sync_local_strategies(std::slice::from_ref(&restored_strategy));
+    a.client
+        .settings()
+        .send(original_settings.clone())
+        .expect("MoonClient send_settings must queue");
+    let restored = pump_pair_until(&mut a, &mut b, cfg.wait, "restore mutation", |a, b| {
+        strategy_field_string(a, original_strategy.strategy_id, &field)
+            .is_some_and(|value| value == original_field_value)
+            && b.last_settings
+                .as_ref()
+                .map(|s| s.x_sell == original_settings.x_sell)
+                .unwrap_or(false)
+            && strategy_field_string(b, original_strategy.strategy_id, &field)
+                .map(|value| value == original_field_value)
+                .unwrap_or(false)
+    });
+
+    assert!(
+        mutation_seen,
+        "client A did not receive a canonical strategy confirmation or client B missed the mutation"
+    );
+    assert!(
+        restored,
+        "client A did not receive a canonical strategy restore confirmation or client B missed it"
+    );
+
+    let before_blackhole = a.snapshot();
+    a.client
+        .debug_set_outgoing_blackhole(true)
+        .expect("enable outgoing blackhole");
+    let disconnect_start = Instant::now();
+    let disconnected = pump_pair_until(
+        &mut a,
+        &mut b,
+        cfg.disconnect_timeout,
+        "server-side disconnect after outgoing blackhole",
+        |a, _| a.reconnecting > before_blackhole.reconnecting,
+    );
+    let disconnected_after = disconnect_start.elapsed();
+    a.client
+        .debug_set_outgoing_blackhole(false)
+        .expect("disable outgoing blackhole");
+    assert!(
+        disconnected,
+        "client A did not enter reconnecting state within {:?} while outgoing blackhole was enabled",
+        cfg.disconnect_timeout
+    );
+    println!(
+        "OK: server/client detected silence after {:.2}s",
+        disconnected_after.as_secs_f64()
+    );
+
+    let before_reconnect = a.snapshot();
+    let reconnected = pump_pair_until(
+        &mut a,
+        &mut b,
+        cfg.reconnect_timeout,
+        "automatic reconnect",
+        |a, _| a.connected_again > before_reconnect.connected_again,
+    );
+    assert!(
+        reconnected && a.snapshot().connected_now,
+        "client A did not reconnect within {:?}",
+        cfg.reconnect_timeout
+    );
+
+    let after_reconnect = a.snapshot();
+    let trades_before = after_reconnect.trades_apply;
+    let books_before = after_reconnect.orderbook_apply;
+    assert!(
+        pump_pair_until(
+            &mut a,
+            &mut b,
+            cfg.wait,
+            "streams after reconnect",
+            |a, _| { a.trades_apply > trades_before && a.orderbook_apply > books_before }
+        ),
+        "client A did not receive trades and orderbook after reconnect within {:?}",
+        cfg.wait
+    );
+
+    pump_pair_for(&mut a, &mut b, Duration::from_millis(200));
+    a.assert_coin_card_candles_healthy(&cfg.market, FIRETEST_COIN_CARD_KIND);
+    b.assert_coin_card_candles_healthy(&cfg.market, FIRETEST_COIN_CARD_KIND);
+    let a_stats = a.snapshot();
+    let b_stats = b.snapshot();
+    assert!(
+        a_stats.server_logs + b_stats.server_logs > 0,
+        "FireTest did not receive any encrypted server LogMsg events: A=[{}] B=[{}]",
+        a_stats.summary(),
+        b_stats.summary()
+    );
+    log_protocol_cpu_pair("final", &a, &b);
+    write_strategy_info_dump(FireProfile::Full, &cfg, &[("A", &a), ("B", &b)]);
+    a.emit_active_lib_report(FireProfile::Full, start);
+    println!("FIRETEST_PASS");
+}
