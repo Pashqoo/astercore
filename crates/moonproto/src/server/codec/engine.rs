@@ -317,6 +317,16 @@ pub struct MarketSpec {
     pub status_trading: bool,
 }
 
+/// Next funding time as the wire wants it: Delphi days, UTC, zero for absent
+/// ([`MarketSpec::funding_time_days`] says why the guard is the whole point).
+/// Shared by the market row and the funded price row, which carry the same pair.
+fn funding_time_days(funding: Option<Funding>) -> f64 {
+    match funding {
+        Some(f) if f.time_ms > 0 => delphi_days(f.time_ms),
+        _ => 0.0,
+    }
+}
+
 impl MarketSpec {
     /// Next funding time as the wire wants it: Delphi days, UTC, and **zero for
     /// absent**.
@@ -327,10 +337,7 @@ impl MarketSpec {
     /// funding" into "it was last charged 56 years ago" and the countdown shows
     /// a figure instead of nothing.
     fn funding_time_days(&self) -> f64 {
-        match self.funding {
-            Some(f) if f.time_ms > 0 => delphi_days(f.time_ms),
-            _ => 0.0,
-        }
+        funding_time_days(self.funding)
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -458,6 +465,42 @@ pub fn write_markets_prices(rows: &[PriceRow]) -> Vec<u8> {
         out.extend_from_slice(&r.m_index.to_le_bytes());
         out.extend_from_slice(&r.bid.to_le_bytes());
         out.extend_from_slice(&r.ask.to_le_bytes());
+        out.extend_from_slice(&r.last.to_le_bytes()); // mark_price
+        out.push(u8::from(r.last > 0.0)); // mark_price_found
+    }
+    out.push(0); // send_corr_markets
+    out
+}
+
+/// One price row plus the market's current funding, for
+/// [`write_markets_prices_funded`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FundedPriceRow {
+    pub row: PriceRow,
+    /// `None` is sent as rate 0 and time 0, which the terminal reads as "no
+    /// funding" — the right statement for a market the exchange stopped naming.
+    pub funding: Option<Funding>,
+}
+
+/// `emk_UpdateMarketsList` body WITH funding (`send_funding = 1`).
+///
+/// The catalog carries funding only once per session, and a funding charge
+/// moves the next-charge time every few hours: without this the terminal's
+/// countdown runs to a moment already past. With the flag set, every row
+/// carries the pair and the client overwrites both on every row
+/// (`state/markets/prices.rs`), so a market whose funding went away is sent as
+/// zeros rather than left out — the same reason [`write_markets_prices`] sends
+/// a zero bid instead of omitting the row.
+pub fn write_markets_prices_funded(rows: &[FundedPriceRow]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + rows.len() * 43);
+    out.push(1); // send_funding
+    out.extend_from_slice(&(rows.len() as i32).to_le_bytes());
+    for FundedPriceRow { row: r, funding } in rows {
+        out.extend_from_slice(&r.m_index.to_le_bytes());
+        out.extend_from_slice(&r.bid.to_le_bytes());
+        out.extend_from_slice(&r.ask.to_le_bytes());
+        out.extend_from_slice(&funding.map_or(0.0, |f| f.rate_pct).to_le_bytes());
+        out.extend_from_slice(&funding_time_days(*funding).to_le_bytes());
         out.extend_from_slice(&r.last.to_le_bytes()); // mark_price
         out.push(u8::from(r.last > 0.0)); // mark_price_found
     }
@@ -763,6 +806,65 @@ mod tests {
             .expect("state prices");
         let gazp = st.get("GAZP").expect("GAZP");
         assert_eq!(gazp.with(|m| (m.price.bid, m.price.ask)), (100.0, 100.5));
+
+        // The funded form: the same row plus the funding pair, which the
+        // client overwrites on every row it receives — so a market without
+        // funding must arrive as zeros, and a funded one as percent and a
+        // UTC instant the reader then shifts into its own zone.
+        let funded = write_markets_prices_funded(&[
+            FundedPriceRow {
+                row: PriceRow {
+                    m_index: 0,
+                    bid: 10.0,
+                    ask: 10.5,
+                    last: 10.2,
+                },
+                funding: Some(Funding {
+                    rate_pct: 0.008_979,
+                    time_ms: 1_790_870_400_000,
+                }),
+            },
+            FundedPriceRow {
+                row: PriceRow {
+                    m_index: 1,
+                    bid: 101.0,
+                    ask: 101.5,
+                    last: 0.0,
+                },
+                funding: None,
+            },
+        ]);
+        let ev = st
+            .apply_markets_prices_payload(&funded)
+            .expect("funded prices");
+        assert!(matches!(
+            ev,
+            crate::state::MarketsEvent::PricesUpdated {
+                count: 2,
+                included_funding: true,
+                ..
+            }
+        ));
+        let sber = st.get("SBER").expect("SBER");
+        let (rate, time, mark, bid) = sber.with(|m| {
+            (
+                m.funding_rate,
+                m.funding_time,
+                m.price.mark_price,
+                m.price.bid,
+            )
+        });
+        assert_eq!((rate, mark, bid), (0.008_979, 10.2, 10.0));
+        assert!(
+            time > delphi_days(1_790_870_400_000) - 1.0,
+            "a 2026 instant, not 1970"
+        );
+        let gazp = st.get("GAZP").expect("GAZP");
+        assert_eq!(
+            gazp.with(|m| (m.funding_rate, m.funding_time, m.price.bid)),
+            (0.0, 0.0, 101.0),
+            "no funding is zeros, never the Delphi 1970"
+        );
 
         let names =
             crate::commands::market::parse_markets_indexes_response(&write_markets_indexes(&[

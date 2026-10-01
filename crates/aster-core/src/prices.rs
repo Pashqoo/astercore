@@ -1,34 +1,30 @@
-//! The price snapshots M0 answers `UpdateMarketsList` from, refreshed off the
-//! UDP loop.
+//! The top-of-book snapshots `UpdateMarketsList` is answered from, refreshed
+//! off the UDP loop.
 //!
-//! M1 replaces this with the WebSocket streams (`depth20@100ms`,
-//! `markPrice@1s`). Until then the prices come from two REST calls — and they
-//! cannot be made from the loop that receives UDP: `ureq` is synchronous and
-//! those calls take 0.3–0.6 s measured 01.10, which is 0.3–0.6 s of a trading
-//! core not reading its socket. So this is threads that send snapshots, the
-//! same shape `feed.rs` will have in M1: the loop only ever applies what has
-//! already arrived.
+//! One REST call, `GET /fapi/v1/ticker/bookTicker`, every 2 s for the whole
+//! catalog. It stays REST in M1 on purpose: the terminal wants a bid and an ask
+//! for ALL 596 markets, and the stream that carries that (`!bookTicker`) was
+//! measured on 01.10 at 23 503 frames in 5 s — 4 MB of traffic to learn what one
+//! weight-2 call answers every two seconds. The books the terminal actually
+//! shows come live from `depth20` (`feed.rs`); the mark price and the funding,
+//! which this module also used to poll, come from `!markPrice@arr`.
 //!
-//! One thread per call, and a REST client per thread. The two calls have
-//! periods thirty times apart and the same 30 s dead-gateway timeout
-//! (`rest::CALL_TIMEOUT`), so sharing a thread would let one slow funding
-//! answer hold the book still for half a minute — the whole point of this
-//! module is that nothing waits behind anything else.
+//! The call cannot be made from the loop that receives UDP: `ureq` is
+//! synchronous and it takes 0.3–0.6 s, measured 01.10, which is 0.3–0.6 s of a
+//! trading core not reading its socket. So this is a thread that sends
+//! snapshots: the loop only ever applies what has already arrived.
 //!
-//! What a thread does NOT do is hide an outage. Two things make a failure
-//! visible rather than silent: a refusal that repeats past [`stale_after`]
-//! raises a warning and **clears the prices** (an empty snapshot, which
-//! `Catalog::apply_book` reads as "nothing is quoted"), and a throttle or a ban
-//! backs off instead of hammering. A core that cannot reach the exchange must
-//! stop presenting its last prices as current — that is the difference between
-//! a terminal showing no price and a terminal showing a price that is minutes
-//! old.
+//! What the thread does NOT do is hide an outage. A refusal that repeats past
+//! [`stale_after`] raises an error and **clears the prices** (an empty
+//! snapshot, which `Catalog::apply_book` reads as "nothing is quoted"), and a
+//! throttle or a ban backs off instead of hammering. A core that cannot reach
+//! the exchange must stop presenting its last prices as current.
 
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::aster::json::{BookTicker, PremiumIndex};
+use crate::aster::json::BookTicker;
 use crate::aster::rest::{self, Rest};
 
 /// Top of book for the whole catalog, every this often.
@@ -39,16 +35,6 @@ use crate::aster::rest::{self, Rest};
 /// weight 2 (measured 01.10), i.e. 60 of the 2400/min ceiling at this period —
 /// the cheapest thing the core does.
 pub const BOOK_PERIOD: Duration = Duration::from_secs(2);
-/// Funding and mark price for the whole catalog, every this often.
-///
-/// Funding is charged on a shared schedule — measured 01.10, two distinct
-/// `nextFundingTime` values across the entire catalog — so it moves in hours,
-/// not seconds. The mark price does move, and a minute of staleness on it is
-/// visible in the terminal's risk column; this is the price of reading it over
-/// REST at all, and M1's `markPrice@1s` stream is what makes it live. It is not
-/// read at the book's period because the answer is 167 KB against 88 KB and
-/// carries 766 rows for the 596 markets that want them.
-pub const PREMIUM_PERIOD: Duration = Duration::from_secs(60);
 /// How long a feed backs off after the exchange says "too many requests".
 ///
 /// Aster answers `-1003`/`-1015` or HTTP 429, and 418 for an IP the gateway has
@@ -63,8 +49,7 @@ const THROTTLED_BACKOFF: Duration = Duration::from_secs(60);
 ///
 /// Five missed periods, and never less than half a minute: one refused call is
 /// a blip that costs a period of staleness, while five in a row is an outage
-/// the trader has to know about. On the book that is 30 s, on the funding
-/// answer 5 minutes.
+/// the trader has to know about. On the book that is 30 s.
 fn stale_after(period: Duration) -> Duration {
     (period * 5).max(Duration::from_secs(30))
 }
@@ -75,16 +60,13 @@ fn stale_after(period: Duration) -> Duration {
 /// which is what a feed sends when its outage has outlived [`stale_after`].
 pub enum Snapshot {
     Book(Vec<BookTicker>),
-    Premium(Vec<PremiumIndex>),
 }
 
-/// The running refreshers: what they send, and whether they are still there.
+/// The running refresher: what it sends, and whether it is still there.
 ///
-/// The threads are held rather than detached for one reason: the channel they
-/// share closes only when the LAST sender drops, so a receiver alone cannot
-/// tell one dead feed from two live ones. A panicked book feed would otherwise
-/// leave the bid and the ask frozen for as long as the core runs, with the
-/// funding feed holding the channel open and the journal saying nothing.
+/// The thread is held rather than detached so that its death is a fact the
+/// loop can read (`dead`) rather than one it infers: a panicked refresher would
+/// otherwise leave the bid and the ask frozen for as long as the core runs.
 pub struct Feeds {
     rx: Receiver<Snapshot>,
     threads: Vec<(&'static str, JoinHandle<()>)>,
@@ -109,31 +91,21 @@ impl Feeds {
     }
 }
 
-/// Start both refreshers. The threads end when [`Feeds`] is dropped, which is
-/// how the core's own exit stops them — there is no stop flag to forget to
-/// set.
+/// Start the refresher. The thread ends when [`Feeds`] is dropped, which is how
+/// the core's own exit stops it — there is no stop flag to forget to set.
 ///
-/// The first call of each is one period away, not immediate: the startup
-/// catalog read already took both answers (`main.rs`), and repeating them at
-/// once would spend the weight to learn what the core just learnt.
+/// The first call is one period away, not immediate: the startup catalog read
+/// already took the answer (`main.rs`), and repeating it at once would spend
+/// the weight to learn what the core just learnt.
 pub fn start() -> Feeds {
     let (tx, rx) = mpsc::channel();
-    let threads = vec![
-        spawn_feed(
-            "bookTicker",
-            BOOK_PERIOD,
-            tx.clone(),
-            |rest| rest.book_ticker_all(),
-            Snapshot::Book,
-        ),
-        spawn_feed(
-            "premiumIndex",
-            PREMIUM_PERIOD,
-            tx,
-            |rest| rest.premium_index_all(),
-            Snapshot::Premium,
-        ),
-    ];
+    let threads = vec![spawn_feed(
+        "bookTicker",
+        BOOK_PERIOD,
+        tx,
+        |rest| rest.book_ticker_all(),
+        Snapshot::Book,
+    )];
     Feeds { rx, threads }
 }
 
@@ -152,8 +124,8 @@ where
     let thread = thread::Builder::new()
         .name(format!("prices:{name}"))
         .spawn(move || {
-            // A client per thread: `ureq` pools a connection per agent, and the
-            // two feeds would otherwise contend for one.
+            // Its own client: `ureq` pools a connection per agent, and the
+            // startup client stays with `main`.
             let mut rest = Rest::new();
             run(name, period, &mut rest, &tx, &fetch, &wrap);
         })

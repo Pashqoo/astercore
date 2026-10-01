@@ -83,8 +83,9 @@ BaseCheck → AuthCheck → GetMarketsList → UpdateMarketsList → StratSchema
 - UI 24 ProfitState — в ответ на UI 2 SettingsRequest (до Ready клиент его не применяет) и всем при
   изменении итогов; раз в минуту перепроверка (почасовое окно сдвигается само).
 - GetMarketsIndexes: `count i32 + bn_market_name[]`. CancelAllOrders (API 11, кнопка «Cancel ALL
-  orders» настроек ядра) → ok с пустыми данными, действие — `trading.mdc`. Остальные API-методы пока
-  `response_err`.
+  orders» настроек ядра) → ok с пустыми данными, действие — `trading.mdc`. UpdateMarketsList с M1 идёт с
+  `send_funding=1` (`write_markets_prices_funded`): ставка в процентах и время следующего начисления
+  в каждой строке, рынок без фандинга — нулями. Остальные API-методы пока `response_err`.
 
 ## Маркет-дата (`server/codec/market_data.rs`, всё UTC в Delphi-днях)
 - TradesStream: `base_time f64 + packet_num u16 + секции[idx u16 (type<<14, 0=futures), cnt u8,
@@ -98,7 +99,9 @@ BaseCheck → AuthCheck → GetMarketsList → UpdateMarketsList → StratSchema
   отдаёт топ-20 целиком — замерено 01.10, 55 сообщений, всегда ровно (20, 20) уровней и ни одного
   с нулевым объёмом, тогда как `@depth` за те же 6 с дал 478 нулевых (удаления). Поэтому ни
   локального стакана, ни `U`/`u`/`pu`-менеджмента, ни сшивки со снимком по REST в ядре нет. SubscribeOrderBook/UnsubscribeOrderBook — батч имён; клиент сам шлёт
-  `RequestOrderBookFull(idx u16, kind u8)`.
+  `RequestOrderBookFull(idx u16, kind u8)`, ядро отвечает последним кадром сессии (он и есть
+  целая книга). Сессия книги, оборвавшаяся сама, — клиенту уходит **пустая** полная книга, а не
+  тишина: иначе терминал рисует последнюю как живую.
 - Свечи: `GetCoinCardCandles(name, kind u8)` → `count i32 + TDeepPrice(open,close,high,low,vol
   f32, time f64)`; `SubscribeCandles(names[], kind u8)` → ok + `TCandleTFStateCommand` (API cmd 4)
   и живые `TCandleUpdateCommand` (API cmd 3, unreliable). Live применяется только поверх

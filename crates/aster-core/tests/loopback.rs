@@ -1,5 +1,5 @@
-//! The M0 contract test: our server, and the terminal's own client of the same
-//! `moonproto` rev, on loopback.
+//! The contract test: our server, and the terminal's own client of the same
+//! `moonproto` rev, on loopback — the Init spine (M0) and the market data (M1).
 //!
 //! This is the observation `PLAN.md` asks M0 to end with, minus the GUI: the
 //! terminal is `moonproto::MoonClient` plus a window, and `MoonClient` walks
@@ -14,16 +14,21 @@
 //! run.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use aster_core::aster::json::{BookTicker, ExchangeInfo, PremiumIndex};
 use aster_core::engine::{
-    CoreHandler, ACCOUNT_PLACEHOLDER, EXCHANGE_CODE, EXCHANGE_NAME, SERVER_NAME,
+    CoreHandler, FeedLink, ACCOUNT_PLACEHOLDER, EXCHANGE_CODE, EXCHANGE_NAME, SERVER_NAME,
 };
+use aster_core::feed::{FeedCommand, FeedEvent};
+use aster_core::load::Load;
 use aster_core::model::Catalog;
 use aster_core::strategies::Strategies;
+use aster_core::stream_health::StreamHealth;
+use moonproto::server::codec::market_data::{delphi_days, Candle, Level};
 use moonproto::server::key_export::ServerKey;
 use moonproto::server::Server;
 use moonproto::state::AccountEvent;
@@ -126,26 +131,26 @@ impl Core {
     }
 
     fn connect(&self) -> MoonClient {
-        let cfg = ClientConfig::new(
-            "127.0.0.1",
-            self.key.port,
-            self.key.master_key,
-            self.key.mac_key,
-        )
-        .with_transport_mode(self.key.transport_mode);
-        let init = InitConfig {
-            // The terminal arrives with its own strategy list; an empty one is
-            // the first-run case and the one M0 has to survive.
-            initial_strategies: Some(InitialStrategies::new(0, Vec::new())),
-            ..Default::default()
-        };
-        MoonClient::connect_blocking(
-            cfg,
-            ConnectConfig::new(init).with_connect_timeout(Duration::from_secs(20)),
-            Duration::from_secs(30),
-        )
-        .expect("the client must reach Ready against this core")
+        connect(&self.key)
     }
+}
+
+/// The terminal's own client, walked to `Ready` against the core behind `key`.
+fn connect(key: &ServerKey) -> MoonClient {
+    let cfg = ClientConfig::new("127.0.0.1", key.port, key.master_key, key.mac_key)
+        .with_transport_mode(key.transport_mode);
+    let init = InitConfig {
+        // The terminal arrives with its own strategy list; an empty one is
+        // the first-run case and the one M0 has to survive.
+        initial_strategies: Some(InitialStrategies::new(0, Vec::new())),
+        ..Default::default()
+    };
+    MoonClient::connect_blocking(
+        cfg,
+        ConnectConfig::new(init).with_connect_timeout(Duration::from_secs(20)),
+        Duration::from_secs(30),
+    )
+    .expect("the client must reach Ready against this core")
 }
 
 impl Drop for Core {
@@ -168,7 +173,7 @@ fn wait_until(timeout: Duration, mut tick: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// The whole of M0 in one test: the client walks BaseCheck, AuthCheck,
+/// The whole Init spine (M0) in one test: the client walks BaseCheck, AuthCheck,
 /// GetMarketsList, UpdateMarketsList and the strategy schema, and what it ends
 /// up holding is what the terminal would draw.
 #[test]
@@ -356,5 +361,299 @@ fn an_unimplemented_engine_method_is_refused_rather_than_ignored() {
         sent.elapsed()
     );
 
+    let _ = client.disconnect();
+}
+
+// ----- M1: market data --------------------------------------------------------
+
+/// The core with a market feed the test plays: the commands the handler sends
+/// come out of `cmd_rx`, and whatever the test puts into `ev_tx` is what the
+/// exchange said. The loop is the core's own — `step`, then `pump` — so what
+/// the client sees is what a terminal would.
+struct FedCore {
+    key: ServerKey,
+    cmd_rx: Receiver<FeedCommand>,
+    ev_tx: Sender<FeedEvent>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl FedCore {
+    fn start() -> Self {
+        let mut key = ServerKey::generate(None, 0, TransportMode::V2);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let handler = CoreHandler::new(1, ACCOUNT_PLACEHOLDER.into(), catalog(), Strategies::new())
+            .with_feed(FeedLink {
+                tx: cmd_tx,
+                health: StreamHealth::default(),
+                load: Arc::new(Load::default()),
+            });
+        let mut server = Server::bind(&key, handler).expect("bind");
+        key.port = server.local_addr().expect("local_addr").port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                server.step();
+                let (h, sessions) = server.split();
+                h.pump(sessions, &ev_rx);
+            }
+        });
+        Self {
+            key,
+            cmd_rx,
+            ev_tx,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn connect(&self) -> MoonClient {
+        connect(&self.key)
+    }
+
+    /// The next feed command matching `pick`, skipping the rest.
+    fn expect_cmd<T>(&self, what: &str, mut pick: impl FnMut(FeedCommand) -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let cmd = self
+                .cmd_rx
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("no feed command: {what}"));
+            if let Some(v) = pick(cmd) {
+                return v;
+            }
+        }
+    }
+}
+
+impl Drop for FedCore {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    aster_core::engine::now_ms()
+}
+
+/// M1 in one test: the terminal's subscriptions reach the feed as commands,
+/// and what the feed says — a trade, a whole book, a CoinCard history, a new
+/// funding pair — reaches the client's own state.
+#[test]
+fn the_tape_the_book_the_chart_and_live_funding_reach_the_client() {
+    let core = FedCore::start();
+    let client = core.connect();
+    client
+        .streams()
+        .subscribe_all_trades(moonproto::TradesStreamMode::TradesOnly)
+        .unwrap();
+    client.streams().subscribe_orderbook("BTCUSDT").unwrap();
+    let card = client
+        .candles()
+        .request_coin_card("BTCUSDT", moonproto::DeepHistoryKind::Min5)
+        .unwrap();
+
+    core.expect_cmd("the book subscription", |c| match c {
+        FeedCommand::SetBooks(s) if s == ["BTCUSDT"] => Some(()),
+        _ => None,
+    });
+    let (client_id, request_uid) = core.expect_cmd("the CoinCard request", |c| match c {
+        FeedCommand::Candles {
+            symbol,
+            minutes,
+            client_id,
+            request_uid,
+        } => {
+            assert_eq!((symbol.as_str(), minutes), ("BTCUSDT", 5));
+            Some((client_id, request_uid))
+        }
+        _ => None,
+    });
+    let bar_ms = now_ms() / 300_000 * 300_000 - 300_000;
+    core.ev_tx
+        .send(FeedEvent::CandlesReply {
+            client_id,
+            request_uid,
+            result: Ok(vec![Candle {
+                open: 83_700.0,
+                high: 83_800.0,
+                low: 83_650.0,
+                close: 83_772.0,
+                volume: 12.5,
+                time: delphi_days(bar_ms),
+            }]),
+        })
+        .unwrap();
+    // Funding moved on: the next charge is eight hours later and the rate is
+    // another one. The catalog row the client holds still says the old pair,
+    // so only the price rows can carry this.
+    let next_charge = BTC_FUNDING_MS + 8 * 3_600_000;
+    core.ev_tx
+        .send(FeedEvent::Marks(vec![PremiumIndex {
+            symbol: "BTCUSDT".into(),
+            last_funding_rate: 0.000_2,
+            next_funding_time_ms: next_charge,
+            mark_price: BTC_MARK,
+        }]))
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        core.ev_tx
+            .send(FeedEvent::Book {
+                symbol: "BTCUSDT".into(),
+                bids: vec![Level {
+                    price: 83_771.9,
+                    qty: 0.5,
+                }],
+                asks: vec![Level {
+                    price: 83_772.1,
+                    qty: 1.25,
+                }],
+            })
+            .unwrap();
+        // Trades are applied only once the client's indexes are synchronized;
+        // keep sending until one lands.
+        core.ev_tx
+            .send(FeedEvent::Trade {
+                symbol: "BTCUSDT".into(),
+                price: 83_772.0,
+                qty: -0.004,
+                time_ms: now_ms(),
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let Some(snap) = client.snapshot() else {
+            continue;
+        };
+        let last = snap
+            .markets()
+            .get("BTCUSDT")
+            .map_or(0.0, |m| m.trade_state().last_trade_price);
+        let top = snap.top_of_book("BTCUSDT", moonproto::state::OrderBookKind::Futures);
+        let book_ok = top.as_ref().is_some_and(|t| {
+            t.bid
+                .is_some_and(|b| (b.rate - 83_771.9).abs() < 0.01 && b.quantity == 0.5)
+                && t.ask
+                    .is_some_and(|a| (a.rate - 83_772.1).abs() < 0.01 && a.quantity == 1.25)
+        });
+        let bars = snap
+            .markets()
+            .get("BTCUSDT")
+            .and_then(|m| snap.coin_card_candles_for(&m, card.kind).map(<[_]>::len));
+        let funding = snap.markets().price("BTCUSDT").map(|p| p.funding_rate);
+        // Percent on the wire: 0.0002 is 0.02 %.
+        let funded = funding.is_some_and(|r| (r - 0.02).abs() < 1e-12);
+        if (last - 83_772.0).abs() < 0.01 && book_ok && bars == Some(1) && funded {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not applied: last={last} top={top:?} bars={bars:?} funding={funding:?}"
+        );
+    }
+
+    // Closing the book releases its session: one the feed would otherwise
+    // keep open for nobody. (A client that just goes away is released too,
+    // but only once the server times its session out — the client sends no
+    // close on `disconnect` — so that path is a minute long and not tested
+    // here.)
+    client.streams().unsubscribe_orderbook("BTCUSDT").unwrap();
+    core.expect_cmd("the book released", |c| match c {
+        FeedCommand::SetBooks(s) if s.is_empty() => Some(()),
+        _ => None,
+    });
+    let _ = client.disconnect();
+}
+
+/// The unhappy branch: the exchange refuses the REST call behind a chart. The
+/// refusal must reach the client as a failure it can show — not as silence,
+/// which the client would wait out, and not as an empty chart, which reads as
+/// a market with no history.
+#[test]
+fn a_refused_history_call_reaches_the_client_as_a_failure() {
+    let core = FedCore::start();
+    let client = core.connect();
+    client
+        .streams()
+        .subscribe_all_trades(moonproto::TradesStreamMode::TradesOnly)
+        .unwrap();
+    client
+        .candles()
+        .request_coin_card("BTCUSDT", moonproto::DeepHistoryKind::Hour1)
+        .unwrap();
+    let (client_id, request_uid) = core.expect_cmd("the CoinCard request", |c| match c {
+        FeedCommand::Candles {
+            client_id,
+            request_uid,
+            ..
+        } => Some((client_id, request_uid)),
+        _ => None,
+    });
+    let refusal = "api 429/-1003: Too many requests";
+    core.ev_tx
+        .send(FeedEvent::CandlesReply {
+            client_id,
+            request_uid,
+            result: Err(refusal.into()),
+        })
+        .unwrap();
+    let mut failed = None;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            for event in client.drain_events() {
+                if let Event::CoinCardCandles(moonproto::CoinCardCandlesEvent::UpdateFailed {
+                    error,
+                    ..
+                }) = event
+                {
+                    failed = Some(error);
+                    return true;
+                }
+            }
+            false
+        }),
+        "the client never heard the CoinCard refusal"
+    );
+    assert!(failed.unwrap().contains("-1003"));
+
+    // The same for the tape of the last hour.
+    let ticket = client.history().request_chart("BTCUSDT").unwrap();
+    let (client_id, request_uid) = core.expect_cmd("the history request", |c| match c {
+        FeedCommand::History {
+            symbol,
+            client_id,
+            request_uid,
+        } => {
+            assert_eq!(symbol, "BTCUSDT");
+            Some((client_id, request_uid))
+        }
+        _ => None,
+    });
+    core.ev_tx
+        .send(FeedEvent::HistoryReply {
+            client_id,
+            request_uid,
+            result: Err(refusal.into()),
+        })
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            client.drain_events().into_iter().any(|e| {
+                matches!(
+                    e,
+                    Event::MarketHistory(moonproto::MarketHistoryEvent::Failed { ticket: t, .. })
+                        if t == ticket
+                )
+            })
+        }),
+        "the client never heard the history refusal"
+    );
     let _ = client.disconnect();
 }

@@ -10,19 +10,32 @@
 //! for a core that has no signed access yet (M2).
 //!
 //! Adapted from TInvestCore's `engine.rs`, which is the same spine over 6000
-//! lines of trading on top. What is NOT here is deliberate, not forgotten:
-//! market data (M1), orders (M2), strategies (M3). Every Engine API method
-//! outside the spine answers with a refusal naming itself, which is how the
-//! terminal shows a missing feature instead of waiting out a timeout.
+//! lines of trading on top. Market data (M1) is here: the tape, the books and
+//! the candles the terminal subscribes to, fed from `feed.rs`. What is NOT here
+//! is deliberate, not forgotten: orders (M2), strategies (M3). Every Engine API
+//! method outside what is implemented answers with a refusal naming itself,
+//! which is how the terminal shows a missing feature instead of waiting out a
+//! timeout.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+use std::time::Instant;
 
 use moonproto::server::codec::engine::{self, EngineMethod, EngineRequest, ServerInfo};
 use moonproto::server::codec::log::log_msg;
+use moonproto::server::codec::market_data::{self, DeepHistoryKind, Level, BOOK_KIND_FUTURES};
 use moonproto::server::codec::{balance, strat, trade, ui, BaseHeader, BASE_HEADER_SIZE};
 use moonproto::server::{Command, Handler, Session};
 
+use crate::aster::ws::Stamp;
+use crate::feed::{FeedCommand, FeedEvent};
+use crate::load::Load;
 use crate::model::{Catalog, QUOTE, QUOTE_CODE};
 use crate::prices::Snapshot;
 use crate::strategies::Strategies;
+use crate::stream_health::{Scope, StreamHealth, SUMMARY_EVERY_MS};
+use crate::trades_stream::TradesStream;
 
 pub const SERVER_NAME: &str = "Astercore";
 pub const EXCHANGE_NAME: &str = "Aster";
@@ -54,6 +67,31 @@ const UI: u8 = Command::UI.to_byte();
 const ORDER: u8 = Command::Order.to_byte();
 const BALANCE: u8 = Command::Balance.to_byte();
 const LOG: u8 = Command::LogMsg.to_byte();
+const TRADES: u8 = Command::TradesStream.to_byte();
+const TRADES_RESEND: u8 = Command::TradesResendResponse.to_byte();
+const ORDER_BOOK: u8 = Command::OrderBook.to_byte();
+/// Feed events applied per UDP-loop pass, so receiving is never starved by a
+/// backlog the feed built up.
+const PUMP_BATCH: usize = 256;
+/// How often stream liveness is judged.
+const HEALTH_EVERY_MS: i64 = 1_000;
+
+/// The last book a market's session sent, whole: what `RequestOrderBookFull`
+/// is answered from. A `depth20` frame is a complete top 20, so the last one
+/// IS the book — there is nothing to rebuild and no REST snapshot to stitch.
+struct Book {
+    seq: u16,
+    bids: Vec<Level>,
+    asks: Vec<Level>,
+}
+
+/// What ties the handler to the market feed. Absent in the contract test that
+/// only walks the Init spine, present in the core.
+pub struct FeedLink {
+    pub tx: Sender<FeedCommand>,
+    pub health: StreamHealth,
+    pub load: Arc<Load>,
+}
 
 pub struct CoreHandler {
     bot_id: i64,
@@ -82,6 +120,21 @@ pub struct CoreHandler {
     /// epoch exists to tell one snapshot generation from the next, and this
     /// core has exactly one — the empty one. M2 moves it with the account.
     balance_epoch: u16,
+    feed: Option<FeedLink>,
+    /// The core-wide tape packetizer, broadcast to `trade_subs`.
+    trades: TradesStream,
+    trade_subs: HashSet<u64>,
+    /// Books each client shows, and their union as last sent to the feed.
+    book_subs: HashMap<u64, BTreeSet<u16>>,
+    feed_books: BTreeSet<u16>,
+    books: HashMap<u16, Book>,
+    /// Live candles each client follows (one timeframe per market), and their
+    /// union as last sent to the feed.
+    candle_subs: HashMap<u64, HashMap<u16, DeepHistoryKind>>,
+    feed_candles: BTreeSet<(u16, i64)>,
+    health_at: i64,
+    load_at: Stamp,
+    feed_lost: bool,
 }
 
 impl CoreHandler {
@@ -99,10 +152,327 @@ impl CoreHandler {
             shared_config: ui::default_shared_config_blob(),
             quoted,
             balance_epoch: 1,
+            feed: None,
+            trades: TradesStream::new(now_ms),
+            trade_subs: HashSet::new(),
+            book_subs: HashMap::new(),
+            feed_books: BTreeSet::new(),
+            books: HashMap::new(),
+            candle_subs: HashMap::new(),
+            feed_candles: BTreeSet::new(),
+            health_at: 0,
+            load_at: Stamp::now(),
+            feed_lost: false,
         }
     }
 
-    /// Apply one snapshot from the price thread. Called from the UDP loop
+    /// Connect the handler to the market feed (`feed::start`).
+    pub fn with_feed(mut self, feed: FeedLink) -> Self {
+        self.feed = Some(feed);
+        self
+    }
+
+    /// Send to the feed; `false` when there is none or it is gone. A send that
+    /// fails on a feed that WAS there means its coordinator thread died — the
+    /// receiver drops only with it — and is latched in [`Self::feed_lost`].
+    fn feed_send(&mut self, cmd: FeedCommand) -> bool {
+        let Some(f) = &self.feed else {
+            return false;
+        };
+        let sent = f.tx.send(cmd).is_ok();
+        if !sent && !self.feed_lost {
+            log::error!("feed: the coordinator is gone — subscriptions can no longer change");
+            self.feed_lost = true;
+        }
+        sent
+    }
+
+    /// The market feed died under the core. Nothing in the process would
+    /// notice otherwise: the terminal's subscriptions would be recorded as
+    /// sent and never opened, and its chart requests never answered. `main`
+    /// leaves on it, as it does on a dead price refresher, and the exit code
+    /// is what brings the core back.
+    pub fn feed_lost(&self) -> bool {
+        self.feed_lost
+    }
+
+    fn indexes(&self, names: &[String]) -> Vec<u16> {
+        names
+            .iter()
+            .filter_map(|n| self.catalog.index_of_symbol(n))
+            .collect()
+    }
+
+    fn symbol_of(&self, idx: u16) -> Option<String> {
+        self.catalog
+            .markets()
+            .get(usize::from(idx))
+            .map(|m| m.symbol.clone())
+    }
+
+    /// Push the union of every client's book and candle subscriptions to the
+    /// feed, when it changed. A book that leaves the union leaves the cache
+    /// too: its session is about to stop, and a book the core no longer hears
+    /// must not answer the next `RequestOrderBookFull` as if it were current.
+    fn sync_feed_subscriptions(&mut self) {
+        let books: BTreeSet<u16> = self.book_subs.values().flatten().copied().collect();
+        if books != self.feed_books {
+            for idx in self.feed_books.difference(&books) {
+                self.books.remove(idx);
+            }
+            let symbols = books.iter().filter_map(|&i| self.symbol_of(i)).collect();
+            self.feed_send(FeedCommand::SetBooks(symbols));
+            self.feed_books = books;
+        }
+        let candles: BTreeSet<(u16, i64)> = self
+            .candle_subs
+            .values()
+            .flatten()
+            .map(|(&i, k)| (i, k.minutes()))
+            .collect();
+        if candles != self.feed_candles {
+            let subs = candles
+                .iter()
+                .filter_map(|&(i, m)| Some((self.symbol_of(i)?, m)))
+                .collect();
+            self.feed_send(FeedCommand::SetCandles(subs));
+            self.feed_candles = candles;
+        }
+    }
+
+    /// Apply queued feed events, judge the streams, and flush the tape; called
+    /// by the main loop between `Server::step`s with the authorized sessions.
+    pub fn pump<'s>(
+        &mut self,
+        sessions: impl Iterator<Item = &'s mut Session>,
+        rx: &Receiver<FeedEvent>,
+    ) {
+        let mut sessions: Vec<&mut Session> = sessions.collect();
+        let mut applied = 0;
+        for ev in rx.try_iter().take(PUMP_BATCH) {
+            self.apply_feed(ev, &mut sessions);
+            applied += 1;
+        }
+        if applied == PUMP_BATCH {
+            if let Some(f) = &self.feed {
+                f.load.batch_full();
+            }
+        }
+        let now = now_ms();
+        if now - self.health_at >= HEALTH_EVERY_MS {
+            self.health_at = now;
+            self.judge_streams();
+        }
+        if let Some(packet) = self.trades.poll(Instant::now()) {
+            for s in sessions
+                .iter_mut()
+                .filter(|s| self.trade_subs.contains(&s.client_id()))
+            {
+                s.send(TRADES, &packet);
+            }
+        }
+    }
+
+    /// Stream liveness, and what a dead mark stream takes with it: the mark
+    /// prices and the funding are CLEARED, the same rule the price refresher
+    /// applies to an outage (`prices.rs`) — a terminal showing no funding is
+    /// right, one counting down to a charge the core stopped hearing about is
+    /// not. The next frame after the stream returns restores both.
+    fn judge_streams(&mut self) {
+        let Some(feed) = self.feed.as_mut() else {
+            return;
+        };
+        let stamp = Stamp::now();
+        let marks_died = feed
+            .health
+            .judge(stamp)
+            .iter()
+            .any(|(scope, alive)| **scope == Scope::Marks && !alive);
+        if marks_died {
+            self.catalog.apply_premium_index(&[]);
+        }
+        // Monotonic, unlike the streams line: a stepped wall clock must not
+        // print a load line for a period that never lasted.
+        if stamp.mono - self.load_at.mono >= SUMMARY_EVERY_MS {
+            self.load_at = stamp;
+            log::info!("{}", feed.load.summary());
+        }
+    }
+
+    fn apply_feed(&mut self, ev: FeedEvent, sessions: &mut [&mut Session]) {
+        match ev {
+            FeedEvent::Trade {
+                symbol,
+                price,
+                qty,
+                time_ms,
+            } => {
+                if let Some(idx) = self.catalog.index_of_symbol(&symbol) {
+                    self.trades.push(idx, time_ms, price as f32, qty as f32);
+                }
+            }
+            FeedEvent::Marks(rows) => {
+                let funded = self.catalog.apply_premium_index(&rows);
+                log::trace!("marks: funding on {funded} markets ({} rows)", rows.len());
+            }
+            FeedEvent::Book { symbol, bids, asks } => {
+                let Some(idx) = self.catalog.index_of_symbol(&symbol) else {
+                    return;
+                };
+                // A late frame of a book nobody shows any more: its session
+                // is closing, and caching it would revive what the unsubscribe
+                // just dropped.
+                if !self.feed_books.contains(&idx) {
+                    return;
+                }
+                let seq = self
+                    .books
+                    .get(&idx)
+                    .map_or(1, |b| b.seq.wrapping_add(1).max(1));
+                let shown = |subs: &HashMap<u64, BTreeSet<u16>>, id: u64| {
+                    subs.get(&id).is_some_and(|set| set.contains(&idx))
+                };
+                if sessions
+                    .iter()
+                    .any(|s| shown(&self.book_subs, s.client_id()))
+                {
+                    let packet = market_data::order_book_packet(
+                        idx,
+                        seq,
+                        true,
+                        BOOK_KIND_FUTURES,
+                        &bids,
+                        &asks,
+                    );
+                    for s in sessions.iter_mut() {
+                        if shown(&self.book_subs, s.client_id()) {
+                            s.send(ORDER_BOOK, &packet);
+                        }
+                    }
+                }
+                self.books.insert(idx, Book { seq, bids, asks });
+            }
+            // The session carrying these books ended on its own (or they left
+            // the subscription). A client still showing one is sent an EMPTY
+            // whole book: left alone, the terminal would keep drawing the last
+            // one as live through the reconnect and its backoff — the same rule
+            // as the price rows, where no quote beats an old one.
+            FeedEvent::BooksUnavailable(symbols) => {
+                let mut off = 0;
+                for symbol in &symbols {
+                    let Some(idx) = self.catalog.index_of_symbol(symbol) else {
+                        continue;
+                    };
+                    let Some(book) = self.books.remove(&idx) else {
+                        continue;
+                    };
+                    off += 1;
+                    let packet = market_data::order_book_packet(
+                        idx,
+                        book.seq.wrapping_add(1).max(1),
+                        true,
+                        BOOK_KIND_FUTURES,
+                        &[],
+                        &[],
+                    );
+                    for s in sessions.iter_mut() {
+                        let shown = self
+                            .book_subs
+                            .get(&s.client_id())
+                            .is_some_and(|set| set.contains(&idx));
+                        if shown {
+                            s.send(ORDER_BOOK, &packet);
+                        }
+                    }
+                }
+                if off > 0 {
+                    if let Some(f) = &self.feed {
+                        f.load.books_off(off);
+                    }
+                }
+            }
+            FeedEvent::Candle {
+                symbol,
+                minutes,
+                candle,
+            } => {
+                let Some(idx) = self.catalog.index_of_symbol(&symbol) else {
+                    return;
+                };
+                for s in sessions.iter_mut() {
+                    let kind = self
+                        .candle_subs
+                        .get(&s.client_id())
+                        .and_then(|subs| subs.get(&idx))
+                        .filter(|k| k.minutes() == minutes);
+                    if let Some(&kind) = kind {
+                        s.send_encrypted(
+                            API,
+                            &market_data::candle_update(rand_uid(), idx, kind, &candle),
+                            false,
+                        );
+                    }
+                }
+            }
+            FeedEvent::Lost(what) => {
+                log::error!("feed: {what} is gone");
+                self.feed_lost = true;
+            }
+            FeedEvent::CandlesReply {
+                client_id,
+                request_uid,
+                result,
+            } => {
+                let Some(s) = sessions.iter_mut().find(|s| s.client_id() == client_id) else {
+                    return;
+                };
+                let method = EngineMethod::GetCoinCardCandles;
+                let resp = match result {
+                    Ok(candles) => engine::response_ok(
+                        request_uid,
+                        method,
+                        &market_data::coin_card_candles(&candles),
+                    ),
+                    Err(e) => {
+                        log::warn!("CoinCard: {e}");
+                        engine::response_err(request_uid, method, 0, &e)
+                    }
+                };
+                s.send_encrypted(API, &resp, true);
+            }
+            FeedEvent::HistoryReply {
+                client_id,
+                request_uid,
+                result,
+            } => {
+                let Some(s) = sessions.iter_mut().find(|s| s.client_id() == client_id) else {
+                    return;
+                };
+                let method = EngineMethod::RequestMarketHistory;
+                match result {
+                    Ok(trades) => {
+                        for chunk in market_data::market_history(&trades) {
+                            s.send_encrypted(
+                                API,
+                                &engine::response_ok(request_uid, method, &chunk),
+                                true,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("market history: {e}");
+                        s.send_encrypted(
+                            API,
+                            &engine::response_err(request_uid, method, 0, &e),
+                            true,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply one snapshot from the top-of-book refresher. Called from the UDP loop
     /// between receives, never from inside a request: the request answers
     /// whatever the last applied snapshot says.
     pub fn apply(&mut self, snap: Snapshot) {
@@ -121,10 +491,6 @@ impl CoreHandler {
                     );
                     self.quoted = quoted;
                 }
-            }
-            Snapshot::Premium(rows) => {
-                let funded = self.catalog.apply_premium_index(&rows);
-                log::debug!("prices: funding on {funded} markets ({} rows)", rows.len());
             }
         }
     }
@@ -148,17 +514,136 @@ impl CoreHandler {
             log::warn!("API: unparsable request ({} bytes)", payload.len());
             return;
         };
+        let client = session.client_id();
         let data = match req.method {
+            EngineMethod::SubscribeAllTrades => {
+                self.trade_subs.insert(client);
+                Vec::new()
+            }
+            EngineMethod::UnsubscribeAllTrades => {
+                self.trade_subs.remove(&client);
+                Vec::new()
+            }
+            EngineMethod::TradesResend => {
+                if let Some(nums) = market_data::parse_trades_resend_params(&req.params) {
+                    session.send(TRADES_RESEND, &self.trades.resend(&nums));
+                }
+                Vec::new()
+            }
+            EngineMethod::SubscribeOrderBook => {
+                let idx = self.indexes(&req.market_names);
+                self.book_subs.entry(client).or_default().extend(idx);
+                self.sync_feed_subscriptions();
+                Vec::new()
+            }
+            EngineMethod::UnsubscribeOrderBook => {
+                let idx = self.indexes(&req.market_names);
+                if let Some(set) = self.book_subs.get_mut(&client) {
+                    set.retain(|i| !idx.contains(i));
+                }
+                self.sync_feed_subscriptions();
+                Vec::new()
+            }
+            // Answered from the last frame of the market's session, which is a
+            // whole book. A market whose session has not sent one yet gets
+            // nothing here, and needs nothing: its first frame is a full book
+            // and goes to every client showing it within ~100 ms.
+            EngineMethod::RequestOrderBookFull | EngineMethod::ReloadOrderBook => {
+                let wanted: Vec<u16> = match market_data::parse_order_book_full_params(&req.params)
+                {
+                    Some((idx, _)) => vec![idx],
+                    None => self
+                        .book_subs
+                        .get(&client)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .collect(),
+                };
+                for idx in wanted {
+                    if let Some(b) = self.books.get(&idx) {
+                        let packet = market_data::order_book_packet(
+                            idx,
+                            b.seq,
+                            true,
+                            BOOK_KIND_FUTURES,
+                            &b.bids,
+                            &b.asks,
+                        );
+                        session.send(ORDER_BOOK, &packet);
+                    }
+                }
+                Vec::new()
+            }
+            EngineMethod::SubscribeCandles => {
+                let Some(kind) = market_data::parse_kind_param(&req.params) else {
+                    return self.reply_err(session, &req, "bad timeframe");
+                };
+                let idx = self.indexes(&req.market_names);
+                let subs = self.candle_subs.entry(client).or_default();
+                for i in &idx {
+                    subs.insert(*i, kind);
+                }
+                for i in idx {
+                    session.send_encrypted(
+                        API,
+                        &market_data::candle_tf_state(rand_uid(), i, Some(kind), 1),
+                        true,
+                    );
+                }
+                self.sync_feed_subscriptions();
+                Vec::new()
+            }
+            EngineMethod::UnsubscribeCandles => {
+                let idx = self.indexes(&req.market_names);
+                if let Some(subs) = self.candle_subs.get_mut(&client) {
+                    for i in &idx {
+                        subs.remove(i);
+                    }
+                }
+                self.sync_feed_subscriptions();
+                Vec::new()
+            }
+            EngineMethod::GetCoinCardCandles => {
+                let (Some(kind), Some(_)) = (
+                    market_data::parse_kind_param(&req.params),
+                    self.catalog.index_of_symbol(&req.market_name),
+                ) else {
+                    return self.reply_err(session, &req, "unknown market or timeframe");
+                };
+                let sent = self.feed_send(FeedCommand::Candles {
+                    symbol: req.market_name.clone(),
+                    minutes: kind.minutes(),
+                    client_id: client,
+                    request_uid: req.uid,
+                });
+                if !sent {
+                    self.reply_err(session, &req, "no market data source");
+                }
+                return;
+            }
+            EngineMethod::RequestMarketHistory => {
+                if self.catalog.index_of_symbol(&req.market_name).is_none() {
+                    return self.reply_err(session, &req, "unknown market");
+                }
+                let sent = self.feed_send(FeedCommand::History {
+                    symbol: req.market_name.clone(),
+                    client_id: client,
+                    request_uid: req.uid,
+                });
+                if !sent {
+                    self.reply_err(session, &req, "no market data source");
+                }
+                return;
+            }
             EngineMethod::BaseCheck => self.server_info(),
             EngineMethod::AuthCheck => engine::write_auth_check(&self.account_id, MAX_PAYLOAD),
             EngineMethod::GetMarketsList => engine::write_markets_list(&self.catalog.specs()),
-            // `write_markets_prices` sends no funding (`send_funding = 0`), so
-            // what the terminal knows about funding is the snapshot that rode
-            // the catalog. The refresher keeps the core's own copy current for
-            // the mark price in these rows; carrying the rate and the next
-            // charge in them is M1's work, together with the `markPrice@1s`
-            // stream that makes a per-second update worth sending.
-            EngineMethod::UpdateMarketsList => engine::write_markets_prices(&self.catalog.prices()),
+            // With funding: the catalog row carried it once per session, and
+            // the next-charge time moves every few hours (`Catalog::funded_prices`).
+            EngineMethod::UpdateMarketsList => {
+                engine::write_markets_prices_funded(&self.catalog.funded_prices())
+            }
             EngineMethod::GetMarketsIndexes => {
                 engine::write_markets_indexes(&self.catalog.symbols())
             }
@@ -356,6 +841,12 @@ impl Handler for CoreHandler {
 
     fn on_closed(&mut self, client_id: u64) {
         log::info!("client {client_id:#x} closed");
+        // Its subscriptions go with it: a book nobody shows is a session the
+        // feed keeps open for nothing.
+        self.trade_subs.remove(&client_id);
+        self.book_subs.remove(&client_id);
+        self.candle_subs.remove(&client_id);
+        self.sync_feed_subscriptions();
     }
 }
 

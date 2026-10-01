@@ -9,7 +9,7 @@
 //! terminal's source, not assumed.
 
 use moonproto::server::codec::engine::{
-    BaseCurrency, Funding as WireFunding, MarketSpec, PriceRow,
+    BaseCurrency, FundedPriceRow, Funding as WireFunding, MarketSpec, PriceRow,
 };
 
 use crate::aster::json::{BookTicker, ExchangeInfo, Filter, PremiumIndex, SymbolInfo, Ticker24h};
@@ -209,7 +209,9 @@ pub struct Market {
     /// both sides of that wire spell "no quote".
     pub bid: Option<f64>,
     pub ask: Option<f64>,
-    /// Mark price from `premiumIndex`, `None` until it is read.
+    /// Mark price from `premiumIndex` at startup and `!markPrice@arr` every
+    /// 3 s after; `None` until read, and cleared while the mark stream is dead
+    /// (`engine::judge_streams`).
     ///
     /// The exchange's own reference price: `PERCENT_PRICE`, the margin and the
     /// liquidation price are all computed against it, so it is what the
@@ -217,7 +219,7 @@ pub struct Market {
     /// derived from the book — the two differ on a thin market, which is
     /// exactly where the difference matters.
     pub mark_price: Option<f64>,
-    /// Funding, once `premiumIndex` has been read, and `None` when the exchange
+    /// Funding, from the same two sources as the mark price, and `None` when the exchange
     /// published no row for this symbol — measured 01.10, `MBLUSDT` is such a
     /// market. Not a zero: a rate of exactly zero is a real answer between
     /// charges on 97 of the 595 rows.
@@ -641,7 +643,9 @@ impl Catalog {
     }
 
     /// Merge one `premiumIndex` answer: the funding pair and the mark price per
-    /// market.
+    /// market. Called with the startup REST answer, with every `!markPrice@arr`
+    /// frame after it (the same complete set, measured), and with an empty
+    /// slice when that stream dies — which clears both, on purpose.
     ///
     /// Same matching rule and same reason, with the asymmetry the other way
     /// round as well: measured 01.10 the answer has 766 rows for 596 markets
@@ -793,7 +797,7 @@ impl Catalog {
     /// exchange quotes no book for and the terminal must therefore show no
     /// price for.
     ///
-    /// The mark price rides along when it is known; `write_markets_prices`
+    /// The mark price rides along when it is known; the price-row writer
     /// carries a `found` flag beside it, and a zero there says "no mark price"
     /// rather than "zero".
     pub fn prices(&self) -> Vec<PriceRow> {
@@ -805,6 +809,25 @@ impl Catalog {
                 bid: m.bid.unwrap_or(0.0),
                 ask: m.ask.unwrap_or(0.0),
                 last: m.mark_price.unwrap_or(0.0),
+            })
+            .collect()
+    }
+
+    /// [`Catalog::prices`] with each market's current funding beside its row —
+    /// the body of `UpdateMarketsList` from M1 on.
+    ///
+    /// The catalog row carries funding once per session, and every charge
+    /// moves the next-charge time: without these rows the terminal counts down
+    /// to a moment already past. A market without funding goes out as zeros,
+    /// which overwrite what the terminal held — the same reason a market
+    /// without a quote is a zero row and not a missing one.
+    pub fn funded_prices(&self) -> Vec<FundedPriceRow> {
+        self.prices()
+            .into_iter()
+            .zip(&self.markets)
+            .map(|(row, m)| FundedPriceRow {
+                row,
+                funding: wire_funding(m.funding),
             })
             .collect()
     }
@@ -962,15 +985,21 @@ fn spec_of(m: &Market) -> MarketSpec {
         // for this field, and the terminal already reads 0 as "no figure".
         volume: m.quote_volume_24h.unwrap_or(0.0),
         delivery_time_ms: m.delivery_ms,
-        funding: m.funding.map(|f| WireFunding {
-            // Fraction -> percent. The single multiplication this file exists
-            // to keep in one place; see `WireFunding::rate_pct`.
-            rate_pct: f.rate * 100.0,
-            time_ms: f.next_ms,
-        }),
+        funding: wire_funding(m.funding),
         is_btc_market: m.is_btc_reference(),
         status_trading: m.trading,
     }
+}
+
+/// The exchange's funding in the wire's units — the single conversion this
+/// file exists to keep in one place, shared by the catalog row and the price
+/// rows so the two can never disagree on the unit.
+fn wire_funding(f: Option<Funding>) -> Option<WireFunding> {
+    f.map(|f| WireFunding {
+        // Fraction -> percent; see `WireFunding::rate_pct`.
+        rate_pct: f.rate * 100.0,
+        time_ms: f.next_ms,
+    })
 }
 
 /// Whether `channel` is a value [`tags_of`] knows how to classify.
@@ -1668,7 +1697,7 @@ mod tests {
         assert!(cat.summary().contains("funding 1/2"), "{}", cat.summary());
     }
 
-    /// The price rows are the one message M0 sends on a period, and two rules
+    /// The price rows are what `UpdateMarketsList` answers every 2 s, and two rules
     /// decide them: one row per market whatever its state, and a quote only
     /// where the exchange published one.
     #[test]

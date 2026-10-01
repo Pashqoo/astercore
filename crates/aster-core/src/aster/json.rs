@@ -295,12 +295,12 @@ pub enum Filter {
 /// and the mark price.
 ///
 /// `indexPrice` and `interestRate` are still not read: nothing in the core acts
-/// on them. `markPrice` is, since M0's `UpdateMarketsList` has to carry one —
+/// on them. `markPrice` is, since `UpdateMarketsList` has to carry one —
 /// the price row's mark field has a `found` flag beside it, so a core that
 /// parsed no mark price would be telling the terminal this venue publishes
-/// none. Measured 01.10: all 766 rows carry a positive `markPrice`. The
-/// `markPrice@1s` stream of M1 replaces this snapshot as the source, not the
-/// field.
+/// none. Measured 01.10: all 766 rows carry a positive `markPrice`. After
+/// startup the same rows come from `!markPrice@arr` ([`MarkPriceUpdate`],
+/// converted into this type), so one merge serves both sources.
 ///
 /// Measured 01.10: **766 rows**, more than `exchangeInfo`'s 613 — the answer
 /// also carries index symbols (`GNSUSD`, `USD1USD`, `AAPLUSD`) and symbols the
@@ -374,4 +374,253 @@ pub struct Ticker24h {
     pub price_change_percent: f64,
     #[serde(default)]
     pub count: i64,
+}
+
+/// One of Aster's decimal strings as a value of its own — for the places a
+/// number sits in an array rather than in a named field (book levels), where
+/// `deserialize_with` has no field to hang on. Same tolerance as [`str_f64`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+pub struct Dec(#[serde(deserialize_with = "str_f64")] pub f64);
+
+/// One aggregated trade, from `<symbol>@aggTrade` or `GET /fapi/v1/aggTrades`.
+///
+/// Measured 01.10 the two carry the same fields under the same names; the
+/// stream adds `e`, `E` and `s`, which is why `symbol` defaults — the REST
+/// answer is per symbol and does not repeat it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AggTrade {
+    #[serde(default, rename = "s")]
+    pub symbol: String,
+    /// Aggregate trade id, the paging key of the REST call.
+    #[serde(default, rename = "a")]
+    pub id: i64,
+    #[serde(default, deserialize_with = "str_f64", rename = "p")]
+    pub price: f64,
+    /// Base quantity, unsigned.
+    #[serde(default, deserialize_with = "str_f64", rename = "q")]
+    pub qty: f64,
+    /// Trade time, unix ms.
+    #[serde(default, rename = "T")]
+    pub time_ms: i64,
+    /// The buyer was the maker — so the aggressor SOLD. This is the side the
+    /// tape is signed by: MoonBot's negative quantity is a sell.
+    #[serde(default, rename = "m")]
+    pub buyer_is_maker: bool,
+}
+
+impl AggTrade {
+    /// Quantity signed by the aggressor's side, the way `TradesStream` wants it.
+    pub fn signed_qty(&self) -> f64 {
+        if self.buyer_is_maker {
+            -self.qty
+        } else {
+            self.qty
+        }
+    }
+}
+
+/// `<symbol>@depth20@100ms`: the top twenty levels of each side, WHOLE.
+///
+/// Measured 01.10: 55 messages in 6 s, every one exactly (20, 20) levels and
+/// none with a zero quantity — a snapshot, not a delta, so the core keeps no
+/// local book (`PLAN.md`, "Стакан").
+#[derive(Debug, Clone, Deserialize)]
+pub struct Depth {
+    #[serde(default, rename = "s")]
+    pub symbol: String,
+    #[serde(default, rename = "b")]
+    pub bids: Vec<[Dec; 2]>,
+    #[serde(default, rename = "a")]
+    pub asks: Vec<[Dec; 2]>,
+}
+
+/// `<symbol>@kline_<interval>`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KlineEvent {
+    #[serde(default, rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "k")]
+    pub kline: Kline,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Kline {
+    /// Bar open, unix ms.
+    #[serde(default, rename = "t")]
+    pub open_ms: i64,
+    /// `1m`, `5m`, … — the exchange's own spelling.
+    #[serde(default, rename = "i")]
+    pub interval: String,
+    #[serde(default, deserialize_with = "str_f64", rename = "o")]
+    pub open: f64,
+    #[serde(default, deserialize_with = "str_f64", rename = "h")]
+    pub high: f64,
+    #[serde(default, deserialize_with = "str_f64", rename = "l")]
+    pub low: f64,
+    #[serde(default, deserialize_with = "str_f64", rename = "c")]
+    pub close: f64,
+    /// BASE volume — the one a chart row carries (`PLAN.md`, "Объёмы").
+    #[serde(default, deserialize_with = "str_f64", rename = "v")]
+    pub volume: f64,
+}
+
+/// One row of `!markPrice@arr`.
+///
+/// Measured 01.10: every message, every 3 s, carries all 767 symbols — the
+/// same complete answer `GET /fapi/v1/premiumIndex` gives, under one-letter
+/// names. It is turned into a [`PremiumIndex`] so that one merge
+/// (`Catalog::apply_premium_index`) owns both sources and their rules.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarkPriceUpdate {
+    #[serde(default, rename = "s")]
+    pub symbol: String,
+    #[serde(default, deserialize_with = "str_f64", rename = "p")]
+    pub mark_price: f64,
+    #[serde(default, deserialize_with = "str_f64", rename = "r")]
+    pub funding_rate: f64,
+    #[serde(default, rename = "T")]
+    pub next_funding_time_ms: i64,
+}
+
+impl From<MarkPriceUpdate> for PremiumIndex {
+    fn from(m: MarkPriceUpdate) -> Self {
+        Self {
+            symbol: m.symbol,
+            last_funding_rate: m.funding_rate,
+            next_funding_time_ms: m.next_funding_time_ms,
+            mark_price: m.mark_price,
+        }
+    }
+}
+
+/// One event of a combined stream, by its `e` field. Anything this core does
+/// not read is `Other` rather than a decode error: one new event type must
+/// not fail the frame that carries it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "e")]
+pub enum StreamEvent {
+    #[serde(rename = "aggTrade")]
+    AggTrade(AggTrade),
+    #[serde(rename = "depthUpdate")]
+    Depth(Depth),
+    #[serde(rename = "kline")]
+    Kline(KlineEvent),
+    #[serde(rename = "markPriceUpdate")]
+    MarkPrice(MarkPriceUpdate),
+    #[serde(other)]
+    Other,
+}
+
+/// A combined-stream frame: `{"stream": "...", "data": ...}`. `data` is one
+/// event, or an array of them for the `!…@arr` streams.
+#[derive(Debug, Deserialize)]
+pub struct Envelope {
+    #[serde(default)]
+    pub stream: String,
+    pub data: StreamData,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum StreamData {
+    Many(Vec<StreamEvent>),
+    One(StreamEvent),
+}
+
+/// One row of `GET /fapi/v1/klines`: a 12-cell array of mixed numbers and
+/// decimal strings. Read cell by cell, because a tuple struct of fixed length
+/// fails the whole answer the day the exchange appends a thirteenth cell.
+pub fn kline_row(cells: &[serde_json::Value]) -> Option<Kline> {
+    let num = |i: usize| -> Option<f64> {
+        match cells.get(i)? {
+            serde_json::Value::String(s) => s.parse().ok().filter(|v: &f64| v.is_finite()),
+            serde_json::Value::Number(n) => n.as_f64(),
+            _ => None,
+        }
+    };
+    Some(Kline {
+        open_ms: cells.first()?.as_i64()?,
+        interval: String::new(),
+        open: num(1)?,
+        high: num(2)?,
+        low: num(3)?,
+        close: num(4)?,
+        volume: num(5)?,
+    })
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    /// The frames below are the ones the exchange sent on 01.10, cut short.
+    #[test]
+    fn the_four_stream_shapes_decode() {
+        let agg = r#"{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1790870843144,"a":88157604,"s":"BTCUSDT","p":"84249.3","q":"0.016","f":148352617,"l":148352617,"T":1790870842950,"m":true}}"#;
+        let Envelope {
+            data: StreamData::One(StreamEvent::AggTrade(t)),
+            ..
+        } = serde_json::from_str(agg).unwrap()
+        else {
+            panic!("aggTrade")
+        };
+        assert_eq!(
+            (t.symbol.as_str(), t.price, t.time_ms),
+            ("BTCUSDT", 84249.3, 1790870842950)
+        );
+        assert_eq!(t.signed_qty(), -0.016, "buyer the maker: a sell");
+
+        let depth = r#"{"stream":"btcusdt@depth20@100ms","data":{"e":"depthUpdate","E":1,"T":1,"s":"BTCUSDT","U":1,"u":2,"pu":0,"b":[["84249.3","0.492"],["84248.5","0.083"]],"a":[["84249.4","1.154"]]}}"#;
+        let Envelope {
+            data: StreamData::One(StreamEvent::Depth(d)),
+            ..
+        } = serde_json::from_str(depth).unwrap()
+        else {
+            panic!("depth")
+        };
+        assert_eq!(d.bids.len(), 2);
+        assert_eq!((d.asks[0][0].0, d.asks[0][1].0), (84249.4, 1.154));
+
+        let kline = r#"{"stream":"btcusdt@kline_1m","data":{"e":"kline","E":1,"s":"BTCUSDT","k":{"t":1790870820000,"T":1790870879999,"s":"BTCUSDT","i":"1m","f":1,"L":2,"o":"84259.8","c":"84249.3","h":"84259.8","l":"84242.3","v":"3.502","n":10,"x":false,"q":"295045.4887","V":"2.903","Q":"244579.6424","B":"0"}}}"#;
+        let Envelope {
+            data: StreamData::One(StreamEvent::Kline(k)),
+            ..
+        } = serde_json::from_str(kline).unwrap()
+        else {
+            panic!("kline")
+        };
+        assert_eq!((k.kline.interval.as_str(), k.kline.volume), ("1m", 3.502));
+
+        let arr = r#"{"stream":"!markPrice@arr","data":[{"e":"markPriceUpdate","E":1,"s":"BTCUSDT","p":"84249.30000000","P":"1","i":"1","r":"0.00009554","T":1790899200000},{"e":"somethingNew","s":"X"}]}"#;
+        let Envelope {
+            data: StreamData::Many(rows),
+            ..
+        } = serde_json::from_str(arr).unwrap()
+        else {
+            panic!("arr")
+        };
+        let StreamEvent::MarkPrice(m) = &rows[0] else {
+            panic!("mark")
+        };
+        let p = PremiumIndex::from(m.clone());
+        assert_eq!((p.mark_price, p.last_funding_rate), (84249.3, 0.00009554));
+        assert!(
+            matches!(rows[1], StreamEvent::Other),
+            "an unknown event is not an error"
+        );
+    }
+
+    #[test]
+    fn a_rest_kline_row_reads_its_cells() {
+        let row: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[1661299200000,"21514.0","21899.0","21140.0","21351.0","1073.265",1661385599999,"2.3E7",1,"1","1","0",7]"#,
+        )
+        .unwrap();
+        let k = kline_row(&row).unwrap();
+        assert_eq!(
+            (k.open_ms, k.high, k.volume),
+            (1661299200000, 21899.0, 1073.265)
+        );
+        assert!(kline_row(&row[..3]).is_none(), "a short row is no bar");
+    }
 }

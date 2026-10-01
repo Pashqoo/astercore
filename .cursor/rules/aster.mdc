@@ -34,8 +34,11 @@ Astercore/
   .cursor/rules/          этот слой памяти
   crates/moonproto/       subtree апстрима + наш src/server/
   crates/aster-core/src/
-    aster/                биржа: rest.rs, json.rs (далее ws.rs, sign.rs)
+    aster/                биржа: rest.rs, json.rs, ws.rs (далее sign.rs)
     model.rs              каталог рынков, сайзинг
+    engine.rs             Engine API: Init-хребет, подписки маркет-даты, pump
+    feed.rs               WS-сессии (лента, марки, книги, свечи) и REST-воркер; subs.rs — план чанков
+    trades_stream.rs stream_health.rs load.rs prices.rs strategies.rs key_store.rs
     main.rs
   tools/                  check-vendor.sh, sync-moonproto.sh
 ```
@@ -72,7 +75,7 @@ Astercore/
   wire, а в списке квот терминала (`QUOTES`, приватный массив из 9 имён в
   `moon-core/src/symbol/parse.rs`) `USD1` тоже нет — он не разобрал бы и имя рынка. Спот — отдельное ядро со своим кодом и портом, если понадобится.
 - **Синхронный ввод-вывод, без Tokio.** Поток на стрим и каналы, как в TInvestCore. `ureq` для
-  REST, `tungstenite` для WebSocket (M1). Рантайм был бы единственной асинхронной вещью в
+  REST, `tungstenite` для WebSocket. Рантайм был бы единственной асинхронной вещью в
   процессе.
 - **Не-`TRADING` символы остаются в каталоге.** `SETTLING` — это рынок, где позиция ещё требует
   выхода, а рынок, которого нет в каталоге, терминал не покажет и не закроет. Торговля гейтится
@@ -106,7 +109,7 @@ Astercore/
 
 Только с одобрения. Сейчас: `moonproto`, `log`, `serde`, `serde_json`, `ureq`. `libc` снят
 намеренно — TInvestCore держит его ради graceful stop, которого здесь ещё нет; вернётся с
-обработкой сигналов в M4. В планах: `tungstenite` (M1), подпись (M2 — **v3, EIP-712**: `k256` +
+обработкой сигналов в M4. `tungstenite` (на том же `rustls`/`ring`, что и `ureq`) — с M1. В планах: подпись (M2 — **v3, EIP-712**: `k256` +
 `keccak`, решено 01.10, форма typed data читается по докам в начале M2; `PLAN.md`, «Открытые
 решения» п. 1).
 

@@ -15,7 +15,10 @@ use serde::de::DeserializeOwned;
 use ureq::http::Response;
 use ureq::{Agent, Body};
 
-use super::json::{ApiError, BookTicker, ExchangeInfo, PremiumIndex, ServerTime, Ticker24h};
+use super::json::{
+    kline_row, AggTrade, ApiError, BookTicker, ExchangeInfo, Kline, PremiumIndex, ServerTime,
+    Ticker24h,
+};
 
 pub const BASE: &str = "https://fapi.asterdex.com";
 
@@ -154,9 +157,10 @@ impl Rest {
     /// book of the whole catalog.
     ///
     /// Measured 01.10: 589 rows, `x-mbx-used-weight-1m: 2` right after it — the
-    /// cheapest call the core makes. It is what the price rows of
-    /// `UpdateMarketsList` are built from until M1's `depth20` stream arrives,
-    /// and at that weight it can be re-read on a period without a meter.
+    /// cheapest call the core makes. It is what the bid and ask of
+    /// `UpdateMarketsList` are built from, for the whole catalog — kept over
+    /// the `!bookTicker` stream on purpose (`prices.rs` says why) — and at that
+    /// weight it can be re-read on a period without a meter.
     pub fn book_ticker_all(&mut self) -> Result<Vec<BookTicker>, Error> {
         self.get("/fapi/v1/ticker/bookTicker", &[])
     }
@@ -164,12 +168,68 @@ impl Rest {
     /// `GET /fapi/v1/premiumIndex` for every symbol at once: the funding pair.
     ///
     /// Measured 01.10: 766 rows, 167 KB, 1.0 s. One call covers the catalog,
-    /// which is why the funding fields of `GetMarketsList` can be filled at
-    /// startup instead of waiting for the `markPrice` stream that M1 brings —
-    /// the catalog goes to the terminal once per session, so a field left empty
-    /// here is empty until the terminal reconnects.
+    /// which is why it is read once at startup: the catalog goes to the
+    /// terminal once per session, so its funding fields must be filled before
+    /// the socket binds, not by the first frame of `!markPrice@arr`, which
+    /// carries the same rows every 3 s from then on (`feed.rs`).
     pub fn premium_index_all(&mut self) -> Result<Vec<PremiumIndex>, Error> {
         self.get("/fapi/v1/premiumIndex", &[])
+    }
+
+    /// `GET /fapi/v1/klines`: the newest `limit` bars of `interval`, oldest
+    /// first, BASE volume in each.
+    ///
+    /// Measured 01.10: weight 1 for up to 99 bars, 2 for 499, 10 for 1500 (the
+    /// most one call returns; 2000 is refused with HTTP 400). BTCUSDT's daily
+    /// history reaches back to 2022-08-24.
+    ///
+    /// A row whose cells do not read is dropped, not fatal: one bar lost from a
+    /// chart is better than no chart.
+    pub fn klines(
+        &mut self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> Result<Vec<Kline>, Error> {
+        let limit = limit.to_string();
+        let rows: Vec<Vec<serde_json::Value>> = self.get(
+            "/fapi/v1/klines",
+            &[
+                ("symbol", symbol),
+                ("interval", interval),
+                ("limit", &limit),
+            ],
+        )?;
+        Ok(rows.iter().filter_map(|r| kline_row(r)).collect())
+    }
+
+    /// `GET /fapi/v1/aggTrades`: the newest `limit` aggregate trades, or
+    /// `limit` of them from an id onwards, oldest first either way.
+    ///
+    /// Measured 01.10: weight **20** per call whatever the form, at most 1000
+    /// rows; BTCUSDT's last hour was ~1800 rows. Aggregate ids are consecutive
+    /// per symbol, which is what lets a caller page BACK from the newest page
+    /// (`fromId = oldest - limit`) and so always hold the newest trades first.
+    pub fn agg_trades(
+        &mut self,
+        symbol: &str,
+        from: AggFrom,
+        limit: u32,
+    ) -> Result<Vec<AggTrade>, Error> {
+        let limit = limit.to_string();
+        match from {
+            AggFrom::Latest => self.get(
+                "/fapi/v1/aggTrades",
+                &[("symbol", symbol), ("limit", &limit)],
+            ),
+            AggFrom::Id(id) => {
+                let id = id.to_string();
+                self.get(
+                    "/fapi/v1/aggTrades",
+                    &[("symbol", symbol), ("fromId", &id), ("limit", &limit)],
+                )
+            }
+        }
     }
 
     fn get<T: DeserializeOwned>(&mut self, path: &str, query: &[(&str, &str)]) -> Result<T, Error> {
@@ -252,6 +312,15 @@ impl Default for Rest {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Where an [`Rest::agg_trades`] page starts.
+#[derive(Debug, Clone, Copy)]
+pub enum AggFrom {
+    /// The newest page.
+    Latest,
+    /// From this aggregate id onwards.
+    Id(i64),
 }
 
 /// Milliseconds since the Unix epoch, the unit every Aster timestamp uses.

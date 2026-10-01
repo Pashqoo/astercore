@@ -4,19 +4,24 @@
 //! the catalog mapping work against the real exchange — `clock:`, `limits:`,
 //! `catalog:` and `wire:`, each number of them meant to be read against an
 //! independent parse of `/fapi/v1/exchangeInfo` (`AGENTS.md`, "Канал
-//! наблюдения"). After them it binds the UDP socket and serves: the catalog
-//! goes to the terminal once per session, the prices every couple of seconds.
+//! наблюдения"). After them it opens the market streams (`feed.rs`), binds the
+//! UDP socket and serves: the catalog goes to the terminal once per session,
+//! the prices every couple of seconds, the tape, books and candles live.
 
 use std::process::ExitCode;
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{self, TryRecvError};
+use std::sync::Arc;
 
 use aster_core::aster::rest::Rest;
-use aster_core::engine::{self, CoreHandler};
+use aster_core::engine::{self, CoreHandler, FeedLink};
+use aster_core::feed;
 use aster_core::key_store;
+use aster_core::load::Load;
 use aster_core::model::Catalog;
 use aster_core::prices;
 use aster_core::stderr_log;
 use aster_core::strategies::Strategies;
+use aster_core::stream_health::StreamHealth;
 use moonproto::server::codec::engine as engine_codec;
 use moonproto::server::Server;
 
@@ -175,18 +180,32 @@ fn main() -> ExitCode {
         log::info!("usage: weight-1m {usage}");
     }
 
-    // From here on every call to the exchange is made in the refresher's own
-    // threads, off the UDP loop — the whole reason that module exists
-    // (`prices.rs`). They carry their own clients and their first calls are one
-    // period away, because the three answers above are as fresh as a call made
-    // now would be.
+    // From here on every call to the exchange is made off the UDP loop: the
+    // top-of-book refresher (`prices.rs`) and the market feed (`feed.rs`) each
+    // on their own threads with their own clients. The refresher's first call
+    // is one period away, because the answers above are as fresh as a call made
+    // now would be; the mark stream replaces the startup `premiumIndex` within
+    // its first 3 s frame.
     let feeds = prices::start();
+    // The streams open before the socket binds, so the first terminal to
+    // connect finds the tape already flowing rather than the handshakes still
+    // in flight.
+    let (ev_tx, ev_rx) = mpsc::channel();
+    let mut health = StreamHealth::default();
+    let load = Arc::new(Load::default());
+    let symbols: Vec<String> = cat.symbols().iter().map(|s| s.to_string()).collect();
+    let feed_tx = feed::start(&symbols, ev_tx, &mut health, Arc::clone(&load));
     let handler = CoreHandler::new(
         1,
         engine::ACCOUNT_PLACEHOLDER.to_string(),
         cat,
         Strategies::new(),
-    );
+    )
+    .with_feed(FeedLink {
+        tx: feed_tx,
+        health,
+        load,
+    });
     let mut server = match Server::bind(&key, handler) {
         Ok(s) => s,
         Err(e) => {
@@ -207,30 +226,31 @@ fn main() -> ExitCode {
     // will need saving first (`PLAN.md`, M4).
     loop {
         server.step();
-        // One dead refresher is as bad as both: the prices it fed would never
-        // move again, and nothing else in the process would notice. Checked
-        // before the snapshots, because a panicked feed has nothing left to
-        // send and the loop must not keep serving what it last sent.
+        // A dead refresher would leave its prices frozen, and nothing else in
+        // the process would notice. Checked before the snapshots, because a
+        // panicked refresher has nothing left to send and the loop must not
+        // keep serving what it last sent.
         if let Some(name) = feeds.dead() {
             log::error!("prices: the {name} refresher is gone — its prices would freeze");
             return ExitCode::FAILURE;
         }
-        let (handler, _) = server.split();
+        let (handler, sessions) = server.split();
+        handler.pump(sessions, &ev_rx);
+        if handler.feed_lost() {
+            log::error!("feed: the market feed is gone — the tape and books would freeze");
+            return ExitCode::FAILURE;
+        }
         for _ in 0..APPLY_BATCH {
             match feeds.try_recv() {
                 Ok(snap) => handler.apply(snap),
                 Err(TryRecvError::Empty) => break,
-                // The channel closes only when the LAST sender drops, so this
-                // is the both-gone case and the check above catches the first
-                // one. Kept because the two are different facts and this one is
-                // the end of the exhaustive match, not a case that cannot
-                // happen. Either way the core leaves rather than serving prices
-                // that will never move again, and the exit code is what brings
-                // it back. An outage that leaves the threads alive is the
-                // refresher's own to report, and it clears the prices rather
-                // than freezing them.
+                // The refresher's sender dropped, which the check above
+                // normally sees first. Kept because this is the end of the
+                // exhaustive match, not a case that cannot happen; either way
+                // the core leaves rather than serving prices that will never
+                // move again, and the exit code is what brings it back.
                 Err(TryRecvError::Disconnected) => {
-                    log::error!("prices: both refreshers are gone — prices would freeze");
+                    log::error!("prices: the refresher is gone — prices would freeze");
                     return ExitCode::FAILURE;
                 }
             }

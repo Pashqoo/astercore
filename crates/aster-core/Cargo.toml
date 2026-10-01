@@ -16,6 +16,10 @@ serde_json = "1"
 # the start because a host that cannot reach Aster directly is a deployment
 # question (PLAN.md §10), not a code change.
 ureq = { version = "3", features = ["json", "socks-proxy"] }
+# WebSocket for the market streams, synchronous for the same reason as `ureq`:
+# one thread per stream and no runtime (`PLAN.md`, "Транспорт"). Built on the
+# rustls already in the tree for `ureq`, with the same webpki roots.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 
 # No `libc` yet. TInvestCore carries it so that `systemctl stop` is the same
 # graceful stop as its web page's button — this core has neither a stop path nor

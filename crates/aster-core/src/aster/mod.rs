@@ -1,5 +1,5 @@
-//! The Aster side of the core: REST gateway, wire forms, and (from M1) the
-//! WebSocket streams.
+//! The Aster side of the core: REST gateway, wire forms, and the WebSocket
+//! market streams.
 //!
 //! Aster speaks the Binance USDⓈ-M Futures dialect, which is the dialect
 //! MoonProto itself was shaped around — so unlike TInvestCore's T-Invest
@@ -7,3 +7,4 @@
 
 pub mod json;
 pub mod rest;
+pub mod ws;
