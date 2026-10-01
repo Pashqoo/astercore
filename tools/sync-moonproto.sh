@@ -2,8 +2,8 @@
 # Pull crates/moonproto up to the LATEST upstream moonproto (the trader's
 # decision of 01.10: this core always tracks the newest rev, PLAN.md "Открытые
 # решения" п. 7), or to the rev given as the first argument.
-# The expected conflict is the `pub mod server;` hook in src/lib.rs — and upstream
-# edits src/lib.rs too (6a6c419 touched it), so that file is where to look first.
+# The expected conflict is the `pub mod server;` hook in src/lib.rs — upstream
+# edits that file too, so it is where to look first.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -24,7 +24,7 @@ fi
 echo "syncing $CUR -> $REV"
 # A conflicting pull aborts here under `set -e`, BEFORE MOONPROTO_REV moves, and
 # leaves the tree mid-merge. That is recoverable but not obvious, so the way out
-# is printed rather than remembered: upstream edits src/lib.rs too (6a6c419 did),
+# is printed rather than remembered: upstream edits src/lib.rs too,
 # so the hook is not the only place a conflict can land.
 if ! git subtree pull --prefix crates/moonproto --squash "$UPSTREAM" "$REV" \
        -m "moonproto: sync to $REV"; then

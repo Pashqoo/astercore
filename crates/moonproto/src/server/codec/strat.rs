@@ -499,11 +499,11 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-        let inbound = build_snapshot(2, 5, 7, false, &data, 0);
+        let inbound = build_snapshot(2, 5, 7, false, &data, 0, 0);
         let parsed = parse_snapshot(&inbound[BASE_HEADER_SIZE..]).expect("snapshot");
         assert!(!parsed.full);
         assert_eq!(parsed.data, data);
-        let inbound = build_snapshot(2, 5, 7, true, &data, 13);
+        let inbound = build_snapshot(2, 5, 7, true, &data, 13, 0);
         assert_eq!(
             parse_snapshot(&inbound[BASE_HEADER_SIZE..])
                 .unwrap()

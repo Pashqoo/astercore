@@ -85,12 +85,21 @@ limit 499` в 4 потока (`feed.rs`, `spawn_warmup`): бар **заменя�
 **M1 закрыт наблюдением 01.10:** скриншот трейдера — терминал на живом ядре рисует чарт BTCUSDT,
 фандинг, объёмы окон и **глубокий стакан** (профиль на несколько процентов по обе стороны цены).
 
-**Следующий шаг:**
+**Синк moonproto сделан 01.10:** `2e67562f` → `9fd0490` (upstream HEAD), leak-review дельты —
+CLEAN, `check-vendor.sh` зелёный, loopback и живой пробный клиент на новом rev доходят до `Ready`,
+получают каталог, цены с фандингом и стакан 1000 уровней. Новое на wire: Telegram-панель терминала
+(UI 36–48) — ядро отвечает «встроенного Telegram нет» (`enabled/state_supported=false`); трассы
+отчётов (Order 51/52) — молчим, пока нет отчётов (M2/M4).
 
-1. Синк moonproto на последний rev (решение трейдера, п. 7): `tools/sync-moonproto.sh`, адаптация
-   `src/server/`, `check-vendor.sh` зелёный.
+**Следующий шаг:** M2 — подпись v3 (`aster/sign.rs`), баланс и позиции, ордера.
 
-**Названные долги** (не забытые, записанные): схема стратегий из четырёх полей и список стратегий
+**Названные долги** (не забытые, записанные): с синка 01.10 — серверный разбор `Start`/
+`StartPending` (`server/codec/trade.rs`) не читает новый хвост `StopSettings` (46 байт: стопы
+конкретного ордера) — M2 обязана его читать, иначе ордер со своими стопами откроется без них;
+`parse_snapshot` (`server/codec/strat.rs`) не читает `flags` (`SSF_APPLY_TO_ORDERS`) и `snapshot()`
+их не пишет — M3; `TRepTraceRequest` (Order 51) без ответа — клиент ждёт 15 с и пишет TraceFailed,
+пока отчётов нет, его не шлют — M2/M4; ордерные команды вне `OrderStatusRequest` молча
+игнорируются — M2. схема стратегий из четырёх полей и список стратегий
 без хранения — M3; `profit_state` после `TSettingsRequest` — с отчётами M2/M4; эхо состояния только
 отправителю — M3; `api_meter.rs` с тремя окнами и `Retry-After` — M4; сигналы и коды выхода
 0/70/1 — M4. Подписки ушедшего клиента освобождаются через 60 с тишины (клиент не шлёт
@@ -261,7 +270,7 @@ flowchart LR
 ```
 Astercore/
   Cargo.toml              workspace: crates/moonproto, crates/aster-core
-  MOONPROTO_REV           2e67562f29294228db2996aa818d6cbef4d62e27 — тот же rev, что у TInvestCore
+  MOONPROTO_REV           upstream HEAD (с 01.10 — 9fd0490…); TInvestCore остался на 2e67562f
   crates/moonproto/       git subtree upstream + src/server/ (переносится как есть)
   crates/aster-core/src/
     aster/                НОВОЕ: json.rs, rest.rs (есть; каталог живёт в model.rs, синк часов —
@@ -279,7 +288,8 @@ Astercore/
 `codec/engine.rs` и `mod.rs`, раздел «Находка M0»: `session.rs`, `codec/{trade,strat,market_data,
 engine,report,ui,balance,log}.rs`, `wire.rs`, `key_export.rs`) — это чистый MoonProto, в ней нет
 ни одного байта T-Invest. Переносится **как есть**, вместе с `tools/check-vendor.sh` и
-`sync-moonproto.sh` и тем же `MOONPROTO_REV`: инвариант «от upstream отличаются только
+`sync-moonproto.sh` и тем же на момент переноса `MOONPROTO_REV` (с 01.10 мы на последнем
+upstream, TInvestCore — нет): инвариант «от upstream отличаются только
 `src/server/**` и две строки хука в `lib.rs` (комментарий + `pub mod server;`)» сохраняется в
 обоих репозиториях.
 
@@ -563,8 +573,8 @@ Hedge mode и `positionSide`, управление плечом из страт�
      может не собраться или оказаться устаревшим по wire, а TInvestCore (живое боевое ядро)
      остаётся на старом — и перенос диффом между ядрами ломается.
 
-   Решение трейдера. Пока не решено — **не синкать**: `tools/sync-moonproto.sh` теперь сам
-   прочитает `6a6c4199` из лока терминала и уедет на него.
+   **Сделано 01.10:** синк на `9fd0490` (upstream HEAD), `tools/sync-moonproto.sh` берёт HEAD
+   апстрима, а не лок терминала.
 
 ## Вне объёма (осознанно)
 

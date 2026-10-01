@@ -72,6 +72,8 @@ const LOG: u8 = Command::LogMsg.to_byte();
 const TRADES: u8 = Command::TradesStream.to_byte();
 const TRADES_RESEND: u8 = Command::TradesResendResponse.to_byte();
 const ORDER_BOOK: u8 = Command::OrderBook.to_byte();
+/// The Telegram state this core reports: no built-in Telegram reader.
+const TELEGRAM_UNSUPPORTED: &str = r#"{"enabled":false,"service_online":false,"state_supported":false,"client_state":"unsupported","setup_error":"Astercore has no built-in Telegram reader"}"#;
 /// Feed events applied per UDP-loop pass, so receiving is never starved by a
 /// backlog the feed built up.
 const PUMP_BATCH: usize = 256;
@@ -908,6 +910,18 @@ impl CoreHandler {
                 // open now the second one's button lags — written down because
                 // a known divergence is worth more than a silent one.
                 session.send_encrypted(STRAT, &strat::runtime_state(rand_uid(), start), true);
+            }
+            // The terminal's Telegram panel (moonproto 9fd0490) drives a
+            // MoonBot core's built-in Telegram reader. This core has none, and
+            // says so: every control is answered with a disabled, unsupported
+            // state — silence would leave the panel waiting with no state at
+            // all.
+            ui::CMD_TELEGRAM_REFRESH..=ui::CMD_TELEGRAM_LOGOUT => {
+                session.send_encrypted(
+                    UI,
+                    &ui::telegram_state(rand_uid(), TELEGRAM_UNSUPPORTED),
+                    true,
+                );
             }
             other => log::debug!("UI cmd {other} ignored"),
         }

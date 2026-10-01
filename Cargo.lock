@@ -746,6 +746,8 @@ dependencies = [
  "polling",
  "rand 0.8.8",
  "rusqlite",
+ "serde",
+ "serde_json",
  "sha3",
  "socket2",
  "sysinfo",

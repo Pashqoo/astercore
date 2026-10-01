@@ -518,6 +518,7 @@ mod tests {
             size: 3000.0,
             price: 310.5,
             planned_sell_price: 320.0,
+            stops: None,
         });
         assert_eq!(uid, 0x55);
         assert_eq!(
@@ -540,8 +541,23 @@ mod tests {
             size: 1.0,
             trigger_price: 300.0,
             planned_sell_price: 0.0,
+            stops: None,
         });
         assert!(matches!(cmd, OrderCommand::StartPending(s) if s.price == 300.0 && !s.is_short));
+        // Since upstream 9fd0490 a start may carry its own initial stops as a
+        // 46-byte tail. Not read here yet (orders are M2), but it must not
+        // break the parse of what precedes it.
+        let (_, cmd) = parse_cmd(OrderCommandPayload::Start {
+            market_name: "SBER".into(),
+            is_short: false,
+            use_market_stop: false,
+            strategy_id: 0,
+            size: 1.0,
+            price: 300.0,
+            planned_sell_price: 0.0,
+            stops: Some(crate::commands::trade::StopSettings::disabled()),
+        });
+        assert!(matches!(cmd, OrderCommand::Start(s) if s.price == 300.0 && s.size == 1.0));
         let (_, cmd) = parse_cmd(OrderCommandPayload::TargetBuy {
             order_id: 7,
             price: 1.5,

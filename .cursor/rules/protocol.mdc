@@ -110,6 +110,12 @@ BaseCheck → AuthCheck → GetMarketsList → UpdateMarketsList → StratSchema
   3) на дыру в seq клиент копит пакеты 800 мс и сам шлёт `RequestOrderBookFull(idx u16, kind u8)`
   — ядро отвечает из локальной книги. Снимок, который не удалось взять, — клиенту **пустая**
   полная книга; сессия книги, оборвавшаяся сама, — тоже: иначе терминал рисует последнюю как живую.
+- С moonproto `9fd0490` (01.10): `Start`/`StartPending` (Order) несут необязательный хвост
+  `StopSettings` 46 байт — стопы конкретного ордера; `TStratSnapshot` — хвост `flags u32`
+  (`SSF_APPLY_TO_ORDERS = 1`; у Full после 8 байт `folders_last_modified`, у Partial сразу после
+  data), отсутствует — читается как 0. UI 36 `TTelegramStateCommand` = `len u32 + JSON-объект`
+  (`state::TelegramState`), UI 37–48 — управление Telegram без ответа по протоколу: ядро на каждую
+  отвечает полным состоянием «встроенного Telegram нет». Order 51/52 — трассы отчёта.
 - Свечи: `GetCoinCardCandles(name, kind u8)` → `count i32 + TDeepPrice(open,close,high,low,vol
   f32, time f64)`; `SubscribeCandles(names[], kind u8)` → ok + `TCandleTFStateCommand` (API cmd 4)
   и живые `TCandleUpdateCommand` (API cmd 3, unreliable). Live применяется только поверх

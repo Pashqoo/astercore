@@ -17,6 +17,11 @@ pub const CMD_KERNEL_LICENSE_STATE_REQUEST: u8 = 23;
 const CMD_PROFIT_STATE: u8 = 24;
 pub const CMD_SHARED_CONFIG: u8 = 28;
 pub const CMD_SHARED_CONFIG_REQUEST: u8 = 29;
+const CMD_TELEGRAM_STATE: u8 = 36;
+/// The terminal's Telegram controls: refresh (37) through logout (48). Each is
+/// fire-and-forget; the core answers every one with its full state (36).
+pub const CMD_TELEGRAM_REFRESH: u8 = 37;
+pub const CMD_TELEGRAM_LOGOUT: u8 = 48;
 
 /// `TClientSettings` with every field at its default.
 pub fn default_client_settings(uid: u64) -> Vec<u8> {
@@ -215,10 +220,35 @@ pub fn kernel_license_state(uid: u64, paid: bool) -> Vec<u8> {
     out
 }
 
+/// `TTelegramStateCommand` (CmdId 36): `len u32 + JSON object`, the core's
+/// Telegram service state as `crate::state::TelegramState` reads it. The
+/// client accepts only an object, and a missing optional field means
+/// unavailable, not unchanged.
+pub fn telegram_state(uid: u64, json: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(super::BASE_HEADER_SIZE + 4 + json.len());
+    BaseHeader::write(&mut out, CMD_TELEGRAM_STATE, uid);
+    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    out.extend_from_slice(json.as_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::ui::{build_shared_config_blob, UICommand};
+
+    #[test]
+    fn telegram_state_parses() {
+        let json = r#"{"enabled":false,"service_online":false,"state_supported":false,"setup_error":"none here"}"#;
+        match UICommand::parse(&telegram_state(3, json)) {
+            Some(UICommand::TelegramState(s)) => {
+                assert!(!s.enabled && !s.service_online && !s.state_supported);
+                assert_eq!(s.setup_error.as_deref(), Some("none here"));
+                assert!(s.service.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 
     #[test]
     fn profit_state_parses() {
