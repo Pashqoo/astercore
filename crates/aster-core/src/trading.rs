@@ -574,6 +574,9 @@ mod tests {
             last_price: "84250.1".into(),
             avg_price: "84250.1".into(),
             time_ms: 1568879465651,
+            commission: "0.53".into(),
+            commission_asset: "USDT".into(),
+            trade_id: 7,
         };
         let u = OrderUpdate::from_event(&o, GRID.step).unwrap();
         assert_eq!(

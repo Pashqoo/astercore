@@ -122,7 +122,12 @@ struct Core {
 impl Core {
     fn start() -> Self {
         let mut key = ServerKey::generate(None, 0, TransportMode::V2);
-        let handler = CoreHandler::new(1, ACCOUNT_PLACEHOLDER.into(), catalog(), Strategies::new());
+        let handler = CoreHandler::new(
+            1,
+            ACCOUNT_PLACEHOLDER.into(),
+            catalog(),
+            Strategies::new(None, 0),
+        );
         let mut server = Server::bind(&key, handler).expect("bind");
         key.port = server.local_addr().expect("local_addr").port();
         let stop = Arc::new(AtomicBool::new(false));
@@ -399,7 +404,7 @@ impl FedCore {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let (store, saved) = OrderStore::open(dir.join("orders.json"));
-        let core = Self::start_with(move |h| h.with_trading(tx, store, saved));
+        let core = Self::start_with(move |h| h.with_orders(store, saved).with_trading(tx));
         (core, rx)
     }
 
@@ -408,12 +413,17 @@ impl FedCore {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (ev_tx, ev_rx) = mpsc::channel();
         let handler = setup(
-            CoreHandler::new(1, ACCOUNT_PLACEHOLDER.into(), catalog(), Strategies::new())
-                .with_feed(FeedLink {
-                    tx: cmd_tx,
-                    health: StreamHealth::default(),
-                    load: Arc::new(Load::default()),
-                }),
+            CoreHandler::new(
+                1,
+                ACCOUNT_PLACEHOLDER.into(),
+                catalog(),
+                Strategies::new(None, 0),
+            )
+            .with_feed(FeedLink {
+                tx: cmd_tx,
+                health: StreamHealth::default(),
+                load: Arc::new(Load::default()),
+            }),
         );
         let mut server = Server::bind(&key, handler).expect("bind");
         key.port = server.local_addr().expect("local_addr").port();
@@ -1077,11 +1087,11 @@ fn a_start_with_its_own_stops_keeps_them() {
     let _ = client.disconnect();
 }
 
-/// The terminal's emulator mode on a core without an emulator: the entry is
-/// refused with its reason and nothing reaches the exchange — a paper trade
-/// must never become a real one.
+/// The terminal's emulator mode: the entry is answered by the core's emulator
+/// — it rests as a live order would, under the market — and nothing reaches
+/// the exchange: a paper trade must never become a real one.
 #[test]
-fn an_entry_in_emulator_mode_is_refused_not_sent() {
+fn an_entry_in_emulator_mode_is_answered_by_the_emulator_not_sent() {
     let (core, orders) = FedCore::trading();
     let client = core.connect();
     let mut settings = moonproto::ClientSettingsCommand::default();
@@ -1096,23 +1106,19 @@ fn an_entry_in_emulator_mode_is_refused_not_sent() {
             100.0,
         ))
         .expect("the order request itself is sent");
-    let (mut reason, mut failed) = (None, false);
+    let mut status = None;
     let answered = wait_until(Duration::from_secs(5), || {
         for event in client.drain_events() {
-            match event {
-                Event::ServerLog(log) if log.msg.contains("emulator mode is on") => {
-                    reason = Some(log.msg.clone());
-                }
-                Event::Order(
-                    moonproto::state::OrderEvent::Created(o)
-                    | moonproto::state::OrderEvent::Updated(o),
-                ) if o.status == moonproto::OrderWorkerStatus::BuyFail => failed = true,
-                _ => {}
+            if let Event::Order(
+                moonproto::state::OrderEvent::Created(o) | moonproto::state::OrderEvent::Updated(o),
+            ) = event
+            {
+                status = Some(o.status);
             }
         }
-        reason.is_some() && failed
+        status == Some(moonproto::OrderWorkerStatus::BuySet)
     });
-    assert!(answered, "refusal line {reason:?}, BuyFail {failed}");
+    assert!(answered, "the emulated entry is not resting: {status:?}");
     let call = std::iter::from_fn(|| orders.try_recv().ok())
         .find(|c| matches!(c, TradeCommand::Exchange { .. }));
     assert!(call.is_none(), "an emulated entry reached the order worker");
@@ -1464,5 +1470,128 @@ fn an_entry_refused_for_a_closed_market_closes_it_to_entries() {
         post.is_none(),
         "an entry on a closed market reached the worker"
     );
+    let _ = client.disconnect();
+}
+
+// ----- M3: strategies ----------------------------------------------------------
+
+/// The terminal's own client, to `Ready` with `strategies` as its local list.
+fn connect_with(key: &ServerKey, strategies: Vec<moonproto::StrategySnapshot>) -> MoonClient {
+    let cfg = ClientConfig::new("127.0.0.1", key.port, key.master_key, key.mac_key)
+        .with_transport_mode(key.transport_mode);
+    let init = InitConfig {
+        initial_strategies: Some(InitialStrategies::new(1, strategies)),
+        ..Default::default()
+    };
+    MoonClient::connect_blocking(
+        cfg,
+        ConnectConfig::new(init).with_connect_timeout(Duration::from_secs(20)),
+        Duration::from_secs(30),
+    )
+    .expect("the client must reach Ready against this core")
+}
+
+/// One trade of BTCUSDT on the fed tape.
+fn btc_trade(core: &FedCore, price: f64) {
+    core.ev_tx
+        .send(FeedEvent::Trade {
+            symbol: "BTCUSDT".into(),
+            price,
+            qty: 0.01,
+            time_ms: now_ms(),
+        })
+        .unwrap();
+}
+
+/// M3's first observation, on loopback: a MoonShot strategy the terminal
+/// brings in its list and starts runs in the emulator — its entry rests under
+/// the market, the tape fills it, its exit goes out at `SellPrice` and the
+/// tape fills that too — and not one call reaches the order worker. A
+/// strategy at zero money risk, with no exchange behind it.
+#[test]
+fn an_emulated_moonshot_enters_and_exits_on_the_tape_and_never_reaches_the_exchange() {
+    use moonproto::{FieldValue, OrderWorkerStatus, StrategyFields, StrategyKind};
+    let (core, orders) = FedCore::trading();
+    let mut fields = StrategyFields::new();
+    for (k, v) in [
+        ("StrategyName", FieldValue::String("emu".into())),
+        ("CoinsWhiteList", FieldValue::String("BTCUSDT".into())),
+        ("EmulatorMode", FieldValue::Bool(true)),
+        ("OrderSize", FieldValue::Double(100.0)),
+        ("MShotPrice", FieldValue::Double(0.5)),
+        ("MShotPriceMin", FieldValue::Double(0.3)),
+        ("MShotAdd15minDelta", FieldValue::Double(0.0)),
+        ("MShotAddHourlyDelta", FieldValue::Double(0.0)),
+        ("SellPrice", FieldValue::Double(1.0)),
+        ("PriceDownTimer", FieldValue::Double(0.0)),
+        ("UseStopLoss", FieldValue::Bool(false)),
+    ] {
+        fields.insert(k, v);
+    }
+    let strategy = moonproto::StrategySnapshot::new(
+        11,
+        1,
+        now_ms() as u64,
+        true,
+        StrategyKind::MOON_SHOT,
+        "",
+        fields,
+    );
+    let client = connect_with(&core.key, vec![strategy]);
+    // A price for the market, then the start button.
+    btc_trade(&core, BTC_BID);
+    client.strategies().start().expect("start sent");
+
+    let mut seen: Vec<(OrderWorkerStatus, f64, f64)> = Vec::new();
+    let watch = |seen: &mut Vec<(OrderWorkerStatus, f64, f64)>, want: OrderWorkerStatus| {
+        wait_until(Duration::from_secs(10), || {
+            for event in client.drain_events() {
+                if let Event::Order(
+                    moonproto::state::OrderEvent::Created(o)
+                    | moonproto::state::OrderEvent::Updated(o),
+                ) = event
+                {
+                    seen.push((o.status, o.buy_price, o.sell_price));
+                }
+            }
+            seen.iter().any(|(s, ..)| *s == want)
+        })
+    };
+    assert!(
+        watch(&mut seen, OrderWorkerStatus::BuySet),
+        "no entry from the strategy: {seen:?}"
+    );
+    // The entry rests 0.5 % under the bid.
+    let entry = seen
+        .iter()
+        .find(|(s, ..)| *s == OrderWorkerStatus::BuySet)
+        .map(|(_, b, _)| *b)
+        .unwrap();
+    assert!((entry - BTC_BID * 0.995).abs() < 1.0, "entry at {entry}");
+    // The tape trades through it: filled at its own limit, the exit goes out.
+    btc_trade(&core, entry - 10.0);
+    assert!(
+        watch(&mut seen, OrderWorkerStatus::SellSet),
+        "no exit after the fill: {seen:?}"
+    );
+    let exit = seen
+        .iter()
+        .rev()
+        .find(|(s, ..)| *s == OrderWorkerStatus::SellSet)
+        .map(|(_, _, sp)| *sp)
+        .unwrap();
+    assert!(
+        (exit - entry * 1.01).abs() < 1.0,
+        "exit at {exit} for {entry}"
+    );
+    btc_trade(&core, exit + 10.0);
+    assert!(
+        watch(&mut seen, OrderWorkerStatus::SellDone),
+        "the exit never filled: {seen:?}"
+    );
+
+    let call = std::iter::from_fn(|| orders.try_recv().ok())
+        .find(|c| matches!(c, TradeCommand::Exchange { .. }));
+    assert!(call.is_none(), "an emulated order reached the order worker");
     let _ = client.disconnect();
 }

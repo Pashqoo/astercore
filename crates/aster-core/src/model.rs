@@ -107,6 +107,87 @@ impl Tag {
     }
 }
 
+impl Tag {
+    /// Every tag, in the order the journal and the editor list them.
+    pub const ALL: [Tag; 10] = [
+        Tag::Crypto,
+        Tag::Stock,
+        Tag::Forex,
+        Tag::Commodities,
+        Tag::Etf,
+        Tag::Meme,
+        Tag::Ai,
+        Tag::Top,
+        Tag::Rwa,
+        Tag::PreLaunch,
+    ];
+
+    fn bit(self) -> u16 {
+        1 << (self as u16)
+    }
+}
+
+/// The classes a strategy's screener picks from (MoonBot's `MarketTags`),
+/// ported from TInvestCore over Aster's own taxonomy ([`Tag`]). A market
+/// carries several tags (`DOGEUSDT`: meme and crypto), and it is in the set
+/// when one of its tags is and none of its tags is excluded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MarketTags {
+    include: u16,
+    exclude: u16,
+}
+
+impl MarketTags {
+    /// Choices of the terminal's `MarketTags` combo: one class per item,
+    /// spelled the way [`Self::parse`] expects. A combination or a `!tag`
+    /// exclusion still parses when typed into a strategy file.
+    pub const PICKLIST: &'static str =
+        "crypto|stock|forex|commodities|etf|meme|ai|top|rwa|prelaunch";
+
+    /// MoonBot tag-filter syntax, case-insensitive: `crypto`, `meme, ai` or
+    /// `!stock` (only exclusions start from every class). Empty text is the
+    /// empty set; an unknown tag is the error, so a typo never widens the set.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let (mut include, mut exclude) = (0u16, 0u16);
+        for token in text.split([',', ' ', ';']).filter(|t| !t.is_empty()) {
+            let (negated, name) = match token.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, token),
+            };
+            let Some(tag) = Tag::ALL
+                .iter()
+                .find(|t| t.name().eq_ignore_ascii_case(name))
+            else {
+                return Err(token.to_string());
+            };
+            if negated {
+                exclude |= tag.bit();
+            } else {
+                include |= tag.bit();
+            }
+        }
+        if include == 0 && exclude != 0 {
+            include = Tag::ALL.iter().fold(0, |acc, t| acc | t.bit());
+        }
+        Ok(Self { include, exclude })
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.include & !self.exclude == 0
+    }
+
+    /// A market with these tags is in the set.
+    pub fn matches(self, tags: &[Tag]) -> bool {
+        let bits = tags.iter().fold(0, |acc, t| acc | t.bit());
+        bits & self.include != 0 && bits & self.exclude == 0
+    }
+
+    /// The tag names the parser knows, for log lines.
+    pub fn known() -> String {
+        Tag::ALL.map(Tag::name).join(", ")
+    }
+}
+
 /// One market of the catalog.
 #[derive(Debug, Clone)]
 pub struct Market {
@@ -548,6 +629,54 @@ impl Market {
             None => price,
         }
     }
+
+    /// `price` when it lies inside the band (or the band is unknown), 0 past
+    /// it: a strategy entry beyond the band is not placed — pinned to the edge
+    /// it would sit nearer the market than the strategy asked (TInvestCore,
+    /// by request, 21.09). Exits and manual orders are pinned instead.
+    pub fn inside_limits(&self, price: f64) -> f64 {
+        match self.band() {
+            Some((down, up)) => {
+                let eps = self.tick_size.max(0.0) * 1e-6;
+                if price < down - eps || price > up + eps {
+                    0.0
+                } else {
+                    price
+                }
+            }
+            None => price,
+        }
+    }
+
+    /// Short entries may go out: a perpetual shorts as it longs.
+    pub fn shortable(&self, _now: i64) -> bool {
+        true
+    }
+
+    /// The `PERCENT_PRICE` band set to exactly `down..up`, for tests: a mark
+    /// of 1 with the bounds as multipliers.
+    #[cfg(test)]
+    pub(crate) fn set_limits(&mut self, down: f64, up: f64, _now: i64) {
+        self.mark_price = Some(1.0);
+        self.multiplier_down = down;
+        self.multiplier_up = up;
+    }
+
+    /// The best bid, 0 while unknown (the strategies' convention).
+    pub fn bid_px(&self) -> f64 {
+        self.bid.unwrap_or(0.0)
+    }
+
+    /// The best ask, 0 while unknown.
+    pub fn ask_px(&self) -> f64 {
+        self.ask.unwrap_or(0.0)
+    }
+
+    /// Strategies may act on this market: it is `TRADING` and its prices are
+    /// current. Otherwise entries come off and exits hold.
+    pub fn live(&self) -> bool {
+        self.trading && self.fresh()
+    }
 }
 
 /// `price` at the nearest multiple of `tick` (unchanged for a zero tick).
@@ -926,6 +1055,46 @@ impl Catalog {
             .binary_search_by(|m| m.symbol.as_str().cmp(symbol))
             .ok()
             .map(|i| i as u16)
+    }
+
+    /// [`Catalog::index_of_symbol`] for text an operator typed — a strategy's
+    /// `CoinsWhiteList`/`CoinsBlackList`, the terminal's global black list —
+    /// where the case is nobody's contract. Aster spells every symbol in
+    /// upper case, so the upper-cased spelling is the only other candidate.
+    pub fn index_of_symbol_ci(&self, symbol: &str) -> Option<u16> {
+        self.index_of_symbol(symbol)
+            .or_else(|| self.index_of_symbol(&symbol.to_ascii_uppercase()))
+    }
+
+    /// Whether an inexact spelling is refused because two markets answer to
+    /// it. Never on Aster: no two symbols share an upper case. Kept for the
+    /// screener's log line, which tells «ambiguous» from «unknown».
+    pub fn symbol_is_ambiguous(&self, _symbol: &str) -> bool {
+        false
+    }
+
+    /// The market at `m_index`.
+    pub fn at(&self, idx: u16) -> Option<&Market> {
+        self.markets.get(usize::from(idx))
+    }
+
+    /// Markets with their `m_index`.
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &Market)> {
+        self.markets.iter().enumerate().map(|(i, m)| (i as u16, m))
+    }
+
+    pub fn len(&self) -> usize {
+        self.markets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.markets.is_empty()
+    }
+
+    /// The market at `m_index`, for tests that set prices on it.
+    #[cfg(test)]
+    pub(crate) fn at_mut(&mut self, idx: u16) -> Option<&mut Market> {
+        self.markets.get_mut(usize::from(idx))
     }
 
     /// The price rows of `UpdateMarketsList`, in `m_index` order: one row per
@@ -1318,6 +1487,78 @@ fn tags_of(s: &SymbolInfo) -> Vec<Tag> {
     tags
 }
 
+/// Markets for the tests of the ported strategy modules.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::{Catalog, Market, Tag};
+
+    /// A market with no prices, no band and the given grid.
+    pub(crate) fn market(symbol: &str, base: &str, tick: f64, step: f64) -> Market {
+        Market {
+            symbol: symbol.into(),
+            base: base.into(),
+            quote: "USDT".into(),
+            long_name: String::new(),
+            price_precision: super::decimals_of(tick),
+            quantity_precision: super::decimals_of(step),
+            tick_size: tick,
+            step_size: step,
+            min_qty: step,
+            max_qty: 1_000_000.0,
+            market_max_qty: 1_000_000.0,
+            min_notional: 5.0,
+            min_price: tick,
+            max_price: 1_000_000.0,
+            multiplier_up: 0.0,
+            multiplier_down: 0.0,
+            max_num_orders: 200,
+            max_num_algo_orders: 10,
+            trigger_protect: 0.02,
+            market_take_bound: 0.02,
+            maint_margin_percent: 2.5,
+            required_margin_percent: 5.0,
+            liquidation_fee: 0.025,
+            trading: true,
+            has_sessions: false,
+            delivery_ms: None,
+            tags: vec![Tag::Crypto],
+            quote_volume_24h: None,
+            last_price: None,
+            bid: None,
+            ask: None,
+            mark_price: None,
+            funding: None,
+            feed_fresh: true,
+        }
+    }
+
+    /// `BTCUSDT` at index 0 and the given `(symbol, base, tick, step)`
+    /// markets after it; the symbols must sort after `BTCUSDT` and in the
+    /// order given, or the indexes the caller counts on move.
+    pub(crate) fn sber_catalog_of(rest: &[(&str, &str, f64, f64)]) -> Catalog {
+        let mut btc = market("BTCUSDT", "BTC", 0.1, 0.001);
+        btc.tags = vec![Tag::Top, Tag::Crypto];
+        let mut markets = vec![btc];
+        markets.extend(rest.iter().map(|&(s, b, t, st)| market(s, b, t, st)));
+        let c = Catalog::of(markets);
+        debug_assert!(rest
+            .iter()
+            .enumerate()
+            .all(|(i, (s, ..))| c.index_of_symbol(s) == Some(i as u16 + 1)));
+        c
+    }
+
+    /// TInvestCore's two-market test model on Aster's catalog: `BTCUSDT` at
+    /// index 0 (where TInvestCore had its service market; here it is the
+    /// delta reference) and its SBER fixture at index 1 — keyed `u-sber`, so
+    /// it sorts after `BTCUSDT`, with a lot of 10 and a tick of 0.01.
+    pub(crate) fn sber_catalog() -> Catalog {
+        let mut btc = market("BTCUSDT", "BTC", 0.1, 0.001);
+        btc.tags = vec![Tag::Top, Tag::Crypto];
+        Catalog::of(vec![btc, market("u-sber", "SBER", 0.01, 10.0)])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1359,6 +1600,25 @@ mod tests {
             mark_price: None,
             funding: None,
             feed_fresh: true,
+        }
+    }
+
+    /// MoonBot's tag filter over Aster's taxonomy: a market is in when one of
+    /// its tags is and none is excluded; only exclusions start from all; an
+    /// unknown tag is an error, never a wider set.
+    #[test]
+    fn market_tags_include_any_and_exclude_any() {
+        let doge = [Tag::Meme, Tag::Crypto];
+        let nvda = [Tag::Stock];
+        let t = |s: &str| MarketTags::parse(s).unwrap();
+        assert!(t("crypto").matches(&doge) && !t("crypto").matches(&nvda));
+        assert!(t("Meme, STOCK").matches(&doge) && t("meme;stock").matches(&nvda));
+        assert!(!t("crypto, !meme").matches(&doge), "an excluded tag wins");
+        assert!(t("!meme").matches(&nvda) && !t("!meme").matches(&doge));
+        assert!(t("").is_empty() && !t("").matches(&doge));
+        assert_eq!(MarketTags::parse("crypto, fx"), Err("fx".to_string()));
+        for name in MarketTags::PICKLIST.split('|') {
+            assert!(MarketTags::parse(name).is_ok(), "{name}");
         }
     }
 

@@ -758,6 +758,14 @@ pub struct OrderEvent {
     /// Transaction time, ms.
     #[serde(default, rename = "T")]
     pub time_ms: i64,
+    /// Commission of this execution (a `TRADE` event), its asset, and the
+    /// execution's trade id.
+    #[serde(default, rename = "n")]
+    pub commission: String,
+    #[serde(default, rename = "N")]
+    pub commission_asset: String,
+    #[serde(default, rename = "t")]
+    pub trade_id: i64,
 }
 
 /// One row of `GET /fapi/v1/klines`: a 12-cell array of mixed numbers and

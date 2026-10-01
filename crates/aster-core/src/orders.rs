@@ -19,17 +19,7 @@ use moonproto::server::codec::trade::{status, LegState, OrderRecord, StartOrder}
 use serde::{Deserialize, Serialize};
 
 use crate::model::{round_tick, Catalog, Market, OrderKind};
-
-/// Who closed the position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitSource {
-    /// The core's own exit order.
-    Core,
-    /// A foreign exchange order (the exchange's own app) taken as the exit.
-    Foreign,
-    /// The position left the account without an order the core saw.
-    Outside,
-}
+use crate::reports::ExitSource;
 
 /// A filled exchange order to ask `GetOrderState` about: `id` is the broker
 /// id, or our idempotency key when `by_request`.
@@ -1765,8 +1755,8 @@ impl Orders {
     /// `ClosePosition`: every open entry on the market goes into panic exit
     /// (one limit through the book, see `panic_exit`), each for its own lots.
     /// Units on the account without a core order are a hold (`adopt`) and
-    /// are never sold. `emulator`: the terminal's mode — the emulator closes
-    /// its own orders only.
+    /// are never sold. `emulator`: the mode the core trades in (the terminal's
+    /// emulator mode, or no account) — the emulator closes its own orders only.
     /// `side`: only the long (`false`) or short (`true`) orders; `at_market`:
     /// the exits go at market instead of a limit at the panic spread.
     pub fn close_position(
@@ -2127,6 +2117,15 @@ impl Orders {
         self.at_market(id);
         fx.extend(self.panic_exit(id, m, now_ms));
         fx
+    }
+
+    /// A strategy's fired stop (`moonshot::Cmd::Move` with `market`): the exit goes
+    /// at MARKET — a limit through the book when emulated — and `watch`
+    /// follows it as a panic exit from here on.
+    pub fn stop_out(&mut self, id: u64, code: u8, m: &Market, now_ms: i64) -> Effects {
+        self.set_sell_reason(id, code);
+        self.at_market(id);
+        self.panic_exit(id, m, now_ms)
     }
 
     /// The exit of `id` goes at market — unless the order is emulated.

@@ -26,6 +26,7 @@ use aster_core::load::Load;
 use aster_core::model::{Catalog, QUOTE};
 use aster_core::order_store::OrderStore;
 use aster_core::prices;
+use aster_core::reports::Reports;
 use aster_core::stderr_log;
 use aster_core::strategies::Strategies;
 use aster_core::stream_health::StreamHealth;
@@ -46,6 +47,14 @@ const API_KEY_FILE: &str = "asterkey";
 /// The order store (`order_store.rs`), in the working directory, as
 /// TInvestCore keeps it.
 const ORDERS_FILE: &str = "data/orders.json";
+/// A core without an account keeps its (emulated) orders apart: the real ones
+/// of a keyed run must not be restored where nothing can work them and
+/// refused as «trading is off».
+const EMULATOR_ORDERS_FILE: &str = "data/orders-emulator.json";
+/// The strategy list as MoonBot text (`strategy_file.rs`) and the trade
+/// reports (`reports.rs`), beside it.
+const STRATEGIES_FILE: &str = "data/strategies.txt";
+const REPORTS_FILE: &str = "data/reports.jsonl";
 
 fn main() -> ExitCode {
     stderr_log::init();
@@ -312,12 +321,23 @@ fn main() -> ExitCode {
             (m.symbol.clone(), grid)
         })
         .collect();
-    let mut handler = CoreHandler::new(
+    let now = engine::now_ms();
+    let handler = CoreHandler::new(
         1,
         engine::ACCOUNT_PLACEHOLDER.to_string(),
         cat,
-        Strategies::new(),
-    );
+        Strategies::new(Some(PathBuf::from(STRATEGIES_FILE)), now),
+    )
+    .with_reports(Reports::open(Some(PathBuf::from(REPORTS_FILE)), now));
+    // The order store with or without an account: a core without one runs
+    // its strategies in the emulator, and a restart must resume them.
+    let orders_file = if account.is_some() {
+        ORDERS_FILE
+    } else {
+        EMULATOR_ORDERS_FILE
+    };
+    let (store, saved) = OrderStore::open(PathBuf::from(orders_file));
+    let mut handler = handler.with_orders(store, saved);
     if let Some((account_rest, signer, first)) = account {
         // The order worker signs with a clone of the account's signer: one
         // wallet, one nonce sequence (`Signer`). Its own client, on the same
@@ -325,7 +345,6 @@ fn main() -> ExitCode {
         let mut orders_rest = Rest::on(signer.network());
         orders_rest.set_clock_delta_ms(account_rest.clock_delta_ms());
         let trading = trading::start(orders_rest, signer.clone(), grids, ev_tx.clone());
-        let (store, saved) = OrderStore::open(PathBuf::from(ORDERS_FILE));
         account::start(
             account_rest,
             signer,
@@ -333,9 +352,7 @@ fn main() -> ExitCode {
             first.clone(),
             ev_tx.clone(),
         );
-        handler = handler
-            .with_account(first)
-            .with_trading(trading, store, saved);
+        handler = handler.with_account(first).with_trading(trading);
     }
     let feed_tx = feed::start(&symbols, ev_tx, &mut health, Arc::clone(&load));
     let handler = handler.with_feed(FeedLink {

@@ -4,7 +4,7 @@
 //! `load:` line beside the `streams:` summary, per period; rendering zeroes
 //! the counters, so a line reads as a rate.
 //!
-//! Ported from TInvestCore, trimmed: no strategy passes or pools (M3) and no
+//! Ported from TInvestCore, trimmed: no strategy passes or pools and no
 //! trading-status streams (Aster has none — status rides `exchangeInfo`).
 
 use std::sync::atomic::{AtomicU64, Ordering};

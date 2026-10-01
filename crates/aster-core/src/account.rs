@@ -471,6 +471,7 @@ fn user_stream(network: Network, slot: Arc<Slot>, wake: Sender<Wake>, feed: Send
                     )
                 });
                 slot.lock().take();
+                let _ = feed.send(FeedEvent::UserStreamClosed);
                 if wake.send(Wake::Ended).is_err() {
                     return;
                 }

@@ -172,6 +172,9 @@ pub enum FeedEvent {
     UserOrder(crate::aster::json::OrderEvent),
     /// A session of the user-data stream is opening.
     UserStreamOpen,
+    /// That session ended: until the next one opens, a fill would be seen
+    /// only by the next read of the account.
+    UserStreamClosed,
     /// A feed thread the core cannot do without has died (by panicking): the
     /// engine latches it and `main` leaves (`CoreHandler::feed_lost`).
     Lost(&'static str),

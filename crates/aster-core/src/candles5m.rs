@@ -10,9 +10,9 @@
 //!
 //! Seeded from `klines 5m` at startup (`feed.rs`, the warm-up) and kept from
 //! the `aggTrade` tape after it. TInvestCore derived the same answer from its
-//! minute windows (`windows.rs`, 24 hours deep); those arrive here with the
-//! strategies (M3), and a day of minutes would not reach the 41 hours the
-//! client keeps anyway.
+//! minute windows (`windows.rs`, 24 hours deep); those serve the strategies
+//! here, and a day of minutes would not reach the 41 hours the client keeps
+//! anyway.
 
 use std::collections::VecDeque;
 

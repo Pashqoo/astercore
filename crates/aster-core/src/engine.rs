@@ -12,13 +12,13 @@
 //! Adapted from TInvestCore's `engine.rs`, which is the same spine over 6000
 //! lines of trading on top. Market data (M1) is here: the tape, the books and
 //! the candles the terminal subscribes to, fed from `feed.rs`; so is manual
-//! trading (M2). What is NOT here is deliberate, not forgotten: strategies and
-//! the emulator (M3), reports (M4). Every Engine API
-//! method outside what is implemented answers with a refusal naming itself,
-//! which is how the terminal shows a missing feature instead of waiting out a
-//! timeout.
+//! trading (M2), and the strategies with their emulator and trade reports
+//! (M3): one pass a second (`run_shots`), whose commands go through `Orders`
+//! as the terminal's do. Every Engine API method outside what is implemented
+//! answers with a refusal naming itself, which is how the terminal shows a
+//! missing feature instead of waiting out a timeout.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,23 +27,30 @@ use moonproto::server::codec::engine::{self, EngineMethod, EngineRequest, Server
 use moonproto::server::codec::log::log_msg;
 use moonproto::server::codec::market_data::{self, DeepHistoryKind, BOOK_KIND_FUTURES};
 use moonproto::server::codec::trade::{InitialStops, OrderCommand, StartOrder};
-use moonproto::server::codec::{balance, strat, trade, ui, BaseHeader, BASE_HEADER_SIZE};
+use moonproto::server::codec::{balance, report, strat, trade, ui, BaseHeader, BASE_HEADER_SIZE};
 use moonproto::server::{Command, Handler, Session};
+use moonproto::StrategyKind;
 
 use crate::account::Account;
 use crate::aster::ws::Stamp;
+use crate::autostop;
 use crate::book::{LocalBook, Out};
 use crate::candles5m::Candles5m;
+use crate::emulator::{self, Emulator};
 use crate::feed::{FeedCommand, FeedEvent};
+use crate::guards;
 use crate::load::Load;
 use crate::model::{Catalog, QUOTE, QUOTE_CODE};
+use crate::moonshot::{self, Cmd, MoonShot, Params, WorkWindow, BTC_SYMBOL};
 use crate::order_store::{self, OrderStore};
-use crate::orders::{Action, Effects, Leg, Orders, Resting};
+use crate::orders::{Action, CoreOrder, Effects, Leg, Orders, Resting};
 use crate::prices::Snapshot;
+use crate::reports::{self, Deal, Profit, Reports};
 use crate::strategies::Strategies;
 use crate::stream_health::{Scope, StreamHealth, SUMMARY_EVERY_MS};
 use crate::trades_stream::TradesStream;
 use crate::trading::{Grid, OrderUpdate, TradeCommand, TradingEvent};
+use crate::windows::Windows;
 
 pub const SERVER_NAME: &str = "Astercore";
 pub const EXCHANGE_NAME: &str = "Aster";
@@ -91,6 +98,22 @@ const TELEGRAM_UNSUPPORTED: &str = r#"{"enabled":false,"service_online":false,"s
 const PUMP_BATCH: usize = 256;
 /// How often stream liveness is judged.
 const HEALTH_EVERY_MS: i64 = 1_000;
+/// The strategy pass runs this often, and at once after an order report or a
+/// trade that extends a strike (TInvestCore's period).
+const SHOTS_PERIOD_MS: i64 = 1_000;
+/// The markets' mean hourly delta (`moonshot::market_delta`) is a sweep of
+/// the whole catalog: taken this often, not on every pass.
+const MARKET_DELTA_EVERY_MS: i64 = 10_000;
+/// The report's profit counters are broadcast at most this often.
+const PROFIT_PERIOD_MS: i64 = 60_000;
+/// Exchange orders whose commission is kept at most (`note_commission`).
+const COMMISSIONS_KEPT: usize = 20_000;
+/// Emulator rounds per pass: an answer can bring more work (a fill places
+/// the exit), and that work is answered in the same pass.
+const EMU_ROUNDS: usize = 8;
+/// After an order turns terminal, the whole snapshot is broadcast this much
+/// later (the terminal drops a finished order only from a snapshot).
+const ORDERS_REFRESH_MS: i64 = 1_000;
 
 /// A book the terminal shows, kept from the diff stream (`book.rs`), and the
 /// seq of the last packet sent for it: what `RequestOrderBookFull` answers.
@@ -201,7 +224,57 @@ pub struct CoreHandler {
     /// Markets the exchange takes no new positions on (`-4140`/`-4141` on an
     /// entry), for this run: an entry there is refused by the core.
     closed_markets: HashSet<String>,
+    /// The strategy engine, its tick windows and the time of its last pass;
+    /// `shots_due` runs the next one at once.
+    shots: MoonShot,
+    windows: Windows,
+    shots_at: i64,
+    shots_due: bool,
+    /// The markets' mean hourly delta and when it was taken.
+    market_delta: (Option<f64>, i64),
+    /// When the core started: warm-up bars that end before it seed the
+    /// windows, the live tape covers the rest.
+    started_at: i64,
+    /// The exchange of emulated orders, their work of this pass and the
+    /// markets they rest on.
+    emulator: Emulator,
+    emu_actions: Vec<Action>,
+    emu_markets: HashSet<String>,
+    /// Trade reports and the profit counters last broadcast.
+    reports: Reports,
+    profit: Profit,
+    profit_at: i64,
+    /// When to broadcast the orders snapshot after an order turned terminal.
+    orders_refresh_at: i64,
+    /// Strategy loss guards (`TotalLoss`, Sessions), the rules each strategy
+    /// counts under, and the `PenaltyTime` marks of the report.
+    guards: guards::Guards,
+    guard_rules: Option<Arc<GuardRules>>,
+    #[allow(clippy::type_complexity)]
+    penalty_marks: Option<(HashMap<(u64, String), i64>, HashMap<(String, bool), i64>)>,
+    /// The terminal's auto-start rules, the start of the loss counter (Unix
+    /// s), and the state of the market panic and the circuit breakers.
+    auto_stop: autostop::Rules,
+    loss_since: i64,
+    market_stopped: bool,
+    market_latched: bool,
+    circuit_stopped: Option<(&'static str, Option<i64>)>,
+    /// API errors of the last minute (the error circuit breaker).
+    api_errors: VecDeque<i64>,
+    /// The terminal's global black list: permanent symbols and temporary ones
+    /// with their end (ms).
+    black_list: (HashSet<String>, Vec<(String, i64)>),
+    /// When the terminal sent the current `client_settings` (ms).
+    settings_at: i64,
+    /// Commission per exchange order (symbol, order id — ids are the
+    /// symbol's), USDT, summed from the user stream's trade events (`n`), for
+    /// the report; with the trade ids already summed, so an event heard twice
+    /// is counted once.
+    commissions: HashMap<(String, String), (f64, HashSet<i64>)>,
 }
+
+/// Per strategy: trades in the emulator, and its Sessions rule.
+type GuardRules = HashMap<u64, (bool, Option<guards::SessionRule>)>;
 
 impl CoreHandler {
     pub fn new(bot_id: i64, account_id: String, catalog: Catalog, strategies: Strategies) -> Self {
@@ -234,7 +307,9 @@ impl CoreHandler {
             health_at: 0,
             load_at: Stamp::now(),
             feed_lost: false,
-            orders: Orders::new(),
+            // Ids from the start time, so a restart never reuses one (the
+            // report keys its rows by them).
+            orders: Orders::starting_at(now_ms() as u64),
             trading: None,
             order_store: None,
             pending_actions: Vec::new(),
@@ -246,7 +321,40 @@ impl CoreHandler {
             shutdown_requested: false,
             worker_lost: false,
             closed_markets: HashSet::new(),
+            shots: MoonShot::default(),
+            windows: Windows::default(),
+            shots_at: 0,
+            shots_due: false,
+            market_delta: (None, 0),
+            started_at: now_ms(),
+            emulator: Emulator::starting_at(now_ms()),
+            emu_actions: Vec::new(),
+            emu_markets: HashSet::new(),
+            reports: Reports::open(None, now_ms()),
+            profit: Profit::default(),
+            profit_at: 0,
+            orders_refresh_at: 0,
+            guards: guards::Guards::default(),
+            guard_rules: None,
+            penalty_marks: None,
+            auto_stop: autostop::Rules::default(),
+            loss_since: 0,
+            market_stopped: false,
+            market_latched: false,
+            circuit_stopped: None,
+            api_errors: VecDeque::new(),
+            black_list: (HashSet::new(), Vec::new()),
+            settings_at: 0,
+            commissions: HashMap::new(),
         }
+    }
+
+    /// Keep trade reports in `reports` (in memory only without it).
+    pub fn with_reports(mut self, reports: Reports) -> Self {
+        self.profit = reports.profit(now_ms());
+        self.reports = reports;
+        self.replay_guards();
+        self
     }
 
     /// Start from the account `main` read at startup, so the first terminal
@@ -256,16 +364,12 @@ impl CoreHandler {
         self
     }
 
-    /// Trade on the account: the order worker (`trading::start`) and the order
-    /// store, with the orders the previous run left there.
-    pub fn with_trading(
-        mut self,
-        tx: Sender<TradeCommand>,
-        store: OrderStore,
-        saved: order_store::Saved,
-    ) -> Self {
-        // Ids above every restored one, so a new order never takes an old id.
-        self.orders = Orders::starting_at(now_ms() as u64);
+    /// Keep the orders and the run state in `store`, resuming what the
+    /// previous run left there: its orders, the terminal's settings, the
+    /// strategies' running flag and the auto-stop state. A core without an
+    /// account keeps them too — its strategies run in the emulator, and a
+    /// restart must not forget them.
+    pub fn with_orders(mut self, store: OrderStore, saved: order_store::Saved) -> Self {
         let restored = self.orders.restore(saved.orders);
         self.orders.restore_left(saved.left);
         let (refreshed, missing) = self.orders.respec(|uid| self.catalog.get(uid));
@@ -274,15 +378,49 @@ impl CoreHandler {
                 "orders: {restored} restored, {refreshed} on today's catalog, {missing} on a market it lacks"
             );
         }
+        let now = now_ms();
+        self.shots.restore(&self.orders, now);
+        self.emu_markets = self.orders.emu_markets();
         if !saved.client_settings.is_empty() {
-            self.client_settings = saved.client_settings;
-            self.read_manual_defaults();
+            let at = if saved.settings_at > 0 {
+                saved.settings_at
+            } else {
+                now
+            };
+            self.set_client_settings(saved.client_settings, at);
         }
+        self.loss_since = saved.loss_since;
+        self.market_stopped = saved.market_stopped;
+        // The crash that stopped them already panicked.
+        self.market_latched = saved.market_stopped;
+        if saved.running {
+            self.strategies.set_running(true);
+        }
+        log::info!(
+            "strategies {} after the restart ({} listed)",
+            if saved.running { "running" } else { "stopped" },
+            self.strategies.list().len()
+        );
+        // The restored emulator mode decides which deals the sessions count.
+        self.replay_guards();
+        self.order_store = Some(store);
+        self
+    }
+
+    /// Trade on the account through the order worker (`trading::start`).
+    pub fn with_trading(mut self, tx: Sender<TradeCommand>) -> Self {
         // What the exchange holds now: the restored orders are read against
         // it before any terminal acts on them.
         let _ = tx.send(TradeCommand::OpenOrders);
         self.trading = Some(tx);
-        self.order_store = Some(store);
+        // No fill is seen until the user-data stream opens: real entries wait
+        // for it (`FeedEvent::UserStreamOpen`).
+        self.shots.set_fills_seen(false);
+        // With an account a strategy trades for real unless it says
+        // otherwise: the rules cached while there was none called every
+        // strategy emulated.
+        self.shots.set_emulator(self.emu_mode());
+        self.replay_guards();
         self
     }
 
@@ -456,6 +594,11 @@ impl CoreHandler {
             let fx = self.orders.watch(&self.catalog, now);
             self.effects(fx, now);
         }
+        // Not while stopping: an entry placed now would be one more to
+        // withdraw. `start_order` is the terminal's door, shut by the same flag.
+        if !self.stopping && (self.shots_due || now - self.shots_at >= SHOTS_PERIOD_MS) {
+            self.run_shots(now);
+        }
         if self.open_orders_due.is_some_and(|due| now >= due) {
             self.open_orders_due = None;
             if let Some(tx) = &self.trading {
@@ -463,7 +606,16 @@ impl CoreHandler {
             }
         }
         self.flush_actions(now);
+        self.run_emulator(now);
         self.persist_orders(false, now);
+        if now - self.profit_at >= PROFIT_PERIOD_MS {
+            self.push_profit(now);
+        }
+        if self.orders_refresh_at != 0 && now >= self.orders_refresh_at {
+            self.orders_refresh_at = 0;
+            let snapshot = trade::orders_snapshot(0, &self.orders.records(now));
+            self.outbox.push((ORDER, snapshot));
+        }
         for (channel, payload) in std::mem::take(&mut self.outbox) {
             for s in sessions.iter_mut() {
                 s.send_encrypted(channel, &payload, true);
@@ -528,6 +680,15 @@ impl CoreHandler {
                     self.trades.push(idx, time_ms, price as f32, qty as f32);
                     self.candles.push(idx, time_ms, price, qty);
                     self.catalog.set_last(&symbol, price);
+                    self.windows.push(idx, time_ms, price, qty);
+                    let turnover = price * qty.abs();
+                    if self
+                        .shots
+                        .on_trade(idx, now_ms(), price, turnover, qty > 0.0)
+                    {
+                        self.shots_due = true;
+                    }
+                    self.emulate_fills(&symbol, Some(price));
                 }
             }
             FeedEvent::Warmup { symbol, bars } => {
@@ -536,6 +697,7 @@ impl CoreHandler {
                         self.candles
                             .seed(idx, b.open_ms, b.low, b.high, b.quote_volume);
                     }
+                    self.seed_windows(idx, &bars);
                 }
             }
             FeedEvent::WarmupDone => {
@@ -649,6 +811,7 @@ impl CoreHandler {
             }
             FeedEvent::Trading(ev) => self.on_trading(ev),
             FeedEvent::UserOrder(o) => {
+                self.note_commission(&o);
                 let step = self.catalog.get(&o.symbol).map_or(0.0, |m| m.step_size);
                 match OrderUpdate::from_event(&o, step) {
                     Some(u) => self.on_trading(TradingEvent::Order(u)),
@@ -660,7 +823,9 @@ impl CoreHandler {
             // measured 0.83 s: a read made before it leaves a window that
             // neither the read nor the stream covers. Retries in between fold
             // into the one read.
+            FeedEvent::UserStreamClosed => self.shots.set_fills_seen(false),
             FeedEvent::UserStreamOpen => {
+                self.shots.set_fills_seen(true);
                 if self.open_orders_due.is_none() {
                     self.open_orders_due = Some(now_ms() + OPEN_ORDERS_AFTER_MS);
                 }
@@ -674,6 +839,9 @@ impl CoreHandler {
                     let fx = self.orders.reconcile(&Self::held(a), &self.catalog, now);
                     self.effects(fx, now);
                 }
+                // A fresh read resets the free-money budget of the entries.
+                self.shots
+                    .set_free_balance(account.as_ref().map(|a| a.free));
                 self.account = account;
                 let payload = self.balance_payload(rand_uid());
                 for s in sessions.iter_mut() {
@@ -778,6 +946,10 @@ impl CoreHandler {
         match snap {
             Snapshot::Book(rows) => {
                 let quoted = self.catalog.apply_book(&rows);
+                // The book moved: emulated orders it reached fill.
+                for symbol in self.emu_markets.clone() {
+                    self.emulate_fills(&symbol, None);
+                }
                 // A market that stops being quoted goes into the price rows as
                 // a zero, and the terminal then shows nothing for it — that is
                 // a fact about the venue, so it is said out loud when the count
@@ -1001,8 +1173,7 @@ impl CoreHandler {
         };
         match hdr.cmd_id {
             ui::CMD_CLIENT_SETTINGS => {
-                self.client_settings = payload.to_vec();
-                self.read_manual_defaults();
+                self.set_client_settings(payload.to_vec(), now_ms());
                 session.send_encrypted(UI, &ui::with_uid(payload, rand_uid()), true);
             }
             // MoonBot's guarded shutdown: refused while the core holds a
@@ -1023,13 +1194,11 @@ impl CoreHandler {
                 session.send_encrypted(LOG, &log_msg(now_ms(), &text), true);
             }
             ui::CMD_SETTINGS_REQUEST => {
+                self.refresh_temp_black_list(now_ms());
                 let resp = ui::with_uid(&self.client_settings, hdr.uid);
                 session.send_encrypted(UI, &resp, true);
-                // TInvestCore follows this echo with `profit_state`, the deal
-                // counters shown beside the auto-stop caps. Deliberately not
-                // sent here: this core has no deals and no report store (M2),
-                // and a zeroed counter is a claim about trading that has not
-                // happened. It arrives with the reports.
+                // Post-init: the client applies the counters only after Ready.
+                session.send_encrypted(UI, &profit_state(&self.profit), true);
             }
             ui::CMD_SHARED_CONFIG => {
                 if let Some(blob) = ui::shared_config_blob(payload) {
@@ -1050,42 +1219,12 @@ impl CoreHandler {
                 let Some((start, items)) = ui::parse_strat_start_stop(hdr.cmd_id, body) else {
                     return;
                 };
-                self.strategies.set_running(start);
-                // The per-strategy checkboxes that rode the command. Nothing
-                // here can honour them — there is no strategy list to check off
-                // and nothing to run (M3) — so they are named in the journal
-                // rather than dropped in silence.
                 if !items.is_empty() {
-                    log::info!(
-                        "start/stop carried {} checked flag(s); no strategy list \
-                         to apply them to yet (M3)",
-                        items.len()
-                    );
+                    self.checked(session, &items);
                 }
-                // The button must not quietly lie. The core keeps the flag
-                // because the terminal's own button follows it, and says in the
-                // terminal's log what the flag does and does not mean while the
-                // strategy engines are not ported.
-                if start {
-                    log::warn!("start requested: no strategy engine yet (M3), nothing is entered");
-                    session.send_encrypted(
-                        LOG,
-                        &log_msg(
-                            now_ms(),
-                            "Astercore M0: strategies are not implemented yet \
-                             — nothing will be entered",
-                        ),
-                        true,
-                    );
-                }
-                // To the sender, which at M0 is the only client there is to
-                // tell. TInvestCore broadcasts this through an outbox every
-                // session drains, so a second terminal's button follows the
-                // first one's; that plumbing arrives with the state worth
-                // converging on (the strategy list, M3). With two terminals
-                // open now the second one's button lags — written down because
-                // a known divergence is worth more than a silent one.
-                session.send_encrypted(STRAT, &strat::runtime_state(rand_uid(), start), true);
+                // A start or stop by hand is the trader's: «Restart if» and
+                // the circuit breakers' restarts no longer apply.
+                self.set_strategies(start);
             }
             // The terminal's Telegram panel (moonproto 9fd0490) drives a
             // MoonBot core's built-in Telegram reader. This core has none, and
@@ -1103,11 +1242,14 @@ impl CoreHandler {
         }
     }
 
+    /// Strategy list sync: the terminal owns edits, the core keeps the list,
+    /// echoes accepted revisions (or its newer copy) to every session.
     fn on_strat(&mut self, session: &mut Session, payload: &[u8]) {
         let Some(hdr) = BaseHeader::parse(payload) else {
             return;
         };
         let body = &payload[BASE_HEADER_SIZE..];
+        let now = now_ms();
         match hdr.cmd_id {
             // The mandatory Init step: without this answer the client never
             // reaches `Ready`.
@@ -1116,11 +1258,171 @@ impl CoreHandler {
                 session.send_encrypted(STRAT, &resp, true);
             }
             strat::CMD_SNAPSHOT => {
-                if let Some(snap) = strat::parse_snapshot(body) {
-                    self.strategies.store(snap);
+                let Some(snap) = strat::parse_snapshot(body) else {
+                    return;
+                };
+                let (touched, rejected) = self.strategies.apply_snapshot(&snap);
+                self.replay_guards();
+                for id in rejected {
+                    self.outbox.push((STRAT, strat::delete(rand_uid(), id, "")));
+                }
+                let echo = if snap.full {
+                    Some(self.strategies.full_payload(rand_uid()))
+                } else {
+                    self.strategies.partial_payload(rand_uid(), &touched)
+                };
+                if let Some(echo) = echo {
+                    self.outbox.push((STRAT, echo));
                 }
             }
-            other => log::debug!("Strat cmd {other} ignored until M3"),
+            strat::CMD_DELETE => {
+                let Some((id, folder)) = strat::parse_delete(body) else {
+                    return;
+                };
+                if self.strategies.delete(id, &folder, now) {
+                    self.replay_guards();
+                    self.outbox
+                        .push((STRAT, strat::delete(rand_uid(), id, &folder)));
+                }
+            }
+            strat::CMD_SELL_PRICE_UPDATE => {
+                let Some((id, price)) = strat::parse_sell_price(body) else {
+                    return;
+                };
+                if self.strategies.set_sell_price(id, price, now) {
+                    if let Some(p) = self.strategies.partial_payload(rand_uid(), &[id]) {
+                        self.outbox.push((STRAT, p));
+                    }
+                }
+            }
+            strat::CMD_CHECKED_SYNC => {
+                if let Some(items) = strat::parse_checked_sync(body) {
+                    self.checked(session, &items);
+                }
+            }
+            other => log::debug!("Strat cmd {other} ignored"),
+        }
+    }
+
+    /// Checked flags: acknowledged to the sender, forwarded to every session.
+    fn checked(&mut self, session: &mut Session, items: &[strat::CheckedItem]) {
+        for it in items {
+            log::info!("strategy {} checked={}", it.strategy_id, it.checked);
+        }
+        self.strategies.set_checked(items);
+        session.send_encrypted(STRAT, &strat::checked_echo(rand_uid(), items), true);
+        self.outbox
+            .push((STRAT, strat::checked_sync(rand_uid(), items)));
+    }
+
+    /// Start or stop the strategies by hand, every terminal's button following.
+    fn set_strategies(&mut self, start: bool) {
+        self.strategies.set_running(start);
+        self.market_stopped = false;
+        self.circuit_stopped = None;
+        let checked = self.strategies.list().iter().filter(|s| s.checked).count();
+        log::info!(
+            "strategies {} ({checked} of {} checked)",
+            if start { "started" } else { "stopped" },
+            self.strategies.list().len()
+        );
+        self.outbox
+            .push((STRAT, strat::runtime_state(rand_uid(), start)));
+    }
+
+    /// Stop the running strategies, the terminals' flag following (their pass
+    /// withdraws their entries); false when they were not running. What a
+    /// stop clears or latches is the caller's.
+    fn stop_strategies(&mut self) -> bool {
+        if !self.strategies.running() {
+            return false;
+        }
+        self.strategies.set_running(false);
+        self.outbox
+            .push((STRAT, strat::runtime_state(rand_uid(), false)));
+        true
+    }
+
+    /// Rewrite the kept `TClientSettings` with the temporary black list as it
+    /// stands now, so an echo does not hand a terminal the old remaining
+    /// times to send back (which would extend every row).
+    fn refresh_temp_black_list(&mut self, now: i64) {
+        if self.black_list.1.is_empty() {
+            return;
+        }
+        let rows = self
+            .black_list
+            .1
+            .iter()
+            .filter(|(_, until)| *until > now)
+            .map(|(sym, until)| {
+                (
+                    sym.clone(),
+                    std::time::Duration::from_millis((until - now) as u64),
+                )
+            })
+            .collect();
+        if let Some(payload) = ui::with_temp_black_list(&self.client_settings, rows) {
+            self.client_settings = payload;
+            self.settings_at = now;
+            self.black_list.1.retain(|(_, until)| *until > now);
+        }
+    }
+
+    /// The terminal's `TClientSettings`: echoed on request, kept across
+    /// restarts, read for the manual defaults, the emulator mode, the global
+    /// black list and the auto-start rules.
+    fn set_client_settings(&mut self, payload: Vec<u8>, received_at: i64) {
+        self.settings_at = received_at;
+        self.client_settings = payload;
+        let was = self.manual.emulator;
+        self.read_manual_defaults();
+        self.shots.set_emulator(self.emu_mode());
+        self.guard_rules = None;
+        if was != self.manual.emulator {
+            self.replay_guards();
+        }
+        let payload = &self.client_settings;
+        if let Some((permanent, temporary)) = ui::black_list(payload) {
+            // The remaining time counts from when the terminal sent it.
+            let temporary: Vec<(String, i64)> = temporary
+                .into_iter()
+                .filter(|(_, days)| days.is_finite() && *days > 0.0)
+                .map(|(sym, days)| (sym, received_at + (days * 86_400_000.0) as i64))
+                .collect();
+            let list = (permanent.into_iter().collect::<HashSet<_>>(), temporary);
+            let symbols =
+                |l: &[(String, i64)]| l.iter().map(|(s, _)| s.clone()).collect::<HashSet<_>>();
+            if list.0 != self.black_list.0 || symbols(&list.1) != symbols(&self.black_list.1) {
+                log::info!(
+                    "global black list: {} permanent, {} temporary",
+                    list.0.len(),
+                    list.1.len()
+                );
+            }
+            self.black_list = list;
+        }
+        if let Some((cfg, cfg2)) = ui::auto_start(payload) {
+            let window = if cfg.work_time {
+                // Not fractions of a day: closed, not open, like a bad WorkingTime.
+                let w = WorkWindow::of_day_fractions(cfg.work_time_from, cfg.work_time_to);
+                if w.is_none() {
+                    log::warn!(
+                        "auto-start work time {} – {} is not a time of day: strategies do not work",
+                        cfg.work_time_from,
+                        cfg.work_time_to
+                    );
+                }
+                Some(w.unwrap_or(WorkWindow::Closed))
+            } else {
+                None
+            };
+            self.shots.set_work_window(window);
+            let rules = autostop::Rules::from_config(&cfg, &cfg2);
+            if rules != self.auto_stop {
+                log::info!("auto-stop: {rules:?}");
+            }
+            self.auto_stop = rules;
         }
     }
 
@@ -1139,6 +1441,59 @@ impl CoreHandler {
             trade::CMD_ORDER_COMMAND => {
                 return self.on_order_command(hdr.uid, &payload[BASE_HEADER_SIZE..]);
             }
+            report::CMD_SCHEMA_REQUEST => report::schema_payload(hdr.uid, reports::FIELDS),
+            report::CMD_SYNC_REQUEST => {
+                let Some((from, depth)) = report::sync_request(payload) else {
+                    return;
+                };
+                let page = self.reports.page(from, depth, now_ms());
+                report::sync_page(
+                    hdr.uid,
+                    self.reports.epoch(),
+                    page.last_rec_id,
+                    self.reports.max_rec_id(),
+                    page.count,
+                    &page.rows,
+                )
+            }
+            report::CMD_ALIVE_MAP_REQUEST => {
+                let Some(up_to) = report::alive_map_request_up_to(payload)
+                    .filter(|&n| n >= 0 && n <= self.reports.max_rec_id() + reports::ALIVE_SLACK)
+                else {
+                    log::warn!("reports: alive map request out of range ignored");
+                    return;
+                };
+                let bitmap = self.reports.alive_bitmap(up_to);
+                report::alive_map(hdr.uid, self.reports.epoch(), up_to, &bitmap)
+            }
+            report::CMD_CHECK_ROWS_REQUEST => {
+                for id in report::check_rows(payload).unwrap_or_default() {
+                    let resp = match self.reports.row(id) {
+                        Some(row) => row_upsert(row),
+                        None => report::row_delete(rand_uid(), id),
+                    };
+                    session.send_encrypted(ORDER, &resp, true);
+                }
+                return;
+            }
+            report::CMD_SET_ROWS_DELETED => {
+                let Some(sel) = report::set_rows_deleted(payload) else {
+                    return;
+                };
+                let changed = self.reports.set_deleted(&sel);
+                if !changed.is_empty() {
+                    self.replay_guards();
+                }
+                log::info!(
+                    "reports: {} {} rows",
+                    if sel.deleted { "deleted" } else { "restored" },
+                    changed.len()
+                );
+                // Every subscriber applies the echo, the sender included.
+                self.outbox.push((ORDER, payload.to_vec()));
+                self.push_profit(now_ms());
+                return;
+            }
             other => {
                 log::debug!("Order cmd {other} ignored");
                 return;
@@ -1148,8 +1503,6 @@ impl CoreHandler {
     }
 
     /// `TOrderCommand` from the terminal; results go out through `effects`.
-    /// Ported from TInvestCore without what this core does not have yet: the
-    /// manual strategy and the emulator (M3).
     fn on_order_command(&mut self, req_uid: u64, body: &[u8]) {
         let now = now_ms();
         let fx = match OrderCommand::parse(body) {
@@ -1200,10 +1553,20 @@ impl CoreHandler {
                 } else {
                     (None, flag)
                 };
-                match self.tradable(&market) {
+                // The positions of the mode the core trades in: the emulator's
+                // with the terminal's emulator mode on, or on a core without
+                // an account (whose strategies can only be emulated).
+                let emulated = self.emu_mode();
+                let ready = if emulated {
+                    self.listed(&market)
+                } else {
+                    self.tradable(&market)
+                };
+                match ready {
                     Ok(()) => {
                         let m = self.catalog.get(&market).expect("tradable");
-                        self.orders.close_position(m, false, side, at_market, now)
+                        self.orders
+                            .close_position(m, emulated, side, at_market, now)
                     }
                     Err(reason) => Effects {
                         logs: vec![reason],
@@ -1242,10 +1605,33 @@ impl CoreHandler {
                 .orders
                 .fail_start(req_uid, s, "the core is stopping", now);
         }
-        if let Err(reason) = self.tradable(&s.market) {
+        let manual = self.manual;
+        let is_manual = s.strategy_id == 0;
+        // «Use the manual strategy»: a hand trade takes its exit settings
+        // (SellPrice, PriceDown, stops, trailing) instead of the toolbar's.
+        let routed = if is_manual {
+            self.manual_strategy()
+        } else {
+            None
+        };
+        let toolbar = is_manual && routed.is_none();
+        // The terminal's emulator mode, a strategy in its own, or a strategy
+        // on a core with no account: the order is answered by the emulator
+        // and never reaches the exchange — so it needs no account either. A
+        // hand trade without an account is refused below, not emulated: the
+        // trader must not take a paper order for a real one.
+        let emulated = manual.emulator
+            || (!is_manual && self.trading.is_none())
+            || (!toolbar && self.strategy_emulated(routed.unwrap_or(s.strategy_id)));
+        let ready = if emulated {
+            self.listed(&s.market)
+        } else {
+            self.tradable(&s.market)
+        };
+        if let Err(reason) = ready {
             return self.orders.fail_start(req_uid, s, &reason, now);
         }
-        if self.closed_markets.contains(&s.market) {
+        if !emulated && self.closed_markets.contains(&s.market) {
             let reason = format!(
                 "{}: the exchange takes no new positions on it (until the core's next start)",
                 s.market
@@ -1260,20 +1646,11 @@ impl CoreHandler {
             );
             return self.orders.fail_start(req_uid, s, &reason, now);
         }
-        let manual = self.manual;
-        let is_manual = s.strategy_id == 0;
-        // No emulator in this core yet (M3): an order the trader means as a
-        // paper one — any order while the terminal's emulator mode is on —
-        // must not reach the exchange as a real one.
-        if manual.emulator {
-            let reason = format!(
-                "{}: emulator mode is on, and this core has no emulator yet: nothing is placed",
-                s.market
-            );
-            return self.orders.fail_start(req_uid, s, &reason, now);
-        }
         let mut s = s.clone();
         let mut notes = Vec::new();
+        if let Some(id) = routed {
+            s.strategy_id = id;
+        }
         // The toolbar's take profit, when the order names no exit — MoonBot
         // applies its `cfg` to a manual order (TInvestCore, as is). It is the
         // planned sell, which the order's own stops do not speak of, so it
@@ -1281,7 +1658,7 @@ impl CoreHandler {
         let entry = if s.price > 0.0 { s.price } else { m.last() };
         let k = if s.is_short { -1.0 } else { 1.0 };
         let at = |pct: f64| m.nearest(entry * (1.0 + k * pct / 100.0));
-        if is_manual && s.planned_sell <= 0.0 && manual.take_profit_pct > 0.0 {
+        if toolbar && s.planned_sell <= 0.0 && manual.take_profit_pct > 0.0 {
             match (entry > 0.0).then(|| at(manual.take_profit_pct)) {
                 Some(tp) if tp > 0.0 => s.planned_sell = tp,
                 _ => notes.push(format!(
@@ -1297,12 +1674,18 @@ impl CoreHandler {
         };
         fx.logs.extend(notes);
         let id = fx.changed.first().copied().unwrap_or(0);
-        if is_manual && manual.manual_strategy.is_some() {
-            fx.logs.push(format!(
-                "{}: «use the manual strategy» is not supported yet (M3): \
-                 the order takes the toolbar's settings",
-                s.market
-            ));
+        if emulated {
+            self.orders.set_emulator(id);
+            self.emu_markets.insert(s.market.clone());
+        }
+        if let Some(strategy) = routed {
+            self.orders.set_hand(id);
+            if emulated && !manual.emulator {
+                fx.logs.push(format!(
+                    "{}: the manual strategy #{strategy} is in EmulatorMode: this hand trade is emulated",
+                    s.market
+                ));
+            }
         }
         // A pending order counts as placed: its stops are set now and wait
         // with it, so the entry is protected the moment it goes out.
@@ -1319,7 +1702,7 @@ impl CoreHandler {
             fx.extend(self.apply_stops(id, &st));
             return fx;
         }
-        if !is_manual {
+        if !toolbar {
             return fx;
         }
         if manual.stop_pct > 0.0 {
@@ -1617,6 +2000,11 @@ impl CoreHandler {
         if self.trading.is_none() {
             return Err("trading is off: the core runs without an account key".into());
         }
+        self.listed(market)
+    }
+
+    /// `market` is in the catalog and trading: what an emulated order needs.
+    fn listed(&self, market: &str) -> Result<(), String> {
         match self.catalog.get(market) {
             Some(m) if m.trading => Ok(()),
             Some(_) => Err(format!("{market}: the market is not trading")),
@@ -1624,11 +2012,89 @@ impl CoreHandler {
         }
     }
 
+    /// Every strategy order is emulated: the terminal's emulator mode is on,
+    /// or the core has no account to trade on — a strategy there can only be
+    /// watched, and the emulator is how.
+    fn emu_mode(&self) -> bool {
+        self.manual.emulator || self.trading.is_none()
+    }
+
+    /// The terminal's manual strategy (`use_manual_strategy`), when it names
+    /// a listed strategy of kind Manual.
+    fn manual_strategy(&self) -> Option<u64> {
+        let id = self.manual.manual_strategy?;
+        self.strategies
+            .list()
+            .iter()
+            .any(|s| s.strategy_id == id && s.kind() == StrategyKind::MANUAL)
+            .then_some(id)
+    }
+
+    /// The strategy trades in the emulator (`EmulatorMode`).
+    fn strategy_emulated(&self, strategy_id: u64) -> bool {
+        self.strategies
+            .list()
+            .iter()
+            .find(|s| s.strategy_id == strategy_id)
+            .is_some_and(|s| Params::from_snapshot(s, self.strategies.schema()).emulator)
+    }
+
+    /// Per listed strategy: its emulator mode (its own `EmulatorMode` or the
+    /// core-wide one) and its Sessions tab. Cached until what it reads
+    /// changes (`replay_guards`, the manual settings).
+    fn guard_rules(&mut self) -> Arc<GuardRules> {
+        let (strategies, emu_mode) = (&self.strategies, self.emu_mode());
+        Arc::clone(self.guard_rules.get_or_insert_with(|| {
+            Arc::new(
+                strategies
+                    .list()
+                    .iter()
+                    .map(|s| {
+                        let p = Params::from_snapshot(s, strategies.schema());
+                        (s.strategy_id, (p.emulator || emu_mode, p.session))
+                    })
+                    .collect(),
+            )
+        }))
+    }
+
+    /// Rebuild the sessions from the report: at start, and whenever what
+    /// counts changes (a deleted or restored row, a mode, a strategy), so the
+    /// live state is the one a restart would rebuild.
+    fn replay_guards(&mut self) {
+        self.penalty_marks = None;
+        self.guard_rules = None;
+        let rules = self.guard_rules();
+        let mut guards = std::mem::take(&mut self.guards);
+        guards.replay(self.reports.rows(), |r| rule_of(&rules, r));
+        self.guards = guards;
+    }
+
+    /// Broadcast the report profit counters when they changed.
+    fn push_profit(&mut self, now: i64) {
+        self.profit_at = now;
+        let p = self.reports.profit(now);
+        if p != self.profit {
+            self.profit = p;
+            self.outbox.push((UI, profit_state(&p)));
+        }
+    }
+
     /// An outcome of the exchange, from the worker or the user-data stream.
     fn on_trading(&mut self, ev: TradingEvent) {
         let now = now_ms();
         let fx = match ev {
-            TradingEvent::Order(u) => self.order_update(&u, now),
+            TradingEvent::Order(u) => {
+                let rejected = u.status == crate::trading::ExecStatus::Rejected;
+                let fx = self.order_update(&u, now);
+                if rejected {
+                    for &id in &fx.changed {
+                        self.shots.on_failed(id, &u.message, now);
+                    }
+                }
+                self.shots_due = true;
+                fx
+            }
             TradingEvent::OpenOrders(list) => {
                 let open: Vec<String> = list.iter().map(|u| u.exchange_id.clone()).collect();
                 for u in &list {
@@ -1646,12 +2112,23 @@ impl CoreHandler {
                 definitive,
                 msg,
             } => {
+                // Not the exchange's refusal of the order: the connection, a
+                // server error, a rate limit — what the error breaker counts.
+                if !definitive || moonshot::rate_limited(&msg) {
+                    self.api_errors.push_back(now);
+                }
+                let order = action.order();
                 let mut fx = self.orders.failed(&action, definitive, &msg, now);
                 fx.extend(self.market_closed(&action, &msg));
+                if !fx.logs.is_empty() || !fx.changed.is_empty() {
+                    self.shots.on_failed(order, &msg, now);
+                }
+                self.shots_due = true;
                 fx
             }
             TradingEvent::Ping(ms) => {
                 log::debug!("orders: call answered in {ms} ms");
+                self.shots.on_ping(ms, now);
                 return;
             }
         };
@@ -1699,21 +2176,488 @@ impl CoreHandler {
     fn effects(&mut self, mut fx: Effects, now: i64) {
         self.cap_to_band(&mut fx);
         self.orders.note_moves(&fx.changed, now);
-        for id in fx.changed {
-            if let Some(o) = self.orders.get(id) {
-                self.outbox.push((ORDER, trade::order_image(&o.record())));
+        let mut reported = false;
+        let rules = self.guard_rules();
+        for &id in &fx.changed {
+            let Some(o) = self.orders.get(id) else {
+                continue;
+            };
+            let record = o.record();
+            self.outbox.push((ORDER, trade::order_image(&record)));
+            if trade::status::is_terminal(o.status) {
+                self.orders_refresh_at = now + ORDERS_REFRESH_MS;
             }
+            let kind = self.strategies.kind_name(o.strategy_id);
+            if let Some(row) = self.reports.record(&deal(o, &record, kind), now) {
+                self.outbox.push((ORDER, row_upsert(row)));
+                reported = true;
+                self.penalty_marks = None;
+                let row = row.clone();
+                let rule = rule_of(&rules, &row);
+                fx.logs.extend(self.guards.book(&row, rule, now));
+                // The commission the user stream has already reported for
+                // this deal's exchange orders.
+                if row.closed && !o.emulator {
+                    self.book_commissions(id, now);
+                }
+            }
+        }
+        if reported {
+            self.push_profit(now);
+            self.check_auto_stop(now);
         }
         for text in fx.logs {
             log::info!("{text}");
             self.outbox.push((LOG, log_msg(now, &text)));
         }
+        // An emulated order's work goes to the emulator (`run_emulator`),
+        // the rest to the worker after one snapshot of the batch.
         for action in fx.actions {
-            if let Some(o) = self.orders.get(action.order()) {
-                let uid = o.uid.clone();
-                self.pending_actions.push((action, uid));
+            match self.orders.get(action.order()) {
+                Some(o) if o.emulator => {
+                    self.emu_markets.insert(o.uid.clone());
+                    self.emu_actions.push(action);
+                }
+                Some(o) => {
+                    let uid = o.uid.clone();
+                    self.pending_actions.push((action, uid));
+                }
+                None => {}
             }
         }
+    }
+
+    /// Answer the emulated orders' work as the exchange would: the answers go
+    /// through `on_trading` like the worker's.
+    fn run_emulator(&mut self, now: i64) {
+        for _ in 0..EMU_ROUNDS {
+            if self.emu_actions.is_empty() {
+                break;
+            }
+            for action in std::mem::take(&mut self.emu_actions) {
+                let market = self
+                    .orders
+                    .get(action.order())
+                    .and_then(|o| self.catalog.get(&o.uid));
+                let ev = self.emulator.answer(action, &self.orders, market, now);
+                self.on_trading(ev);
+            }
+        }
+        // Markets with nothing emulated resting any more leave the set.
+        if !self.emu_markets.is_empty() && self.emu_actions.is_empty() {
+            self.emu_markets = self.orders.emu_markets();
+        }
+    }
+
+    /// The market `symbol` moved (an exchange trade at `trade`, else the
+    /// book): the emulated orders resting there that it reached fill.
+    fn emulate_fills(&mut self, symbol: &str, trade: Option<f64>) {
+        if !self.emu_markets.contains(symbol) {
+            return;
+        }
+        let Some(m) = self.catalog.get(symbol) else {
+            return;
+        };
+        let resting = self.orders.emu_resting(symbol);
+        for u in emulator::fills(&resting, m, trade, now_ms()) {
+            self.on_trading(TradingEvent::Order(u));
+        }
+    }
+
+    /// The 5m warm-up bars of one market into the strategies' windows: each
+    /// bar a bucket of its own (the windows read 5-minute resolution in the
+    /// history and minutes from the start on), and its turnover into the hour
+    /// ledger. Only bars that ended before the core started: the live tape
+    /// covers everything after, and the bar running at the start would be
+    /// counted twice. The minutes between that bar's open and the start are
+    /// lost to the windows — at most five, one twelfth of the first hour.
+    fn seed_windows(&mut self, idx: u16, bars: &[crate::aster::json::Kline]) {
+        const BAR_MS: i64 = 5 * 60_000;
+        // A row the exchange sent short of a cell reads NaN there
+        // (`json::kline_row`), and one NaN would poison every sum it joins.
+        let whole = |b: &&crate::aster::json::Kline| {
+            [b.open, b.low, b.high, b.quote_volume]
+                .iter()
+                .all(|v| v.is_finite())
+        };
+        for b in bars
+            .iter()
+            .filter(|b| b.open_ms + BAR_MS <= self.started_at)
+            .filter(whole)
+        {
+            self.windows
+                .seed(idx, b.open_ms, b.open, b.low, b.high, b.quote_volume);
+            self.windows.seed_hour(idx, b.open_ms, b.quote_volume);
+        }
+    }
+
+    /// One strategy pass: its commands go through `Orders` like the
+    /// terminal's. The auto-start rules are judged first, so a stop asked for
+    /// now is in force before the pass would place the next entry.
+    fn run_shots(&mut self, now: i64) {
+        self.shots_at = now;
+        self.shots_due = false;
+        if now - self.market_delta.1 >= MARKET_DELTA_EVERY_MS {
+            self.market_delta = (
+                moonshot::market_delta(&self.catalog, &self.windows, now),
+                now,
+            );
+        }
+        self.check_market(now);
+        self.check_circuits(now);
+        self.shots.set_emulator(self.emu_mode());
+        // `TotalLoss` counts over the auto-stop hours window, else a day,
+        // the deals of each strategy's current mode only.
+        let window_s = self.auto_stop.by_hours.map_or(86_400, |(_, w, _)| w);
+        let rules = self.guard_rules();
+        let counts =
+            |r: &reports::Row| rules.get(&r.strategy_id).map(|&(emu, _)| emu) == Some(r.emulator);
+        let totals = guards::totals(self.reports.rows(), now / 1000 - window_s, counts);
+        let (streaks, manual) = self
+            .penalty_marks
+            .get_or_insert_with(|| guards::penalty_marks(self.reports.rows(), counts))
+            .clone();
+        self.shots.set_guards(guards::View {
+            totals,
+            sessions: self.guards.held(now),
+            streaks,
+            manual,
+        });
+        let (permanent, temporary) = &self.black_list;
+        let black: HashSet<String> = permanent
+            .iter()
+            .cloned()
+            .chain(
+                temporary
+                    .iter()
+                    .filter(|(_, until)| *until > now)
+                    .map(|(sym, _)| sym.clone()),
+            )
+            .collect();
+        self.shots.set_black_list(black);
+        // A ranked pool taken before the warm-up lands is a pool by accident:
+        // every volume key reads zero out of an empty window.
+        self.shots.set_warming(!self.warmup_done);
+        let cmds = self.shots.tick(
+            &self.strategies,
+            &self.orders,
+            &self.catalog,
+            &self.windows,
+            self.market_delta.0,
+            now,
+        );
+        for cmd in cmds {
+            let fx = match cmd {
+                Cmd::Start { order, tier } => {
+                    let fx = self.start_order(0, &order, false, now);
+                    if let Some(&id) = fx.changed.first() {
+                        self.shots.on_entry_started(id, tier);
+                    }
+                    fx
+                }
+                Cmd::Move {
+                    order,
+                    reason,
+                    market: true,
+                    ..
+                } => {
+                    let symbol = self.orders.get(order).map(|o| o.uid.clone());
+                    match symbol.as_deref().and_then(|u| self.catalog.get(u)) {
+                        Some(m) => self.orders.stop_out(order, reason, m, now),
+                        None => Effects::default(),
+                    }
+                }
+                Cmd::Move {
+                    order,
+                    leg,
+                    price,
+                    reason,
+                    ..
+                } => {
+                    if leg == Leg::Sell {
+                        self.orders.set_sell_reason(order, reason);
+                    }
+                    self.orders.target(order, leg, price, None)
+                }
+                Cmd::MoveEntry {
+                    order,
+                    price,
+                    size,
+                    planned,
+                } => {
+                    let fx = self.orders.target_entry(order, price, size);
+                    self.effects(fx, now);
+                    // MoonHook with `HookSellFixed` off re-prices its exit off
+                    // the entry's new price instead of keeping the ratio.
+                    self.orders.replan_exit(order, price, planned)
+                }
+                Cmd::Cancel { order } => self.orders.cancel_buy(order, now),
+                Cmd::Stop {
+                    order,
+                    price,
+                    spread,
+                } => self.orders.set_bot_stop(order, price, spread),
+                Cmd::Detect {
+                    market,
+                    strategy_id,
+                    is_short,
+                    msg,
+                } => {
+                    let payload =
+                        strat::detect_signal(rand_uid(), &market, strategy_id, is_short, &msg);
+                    self.outbox.push((STRAT, payload));
+                    continue;
+                }
+                Cmd::Log(text) => Effects {
+                    logs: vec![text],
+                    ..Effects::default()
+                },
+            };
+            self.effects(fx, now);
+        }
+    }
+
+    /// Global auto-stop on loss (the terminal's auto-start tab).
+    fn check_auto_stop(&mut self, now: i64) {
+        let running = self.strategies.running();
+        if !self.auto_stop.active() || !(running || self.auto_stop.sell_all) {
+            return;
+        }
+        let deals = self.reports.closed_deals(self.auto_stop.with_emulator);
+        let Some(why) = autostop::tripped(&self.auto_stop, &deals, self.loss_since, now / 1000)
+        else {
+            return;
+        };
+        self.stop_strategies();
+        self.loss_since = now / 1000 + 1;
+        let mut fx = Effects::default();
+        fx.logs.push(format!(
+            "AutoStop: {why}{}",
+            if running { ": strategies stopped" } else { "" }
+        ));
+        if self.auto_stop.sell_all {
+            fx.extend(self.orders.panic_all(&self.catalog, now));
+        }
+        self.effects(fx, now);
+    }
+
+    /// Auto-start circuit breakers: API errors of the last minute and the
+    /// median ping of the answered order calls at or above their level stop
+    /// the running strategies (optionally panic selling all); with a restart
+    /// time they start again once it passed and the reading is back below.
+    fn check_circuits(&mut self, now: i64) {
+        while self.api_errors.front().is_some_and(|&at| at < now - 60_000) {
+            self.api_errors.pop_front();
+        }
+        let errors = self.api_errors.len() as i64;
+        let ping = self.shots.ping_median(now).unwrap_or(0);
+        let rules = self.auto_stop;
+        let readings = [
+            ("API errors a minute", rules.errors, errors),
+            ("ping ms", rules.ping, ping),
+        ];
+        let running = self.strategies.running();
+        if running {
+            self.circuit_stopped = None;
+            let Some((what, c, value)) = readings
+                .into_iter()
+                .find_map(|(w, c, v)| c.filter(|c| v >= c.level).map(|c| (w, c, v)))
+            else {
+                return;
+            };
+            self.stop_strategies();
+            self.circuit_stopped = Some((what, c.restart_ms.map(|ms| now + ms)));
+            let mut fx = Effects::default();
+            fx.logs.push(format!(
+                "AutoStop: {what} {value} ≥ {}: strategies stopped{}",
+                c.level,
+                if c.sell_all { ", Panic Sell ALL" } else { "" }
+            ));
+            if c.sell_all {
+                fx.extend(self.orders.panic_all(&self.catalog, now));
+            }
+            self.effects(fx, now);
+            return;
+        }
+        let Some((what, Some(at))) = self.circuit_stopped else {
+            return;
+        };
+        let calm = readings
+            .iter()
+            .all(|(_, c, v)| c.is_none_or(|c| *v < c.level));
+        // A market move past its panic threshold keeps them stopped.
+        if now < at || !calm || self.market_latched {
+            return;
+        }
+        self.circuit_stopped = None;
+        self.strategies.set_running(true);
+        self.outbox
+            .push((STRAT, strat::runtime_state(rand_uid(), true)));
+        let text = format!("AutoStart: {what} back below the level: strategies started");
+        log::info!("{text}");
+        self.outbox.push((LOG, log_msg(now, &text)));
+    }
+
+    /// Global panic on a market move and its «Restart if»: BTC's hourly
+    /// delta and the markets' mean one.
+    fn check_market(&mut self, now: i64) {
+        let running = self.strategies.running();
+        if running {
+            self.market_stopped = false;
+        }
+        // Before the warm-up seeds the windows the hour is only the ticks
+        // since the start: its delta would read about 0 %.
+        if !self.warmup_done || (!self.auto_stop.watches_market() && !self.market_stopped) {
+            return;
+        }
+        let btc = self
+            .catalog
+            .index_of_symbol(BTC_SYMBOL)
+            .and_then(|i| Some((i, self.catalog.at(i)?)))
+            .filter(|(i, m)| m.fresh() && m.last() > 0.0 && self.windows.covers(*i, now, 60))
+            .and_then(|(i, m)| self.windows.delta(i, m.last(), now, 60));
+        let deltas = autostop::Deltas {
+            btc,
+            market: self.market_delta.0,
+        };
+        if autostop::market_past(&self.auto_stop, deltas).is_none() {
+            self.market_latched = false;
+        }
+        let call = autostop::market_call(
+            &self.auto_stop,
+            deltas,
+            running,
+            self.market_stopped,
+            self.market_latched,
+        );
+        let mut fx = Effects::default();
+        match call {
+            Some(autostop::MarketCall::Panic(why)) => {
+                self.market_latched = true;
+                // Stopped by a breaker meanwhile: the market decides now.
+                if !running && self.circuit_stopped.take().is_some() {
+                    self.market_stopped = true;
+                }
+                if self.stop_strategies() {
+                    self.market_stopped = true;
+                }
+                fx.logs.push(format!(
+                    "AutoStop: {why}: {}Panic Sell ALL",
+                    if running { "strategies stopped, " } else { "" }
+                ));
+                fx.extend(self.orders.panic_all(&self.catalog, now));
+            }
+            Some(autostop::MarketCall::Restart(why)) => {
+                self.strategies.set_running(true);
+                self.market_stopped = false;
+                self.outbox
+                    .push((STRAT, strat::runtime_state(rand_uid(), true)));
+                fx.logs
+                    .push(format!("AutoStart: {why}: strategies started"));
+            }
+            None => return,
+        }
+        self.effects(fx, now);
+    }
+
+    /// A user-stream report of an execution: its commission (`n`, in the
+    /// asset `N`) is summed per exchange order — the deal's row takes it when
+    /// it closes, and again if one arrives after.
+    fn note_commission(&mut self, o: &crate::aster::json::OrderEvent) {
+        if o.execution != "TRADE" {
+            return;
+        }
+        let Ok(fee) = o.commission.parse::<f64>() else {
+            return;
+        };
+        if !fee.is_finite() || fee == 0.0 {
+            return;
+        }
+        if !o.commission_asset.is_empty() && o.commission_asset != QUOTE {
+            log::warn!(
+                "order {} {}: commission {fee} {} is not in {QUOTE}, not booked",
+                o.symbol,
+                o.id,
+                o.commission_asset
+            );
+            return;
+        }
+        if self.commissions.len() >= COMMISSIONS_KEPT {
+            // Keep the fees of the orders still live; the rest belong to deals
+            // the report already holds. A fee of one of those arriving after
+            // this would book that exchange order's later part alone — a rare
+            // error against unbounded growth.
+            let live: HashSet<(String, String)> = self
+                .orders
+                .iter()
+                .filter(|o| !trade::status::is_terminal(o.status))
+                .flat_map(|o| {
+                    let symbol = o.uid.clone();
+                    o.filled_orders()
+                        .into_iter()
+                        .map(move |f| (symbol.clone(), f.id))
+                })
+                .collect();
+            let before = self.commissions.len();
+            self.commissions.retain(|k, _| live.contains(k));
+            log::warn!(
+                "commissions: {before} orders kept, {} of live orders remain",
+                self.commissions.len()
+            );
+        }
+        let id = o.id.to_string();
+        let entry = self
+            .commissions
+            .entry((o.symbol.clone(), id.clone()))
+            .or_default();
+        if !entry.1.insert(o.trade_id) {
+            return;
+        }
+        entry.0 += fee;
+        // A deal already closed takes the late fee now.
+        let order = self
+            .orders
+            .iter()
+            .find(|c| c.uid == o.symbol && c.filled_orders().iter().any(|f| f.id == id))
+            .map(|c| c.id);
+        if let Some(order) = order.filter(|&order| self.reports.has_order(order)) {
+            self.book_one_commission(order, &o.symbol, &id, now_ms());
+        }
+    }
+
+    /// The commissions the user stream reported for every exchange order of
+    /// the closed deal `order`.
+    fn book_commissions(&mut self, order: u64, now: i64) {
+        let Some((symbol, ids)) = self.orders.get(order).map(|o| {
+            let ids: Vec<String> = o.filled_orders().into_iter().map(|f| f.id).collect();
+            (o.uid.clone(), ids)
+        }) else {
+            return;
+        };
+        for id in ids {
+            self.book_one_commission(order, &symbol, &id, now);
+        }
+    }
+
+    fn book_one_commission(&mut self, order: u64, symbol: &str, exchange_id: &str, now: i64) {
+        let key = (symbol.to_string(), exchange_id.to_string());
+        let Some(&(fee, _)) = self.commissions.get(&key) else {
+            return;
+        };
+        let Some(row) = self.reports.add_commission(order, exchange_id, fee) else {
+            return;
+        };
+        self.outbox.push((ORDER, row_upsert(row)));
+        self.penalty_marks = None;
+        let row = row.clone();
+        let rules = self.guard_rules();
+        if let Some(text) = self.guards.book(&row, rule_of(&rules, &row), now) {
+            log::info!("{text}");
+            self.outbox.push((LOG, log_msg(now, &text)));
+        }
+        self.push_profit(now);
+        // A late fee can carry the loss over the limit.
+        self.check_auto_stop(now);
     }
 
     fn cap_to_band(&mut self, fx: &mut Effects) {
@@ -1814,11 +2758,11 @@ impl CoreHandler {
         };
         {
             let state = order_store::State {
-                running: false,
+                running: self.strategies.running(),
                 client_settings: &self.client_settings,
-                settings_at: 0,
-                loss_since: 0,
-                market_stopped: false,
+                settings_at: self.settings_at,
+                loss_since: self.loss_since,
+                market_stopped: self.market_stopped,
             };
             store.save(&self.orders, &state, force, now)
         }
@@ -1917,8 +2861,8 @@ impl Handler for CoreHandler {
 /// Unix milliseconds, UTC — the core's one clock.
 ///
 /// Aster's own `timezone` is UTC and every timestamp on the wire to it is
-/// unix milliseconds, so unlike TInvestCore there is no Moscow midnight and no
-/// local-time arithmetic anywhere in this core.
+/// unix milliseconds. The one local clock is the trader's, which MoonBot's work
+/// windows are read on (`moonshot::WorkWindow`).
 pub fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1937,6 +2881,48 @@ fn rand_uid() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(1, |d| d.as_nanos() as u64);
     (nanos & 0x0000_ffff_ffff_ffff) | (SEQ.fetch_add(1, Ordering::Relaxed) << 48)
+}
+
+/// The Sessions rule a report row counts under: its strategy's, while the
+/// strategy trades in the mode the row was made in.
+fn rule_of(rules: &GuardRules, row: &reports::Row) -> Option<guards::SessionRule> {
+    rules
+        .get(&row.strategy_id)
+        .filter(|(emulated, _)| *emulated == row.emulator)
+        .and_then(|&(_, rule)| rule)
+}
+
+/// Report row of `o` (its image `record`) for `Reports::record`.
+fn deal<'a>(
+    o: &'a CoreOrder,
+    record: &'a trade::OrderRecord<'a>,
+    signal_type: Option<&'a str>,
+) -> Deal<'a> {
+    Deal {
+        order_id: o.id,
+        coin: &o.market,
+        is_short: o.is_short,
+        strategy_id: o.strategy_id,
+        signal_type,
+        buy: &record.buy,
+        sell: &record.sell,
+        closed: trade::status::is_terminal(o.status),
+        panic: record.panic,
+        sell_reason: record.sell_reason,
+        exit: o.exit_source(),
+        ex_order_id: o.exchange_id(),
+        emulator: o.emulator,
+    }
+}
+
+fn row_upsert(row: &reports::Row) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    row.encode(&mut encoded);
+    report::row_upsert(rand_uid(), row.rec_id, &encoded)
+}
+
+fn profit_state(p: &Profit) -> Vec<u8> {
+    ui::profit_state(rand_uid(), p.total, p.trades, p.hour_total, p.hour_trades)
 }
 
 /// The leg an action works on.

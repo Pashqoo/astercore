@@ -22,8 +22,8 @@ use crate::aster::ws::{Beat, Stamp};
 /// pushes. A trade chunk hears the pong of the core's own ping every 30 s
 /// (`ws::PING_EVERY`) however quiet its markets are, so its 120 s bound means
 /// "the connection is gone and reconnecting has not worked", never "the
-/// markets are quiet"; its silence costs a log line until strategies read it
-/// (M3).
+/// markets are quiet". Its silence takes the markets' `feed_fresh` with it,
+/// which holds their orders and the strategies' entries on them.
 pub const STALE_AFTER_MS: i64 = 15_000;
 pub const TRADES_STALE_AFTER_MS: i64 = 120_000;
 /// Period of the summary line: every watched stream, alive or not, with the
