@@ -1,0 +1,9 @@
+/target
+*.key
+.env
+.DS_Store
+/data/
+.claude/settings.local.json
+/todo.md
+_target/
+/logs/
