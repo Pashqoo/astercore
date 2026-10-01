@@ -1361,3 +1361,108 @@ fn a_shutdown_withdraws_the_live_entries() {
     );
     let _ = client.disconnect();
 }
+
+/// «Move all» of the buys: every resting entry of the market moves to the
+/// price the terminal names — as a Replace each, at a tick, in the band.
+#[test]
+fn move_all_moves_every_resting_entry_to_the_price() {
+    let (core, orders) = FedCore::trading();
+    let client = core.connect();
+    let mut keys = Vec::new();
+    for (i, id) in ["911", "912"].into_iter().enumerate() {
+        let key = post_entry(&client, &orders);
+        core.ev_tx
+            .send(report(&key, id, ExecStatus::New, 1, 0))
+            .unwrap();
+        keys.push(key);
+        // Each acknowledged before the next, so the client holds both.
+        let n = i + 1;
+        assert!(wait_until(Duration::from_secs(5), || {
+            let _ = client.drain_events();
+            client.snapshot().is_some_and(|s| {
+                s.orders()
+                    .iter()
+                    .filter(|o| o.status == moonproto::OrderWorkerStatus::BuySet)
+                    .count()
+                    >= n
+            })
+        }));
+    }
+    client
+        .trade()
+        .move_all_buys(
+            "BTCUSDT",
+            moonproto::MoveAllBuysParams::replace_kind(
+                moonproto::BulkMoveKind::All,
+                82_500.0,
+                moonproto::PositionFilter::Both,
+            ),
+        )
+        .expect("sent");
+    let mut moved = Vec::new();
+    for _ in 0..2 {
+        match next_action(&orders) {
+            Action::Replace {
+                exchange_id, price, ..
+            } => moved.push((exchange_id, price)),
+            other => panic!("{other:?}"),
+        }
+    }
+    moved.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        moved,
+        vec![("911".to_string(), 82_500.0), ("912".to_string(), 82_500.0)]
+    );
+    let _ = client.disconnect();
+}
+
+/// `-4141` on an entry: the next entry on that market is refused by the core,
+/// before the exchange.
+#[test]
+fn an_entry_refused_for_a_closed_market_closes_it_to_entries() {
+    let (core, orders) = FedCore::trading();
+    let client = core.connect();
+    // The exchange refuses the entry the core posted.
+    client
+        .trade()
+        .new_order(moonproto::NewOrderParams::new(
+            "BTCUSDT",
+            moonproto::OrderSide::Long,
+            83_000.0,
+            100.0,
+        ))
+        .expect("sent");
+    let posted = next_action(&orders);
+    core.ev_tx
+        .send(FeedEvent::Trading(TradingEvent::Failed {
+            action: posted,
+            definitive: true,
+            msg: "api 400/-4141: Symbol is closed for new positions.".into(),
+        }))
+        .unwrap();
+    assert!(log_line(&client, "takes no new positions"));
+    client
+        .trade()
+        .new_order(moonproto::NewOrderParams::new(
+            "BTCUSDT",
+            moonproto::OrderSide::Long,
+            83_000.0,
+            100.0,
+        ))
+        .expect("sent");
+    assert!(log_line(&client, "takes no new positions on it (until"));
+    let post = std::iter::from_fn(|| orders.try_recv().ok()).find(|c| {
+        matches!(
+            c,
+            TradeCommand::Exchange {
+                action: Action::Post { .. },
+                ..
+            }
+        )
+    });
+    assert!(
+        post.is_none(),
+        "an entry on a closed market reached the worker"
+    );
+    let _ = client.disconnect();
+}

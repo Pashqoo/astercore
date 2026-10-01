@@ -38,7 +38,7 @@ use crate::feed::{FeedCommand, FeedEvent};
 use crate::load::Load;
 use crate::model::{Catalog, QUOTE, QUOTE_CODE};
 use crate::order_store::{self, OrderStore};
-use crate::orders::{Action, Effects, Leg, Orders};
+use crate::orders::{Action, Effects, Leg, Orders, Resting};
 use crate::prices::Snapshot;
 use crate::strategies::Strategies;
 use crate::stream_health::{Scope, StreamHealth, SUMMARY_EVERY_MS};
@@ -198,6 +198,9 @@ pub struct CoreHandler {
     /// The order worker itself is the thread that died: nothing can be
     /// withdrawn through it.
     worker_lost: bool,
+    /// Markets the exchange takes no new positions on (`-4140`/`-4141` on an
+    /// entry), for this run: an entry there is refused by the core.
+    closed_markets: HashSet<String>,
 }
 
 impl CoreHandler {
@@ -242,6 +245,7 @@ impl CoreHandler {
             stopping: false,
             shutdown_requested: false,
             worker_lost: false,
+            closed_markets: HashSet::new(),
         }
     }
 
@@ -1145,7 +1149,7 @@ impl CoreHandler {
 
     /// `TOrderCommand` from the terminal; results go out through `effects`.
     /// Ported from TInvestCore without what this core does not have yet: the
-    /// manual strategy and the emulator (M3), MoveAll.
+    /// manual strategy and the emulator (M3).
     fn on_order_command(&mut self, req_uid: u64, body: &[u8]) {
         let now = now_ms();
         let fx = match OrderCommand::parse(body) {
@@ -1210,12 +1214,15 @@ impl CoreHandler {
             OrderCommand::Immune { order_id, enabled } => self.orders.set_immune(order_id, enabled),
             OrderCommand::PanicSellAll => self.orders.panic_all(&self.catalog, now),
             OrderCommand::PendingCancel { order_id } => self.orders.cancel_pending(order_id, now),
-            OrderCommand::MoveAll { market, .. } => Effects {
-                logs: vec![format!(
-                    "{market}: Move all is not supported by this core yet"
-                )],
-                ..Effects::default()
-            },
+            OrderCommand::MoveAll {
+                market,
+                sells,
+                kind,
+                move_kind,
+                side,
+                price,
+                ..
+            } => self.move_all(&market, sells, kind, move_kind, side, price, now),
             OrderCommand::Other(op) => Effects {
                 logs: vec![format!("order command {op} is not supported by this core")],
                 ..Effects::default()
@@ -1236,6 +1243,13 @@ impl CoreHandler {
                 .fail_start(req_uid, s, "the core is stopping", now);
         }
         if let Err(reason) = self.tradable(&s.market) {
+            return self.orders.fail_start(req_uid, s, &reason, now);
+        }
+        if self.closed_markets.contains(&s.market) {
+            let reason = format!(
+                "{}: the exchange takes no new positions on it (until the core's next start)",
+                s.market
+            );
             return self.orders.fail_start(req_uid, s, &reason, now);
         }
         let m = self.catalog.get(&s.market).expect("tradable");
@@ -1465,6 +1479,134 @@ impl CoreHandler {
         self.persist_orders(true, now_ms());
     }
 
+    /// «Move all» (Order opcode 11) of one leg on a market (TInvestCore, as
+    /// is): `kind` 2 moves every resting order `value` percent (immune ones
+    /// too, as MoonBot); `kind` 0 moves the ones `move_kind` picks — All (5),
+    /// LastSet (6), TopVol (2), LowVol (3) — to the price `value`, for a
+    /// `side` (0 both, 1 long, 2 short), skipping immune ones. The price zone
+    /// (`kind` 1) and other kinds are said to be unsupported.
+    #[allow(clippy::too_many_arguments)]
+    fn move_all(
+        &mut self,
+        market: &str,
+        sells: bool,
+        kind: u8,
+        move_kind: u8,
+        side: u8,
+        value: f64,
+        now: i64,
+    ) -> Effects {
+        let unsupported = |what: &str| Effects {
+            logs: vec![format!(
+                "{market}: Move all {what} is not supported by this core"
+            )],
+            ..Effects::default()
+        };
+        if let Err(reason) = self.tradable(market) {
+            return Effects {
+                logs: vec![reason],
+                ..Effects::default()
+            };
+        }
+        let m = self.catalog.get(market).expect("tradable");
+        if !value.is_finite() {
+            return unsupported("with this price");
+        }
+        let mut found = self.orders.resting(&m.symbol, sells);
+        if side != 0 {
+            let short = side == 2;
+            found.retain(|r| self.orders.get(r.id).is_some_and(|o| o.is_short == short));
+        }
+        // One order of a tie wins by its id, not by the map's order.
+        found.sort_by_key(|r| r.id);
+        // The last-set and the largest of a tie are the smaller id, as the
+        // smallest is (`trading.mdc`, Move all): the sort above makes `min_by`
+        // take it, and these comparisons make `max_by` take it too.
+        let later = |a: &Resting, b: &Resting| a.set_at.cmp(&b.set_at).then(b.id.cmp(&a.id));
+        let larger = |a: &Resting, b: &Resting| a.value.total_cmp(&b.value).then(b.id.cmp(&a.id));
+        let moves: Vec<(u64, Leg, f64)> = match (kind, move_kind) {
+            (2, _) => found
+                .iter()
+                .map(|r| (r.id, r.leg, r.price * (1.0 + value / 100.0)))
+                .collect(),
+            (0, 2 | 3 | 5 | 6) => {
+                found.retain(|r| !r.immune);
+                let pick: Vec<Resting> = match move_kind {
+                    5 => found.clone(),
+                    6 => found
+                        .iter()
+                        .max_by(|a, b| later(a, b))
+                        .copied()
+                        .into_iter()
+                        .collect(),
+                    2 => found
+                        .iter()
+                        .max_by(|a, b| larger(a, b))
+                        .copied()
+                        .into_iter()
+                        .collect(),
+                    _ => found
+                        .iter()
+                        .min_by(|a, b| a.value.total_cmp(&b.value))
+                        .copied()
+                        .into_iter()
+                        .collect(),
+                };
+                pick.into_iter().map(|r| (r.id, r.leg, value)).collect()
+            }
+            (1, _) => return unsupported("by price zone"),
+            _ => return unsupported("of this kind"),
+        };
+        let mut fx = Effects::default();
+        if moves.is_empty() {
+            fx.logs.push(format!(
+                "{market}: Move all — no {} of the core to move",
+                if sells { "exit" } else { "entry" }
+            ));
+        }
+        for (id, leg, price) in moves {
+            // A price at or below zero is not a move to make, whatever the
+            // band would pin it to.
+            if !price.is_finite() || price <= 0.0 {
+                continue;
+            }
+            // At a tick and inside the exchange band, as every other move.
+            let price = m.within_limits(m.nearest(price));
+            fx.extend(match leg {
+                Leg::Sell => self.orders.target(id, Leg::Sell, price, None),
+                Leg::Buy => self.orders.target_manual(id, Leg::Buy, price, None, now),
+            });
+        }
+        fx
+    }
+
+    /// `-4140` (the symbol is closed) / `-4141` (no new positions on it) on an
+    /// entry: the market takes no new entry for this run — the core refuses
+    /// the next one instead of the exchange. Exits, closes and moves of what
+    /// is already open are not touched: a position there still needs them.
+    fn market_closed(&mut self, action: &Action, msg: &str) -> Effects {
+        let entry = matches!(
+            action,
+            Action::Post { leg: Leg::Buy, .. } | Action::Replace { leg: Leg::Buy, .. }
+        );
+        if !entry || !(msg.contains("/-4140:") || msg.contains("/-4141:")) {
+            return Effects::default();
+        }
+        let Some(symbol) = self.orders.get(action.order()).map(|o| o.uid.clone()) else {
+            return Effects::default();
+        };
+        if !self.closed_markets.insert(symbol.clone()) {
+            return Effects::default();
+        }
+        Effects {
+            logs: vec![format!(
+                "{symbol}: the exchange takes no new positions on it — entries refused until \
+                 the next start"
+            )],
+            ..Effects::default()
+        }
+    }
+
     /// The core may send exchange orders for `market`.
     fn tradable(&self, market: &str) -> Result<(), String> {
         if self.trading.is_none() {
@@ -1498,7 +1640,11 @@ impl CoreHandler {
                 action,
                 definitive,
                 msg,
-            } => self.orders.failed(&action, definitive, &msg, now),
+            } => {
+                let mut fx = self.orders.failed(&action, definitive, &msg, now);
+                fx.extend(self.market_closed(&action, &msg));
+                fx
+            }
             TradingEvent::Ping(ms) => {
                 log::debug!("orders: call answered in {ms} ms");
                 return;
