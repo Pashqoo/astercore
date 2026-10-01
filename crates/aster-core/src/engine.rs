@@ -191,6 +191,13 @@ pub struct CoreHandler {
     open_orders_due: Option<i64>,
     /// The toolbar's defaults for manual orders, from `TClientSettings`.
     manual: ui::ManualDefaults,
+    /// The core is leaving (`begin_stop`): no entry may be placed.
+    stopping: bool,
+    /// The terminal asked the core to leave and it agreed (`TShutdownCommand`).
+    shutdown_requested: bool,
+    /// The order worker itself is the thread that died: nothing can be
+    /// withdrawn through it.
+    worker_lost: bool,
 }
 
 impl CoreHandler {
@@ -232,6 +239,9 @@ impl CoreHandler {
             watch_at: 0,
             open_orders_due: None,
             manual: ui::ManualDefaults::default(),
+            stopping: false,
+            shutdown_requested: false,
+            worker_lost: false,
         }
     }
 
@@ -631,6 +641,7 @@ impl CoreHandler {
             FeedEvent::Lost(what) => {
                 log::error!("feed: {what} is gone");
                 self.feed_lost = true;
+                self.worker_lost |= what == crate::trading::WORKER;
             }
             FeedEvent::Trading(ev) => self.on_trading(ev),
             FeedEvent::UserOrder(o) => {
@@ -990,6 +1001,23 @@ impl CoreHandler {
                 self.read_manual_defaults();
                 session.send_encrypted(UI, &ui::with_uid(payload, rand_uid()), true);
             }
+            // MoonBot's guarded shutdown: refused while the core holds a
+            // position — its exit, or the want of one, needs a core to watch
+            // it. Otherwise the core leaves (`main`), withdrawing its entries.
+            ui::CMD_SHUTDOWN => {
+                let open = self.open_positions();
+                let text = if open > 0 {
+                    format!(
+                        "shutdown refused: {open} position(s) of the core are open — \
+                         close them first"
+                    )
+                } else {
+                    self.shutdown_requested = true;
+                    "shutdown: the core is leaving".to_string()
+                };
+                log::info!("{text}");
+                session.send_encrypted(LOG, &log_msg(now_ms(), &text), true);
+            }
             ui::CMD_SETTINGS_REQUEST => {
                 let resp = ui::with_uid(&self.client_settings, hdr.uid);
                 session.send_encrypted(UI, &resp, true);
@@ -1200,6 +1228,13 @@ impl CoreHandler {
     /// price crosses its trigger). A manual entry on a market whose trade
     /// stream is down is refused: its price is not the market's.
     fn start_order(&mut self, req_uid: u64, s: &StartOrder, pending: bool, now: i64) -> Effects {
+        if self.stopping {
+            // The sweep has been through: an entry placed now would outlive
+            // the process that placed it.
+            return self
+                .orders
+                .fail_start(req_uid, s, "the core is stopping", now);
+        }
         if let Err(reason) = self.tradable(&s.market) {
             return self.orders.fail_start(req_uid, s, &reason, now);
         }
@@ -1327,6 +1362,107 @@ impl CoreHandler {
                 if self.manual.emulator { "on" } else { "off" }
             ),
         }
+    }
+
+    /// The terminal asked the core to leave, and it agreed.
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+
+    /// Positions of the core still open: a filled entry, with its exit live or
+    /// not yet placed. Emulated ones hold no money.
+    fn open_positions(&self) -> usize {
+        self.orders
+            .iter()
+            .filter(|o| !o.emulator && o.holds_position())
+            .count()
+    }
+
+    /// The rule the core leaves by (TInvestCore, as is): no order that can
+    /// open or grow a position is left resting with no core to watch it. The
+    /// exits stay — a position without its exit is worse than a position —
+    /// and the entries go. Shuts the terminal's `Start` first, then sweeps;
+    /// returns how many it asked to withdraw. What the caller waits on is
+    /// [`Self::live_entries`]: a withdrawal the exchange has not confirmed is
+    /// still the exchange's.
+    pub fn begin_stop(&mut self, now: i64) -> usize {
+        self.stopping = true;
+        self.sweep_entries(now)
+    }
+
+    /// Withdraw every entry still live, on every pass of the drain: a cancel
+    /// already out is not sent twice (the model holds it while its answer is
+    /// awaited), and one that failed — refused, lost to the transport — goes
+    /// out again. Returns how many entries it withdrew or asked to withdraw on
+    /// this pass.
+    pub fn sweep_entries(&mut self, now: i64) -> usize {
+        let ids: Vec<u64> = self
+            .orders
+            .iter()
+            .filter(|o| o.status == trade::status::BUY_SET || o.is_pending())
+            .map(|o| o.id)
+            .collect();
+        let pending = ids
+            .iter()
+            .filter(|id| self.orders.get(**id).is_some_and(|o| o.is_pending()))
+            .count();
+        let mut fx = Effects::default();
+        for id in ids {
+            fx.extend(self.orders.cancel_buy(id, now));
+        }
+        // Pending ones go at once, with no call; live ones by a cancel.
+        let sent = fx.actions.len() + pending;
+        if sent > 0 {
+            fx.logs
+                .push(format!("stop: withdrawing {sent} entry order(s)"));
+        }
+        self.effects(fx, now);
+        // Straight out, not on the next pump: the process is leaving.
+        self.flush_actions(now);
+        sent
+    }
+
+    /// Exits that have not settled on the exchange: queued for the worker, or
+    /// still on their way (`CoreOrder::exit_unsettled`). An entry that filled
+    /// while the stop was withdrawing it gets its exit this way, an exit being
+    /// moved is cancelled before its replacement goes, and the core must not
+    /// leave in between.
+    pub fn exits_in_flight(&self) -> usize {
+        let queued = self
+            .pending_actions
+            .iter()
+            .filter(|(a, _)| {
+                matches!(
+                    a,
+                    Action::Post { leg: Leg::Sell, .. } | Action::Replace { leg: Leg::Sell, .. }
+                )
+            })
+            .count();
+        queued
+            + self
+                .orders
+                .iter()
+                .filter(|o| !o.emulator && o.exit_unsettled())
+                .count()
+    }
+
+    /// Entry orders the exchange still holds; an emulated or pending one
+    /// never reached it.
+    pub fn live_entries(&self) -> usize {
+        self.orders
+            .iter()
+            .filter(|o| !o.emulator && o.status == trade::status::BUY_SET)
+            .count()
+    }
+
+    /// There is an order worker to send the withdrawals to.
+    pub fn can_withdraw(&self) -> bool {
+        self.trading.is_some() && !self.worker_lost
+    }
+
+    /// The last thing the core does: the orders on disk for the next start.
+    pub fn finish(&mut self) {
+        self.persist_orders(true, now_ms());
     }
 
     /// The core may send exchange orders for `market`.

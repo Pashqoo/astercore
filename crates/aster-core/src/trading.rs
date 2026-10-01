@@ -81,6 +81,9 @@ pub(crate) fn definitive(e: &rest::Error) -> bool {
     matches!(e, rest::Error::Api { status, .. } if (400..500).contains(status) && *status != 408)
 }
 
+/// The order worker's name in `FeedEvent::Lost`.
+pub const WORKER: &str = "the order worker";
+
 /// Pause between order calls: at most 10 a second, a fifth of the 300 per
 /// 10 s that the `ORDERS` limit of `exchangeInfo` allows, so one burst of
 /// cancels cannot spend the account's budget.
@@ -180,7 +183,17 @@ pub fn start(
                     };
                     let (order, leg, op) = describe(&action);
                     log::debug!("{action:?}");
-                    let done = execute(&mut rest, &mut signer, &action, &uid, grid);
+                    let mut done = execute(&mut rest, &mut signer, &action, &uid, grid);
+                    if done.code == Some(CODE_NONCE_EXPIRED) && done.reports.is_empty() {
+                        log::warn!("orders: request outside the time window, clock measured again");
+                        match rest.sync_clock() {
+                            Ok(_) => {
+                                clock_due = Instant::now() + crate::account::CLOCK_EVERY;
+                                done = execute(&mut rest, &mut signer, &action, &uid, grid);
+                            }
+                            Err(e) => log::warn!("orders: clock: {e}"),
+                        }
+                    }
                     let rtt = rest.last_rtt().unwrap_or(rest::CALL_TIMEOUT).as_millis() as i64;
                     send(TradingEvent::Ping(rtt));
                     for u in done.reports {
@@ -188,7 +201,14 @@ pub fn start(
                         send(TradingEvent::Order(u));
                     }
                     if let Some((definitive, msg)) = done.failed {
-                        log::warn!("{op:?} order {order:#x} {leg:?}: {msg}");
+                        if done.code == Some(CODE_REDUCE_ONLY) {
+                            log::error!(
+                                "{op:?} order {order:#x} {leg:?}: {msg} — the exit's reduce-only \
+                                 was refused: the core and the account disagree about the position"
+                            );
+                        } else {
+                            log::warn!("{op:?} order {order:#x} {leg:?}: {msg}");
+                        }
                         clock_due = Instant::now();
                         let failed = TradingEvent::Failed {
                             action,
@@ -203,7 +223,7 @@ pub fn start(
                 }
             }));
             if run.is_err() {
-                let _ = lost.send(FeedEvent::Lost("the order worker"));
+                let _ = lost.send(FeedEvent::Lost(WORKER));
             }
         })
         .expect("spawn");
@@ -228,14 +248,31 @@ fn describe(a: &Action) -> (u64, Leg, Op) {
 struct Done {
     reports: Vec<OrderUpdate>,
     failed: Option<(bool, String)>,
+    /// The exchange's code of that failure, when it gave one.
+    code: Option<i64>,
 }
 
 impl Done {
     fn fail(mut self, e: &rest::Error) -> Self {
         self.failed = Some((definitive(e), e.to_string()));
+        if let rest::Error::Api { code, .. } = e {
+            self.code = Some(*code);
+        }
         self
     }
 }
+
+/// `-4225 Nonce Expired`: the request's nonce was outside the gateway's
+/// window (docs, v3 «Nonce Mechanism» and its example answer). It was not
+/// carried out, so it is made again once the clock is measured anew. That
+/// helps a clock that fell behind; a sequence pushed ahead of the gateway
+/// stays ahead (`Signer::next_nonce` never steps back), and the retry then
+/// fails the same way and is reported.
+const CODE_NONCE_EXPIRED: i64 = -4225;
+/// `-2022 REDUCE_ONLY_REJECT`: an exit refused for its reduce-only flag — the
+/// core's model and the account disagree about the position, which is a
+/// defect to look into, not a market condition (`PLAN.md`, error codes).
+const CODE_REDUCE_ONLY: i64 = -2022;
 
 /// One action's exchange calls.
 ///

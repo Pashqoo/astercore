@@ -17,6 +17,8 @@ pub const CMD_KERNEL_LICENSE_STATE_REQUEST: u8 = 23;
 const CMD_PROFIT_STATE: u8 = 24;
 pub const CMD_SHARED_CONFIG: u8 = 28;
 pub const CMD_SHARED_CONFIG_REQUEST: u8 = 29;
+/// `TShutdownCommand` (empty body): the terminal asks the core to leave.
+pub const CMD_SHUTDOWN: u8 = 31;
 const CMD_TELEGRAM_STATE: u8 = 36;
 /// The terminal's Telegram controls: refresh (37) through logout (48). Each is
 /// fire-and-forget; the core answers every one with its full state (36).

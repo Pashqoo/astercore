@@ -533,6 +533,26 @@ impl CoreOrder {
         self.pending > 0.0
     }
 
+    /// Its exit is on the way and not yet resting confirmed: posted with no
+    /// answer, being moved (cancelled, its replacement deferred to the
+    /// cancel's final report), replaced or reconciled — or, for a filled
+    /// entry, an exit the order is still to place (a panic waiting for its
+    /// retry, a planned exit). An order with no exit planned has none coming.
+    pub(crate) fn exit_unsettled(&self) -> bool {
+        let ex = &self.sell;
+        match self.status {
+            status::SELL_SET => {
+                ex.cancel_requested
+                    || ex.deferred.is_some()
+                    || ex.replacing
+                    || ex.uncertain
+                    || ex.executions.last().is_some_and(|e| e.awaiting_reply)
+            }
+            status::BUY_DONE => self.panic || self.planned_ratio > 0.0,
+            _ => false,
+        }
+    }
+
     /// Filled entry, whole or part: the order holds a position to close.
     pub(crate) fn holds_position(&self) -> bool {
         matches!(self.status, status::BUY_DONE | status::SELL_SET)

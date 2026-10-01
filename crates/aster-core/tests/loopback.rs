@@ -32,7 +32,7 @@ use aster_core::order_store::OrderStore;
 use aster_core::orders::Action;
 use aster_core::strategies::Strategies;
 use aster_core::stream_health::StreamHealth;
-use aster_core::trading::TradeCommand;
+use aster_core::trading::{ExecStatus, OrderUpdate, TradeCommand, TradingEvent};
 use moonproto::server::codec::market_data::{delphi_days, Candle};
 use moonproto::server::key_export::ServerKey;
 use moonproto::server::Server;
@@ -420,10 +420,18 @@ impl FedCore {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let thread = thread::spawn(move || {
+            let mut stopping = false;
             while !flag.load(Ordering::Relaxed) {
                 server.step();
                 let (h, sessions) = server.split();
                 h.pump(sessions, &ev_rx);
+                // What `main` does once the terminal's shutdown is agreed:
+                // the stop sweeps the entries (and keeps serving here, so the
+                // test can watch it).
+                if h.shutdown_requested() && !stopping {
+                    stopping = true;
+                    h.begin_stop(now_ms());
+                }
             }
         });
         Self {
@@ -1186,35 +1194,170 @@ fn a_pending_order_keeps_its_own_stops_while_it_waits() {
         })
         .unwrap();
     let stops = moonproto::StopSettings::disabled().with_stop_loss_percent(3.0, 0.0);
-    client
-        .trade()
-        .new_pending_order(
-            moonproto::PendingOrderParams::new(
-                "BTCUSDT",
-                moonproto::OrderSide::Long,
-                85_000.0,
-                100.0,
+    // The trade and the order reach the core by different roads; until the
+    // trade is in, the core refuses the order for want of a price, which is
+    // its right answer — the order is then sent again.
+    let mut shown = false;
+    for _ in 0..5 {
+        client
+            .trade()
+            .new_pending_order(
+                moonproto::PendingOrderParams::new(
+                    "BTCUSDT",
+                    moonproto::OrderSide::Long,
+                    85_000.0,
+                    100.0,
+                )
+                .with_stops(stops),
             )
-            .with_stops(stops),
-        )
-        .expect("the order request itself is sent");
-    let shown = wait_until(Duration::from_secs(5), || {
-        client.drain_events().into_iter().any(|e| {
-            matches!(
-                e,
-                Event::Order(
-                    moonproto::state::OrderEvent::Created(o)
-                    | moonproto::state::OrderEvent::Updated(o)
-                ) if o.stops.stop_loss_enabled() && o.stops.stop_loss_level() == 82_450.0
-            )
-        })
-    });
+            .expect("the order request itself is sent");
+        let mut refused = false;
+        wait_until(Duration::from_secs(5), || {
+            for e in client.drain_events() {
+                match e {
+                    Event::Order(
+                        moonproto::state::OrderEvent::Created(o)
+                        | moonproto::state::OrderEvent::Updated(o),
+                    ) if o.stops.stop_loss_enabled() && o.stops.stop_loss_level() == 82_450.0 => {
+                        shown = true;
+                    }
+                    Event::ServerLog(l) if l.msg.contains("no price yet") => refused = true,
+                    _ => {}
+                }
+            }
+            shown || refused
+        });
+        if shown {
+            break;
+        }
+    }
     assert!(shown, "no image of the pending order with its stop");
     let call = std::iter::from_fn(|| orders.try_recv().ok())
         .find(|c| matches!(c, TradeCommand::Exchange { .. }));
     assert!(
         call.is_none(),
         "a pending order reached the exchange before its trigger"
+    );
+    let _ = client.disconnect();
+}
+
+/// A report of the exchange for the order the core just posted under `key`.
+fn report(key: &str, id: &str, status: ExecStatus, lots: i64, filled: i64) -> FeedEvent {
+    FeedEvent::Trading(TradingEvent::Order(OrderUpdate {
+        exchange_id: id.into(),
+        request_id: key.into(),
+        uid: "BTCUSDT".into(),
+        status,
+        sell: false,
+        is_market: false,
+        lots_requested: lots,
+        lots_executed: filled,
+        price: 83_000.0,
+        avg_price: if filled > 0 { 83_000.0 } else { 0.0 },
+        unary: true,
+        time_ms: now_ms(),
+        message: String::new(),
+    }))
+}
+
+fn log_line(client: &MoonClient, needle: &str) -> bool {
+    wait_until(Duration::from_secs(5), || {
+        client
+            .drain_events()
+            .into_iter()
+            .any(|e| matches!(e, Event::ServerLog(l) if l.msg.contains(needle)))
+    })
+}
+
+fn post_entry(client: &MoonClient, orders: &Receiver<TradeCommand>) -> String {
+    client
+        .trade()
+        .new_order(moonproto::NewOrderParams::new(
+            "BTCUSDT",
+            moonproto::OrderSide::Long,
+            83_000.0,
+            100.0,
+        ))
+        .expect("the order request itself is sent");
+    match next_action(orders) {
+        Action::Post { key, .. } => key,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// MoonBot's guarded shutdown: refused while the core holds a position.
+#[test]
+fn a_shutdown_is_refused_while_a_position_is_open() {
+    let (core, orders) = FedCore::trading();
+    let client = core.connect();
+    let key = post_entry(&client, &orders);
+    core.ev_tx
+        .send(report(&key, "901", ExecStatus::Filled, 1, 1))
+        .unwrap();
+    // The entry filled: the core now holds a position.
+    assert!(wait_until(Duration::from_secs(5), || {
+        client.drain_events().into_iter().any(|e| {
+            matches!(e, Event::Order(moonproto::state::OrderEvent::Updated(o))
+                if o.status == moonproto::OrderWorkerStatus::BuyDone)
+        })
+    }));
+    client.settings().request_core_shutdown().expect("sent");
+    assert!(
+        log_line(&client, "shutdown refused: 1 position(s)"),
+        "no refusal while a position is open"
+    );
+    let _ = client.disconnect();
+}
+
+/// Without a position the core agrees, and the stop withdraws the live entry:
+/// its cancel reaches the order worker. Nothing new may be entered after.
+#[test]
+fn a_shutdown_withdraws_the_live_entries() {
+    let (core, orders) = FedCore::trading();
+    let client = core.connect();
+    let key = post_entry(&client, &orders);
+    core.ev_tx
+        .send(report(&key, "902", ExecStatus::New, 1, 0))
+        .unwrap();
+    // Let the core take the report before the shutdown is judged.
+    assert!(wait_until(Duration::from_secs(5), || {
+        client.drain_events().into_iter().any(|e| {
+            matches!(e, Event::Order(moonproto::state::OrderEvent::Updated(o))
+                if o.status == moonproto::OrderWorkerStatus::BuySet)
+        })
+    }));
+    client.settings().request_core_shutdown().expect("sent");
+    assert!(log_line(&client, "the core is leaving"));
+    let cancel = next_action(&orders);
+    assert!(
+        matches!(&cancel, Action::Cancel { exchange_id, leg: aster_core::orders::Leg::Buy, .. } if exchange_id == "902"),
+        "{cancel:?}"
+    );
+    client
+        .trade()
+        .new_order(moonproto::NewOrderParams::new(
+            "BTCUSDT",
+            moonproto::OrderSide::Long,
+            83_000.0,
+            100.0,
+        ))
+        .expect("sent");
+    assert!(
+        log_line(&client, "the core is stopping"),
+        "an entry after the stop was not refused"
+    );
+    let post = std::iter::from_fn(|| orders.try_recv().ok()).find(|c| {
+        matches!(
+            c,
+            TradeCommand::Exchange {
+                action: Action::Post { .. },
+                ..
+            }
+        )
+    });
+    assert!(
+        post.is_none(),
+        "an entry after the stop reached the order worker"
     );
     let _ = client.disconnect();
 }

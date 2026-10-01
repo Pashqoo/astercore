@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aster_core::account;
 use aster_core::aster::rest::Rest;
@@ -356,11 +357,11 @@ fn main() -> ExitCode {
         engine::EXCHANGE_CODE
     );
 
-    // No stop path yet: there is nothing to put away on the way out — no
-    // orders, no positions, no file the core writes while it runs. A SIGINT
-    // ends it, and M4 brings the signal handling along with the state that
-    // will need saving first (`PLAN.md`, M4).
-    loop {
+    // Every way out of this loop goes through the stop below: the entries are
+    // withdrawn and the orders written before the process ends. A signal is
+    // not one of them yet — SIGINT/SIGTERM end the process at once, the
+    // entries stay with the exchange (`PLAN.md`, M4: signals).
+    let code = loop {
         server.step();
         // A dead refresher would leave its prices frozen, and nothing else in
         // the process would notice. Checked before the snapshots, because a
@@ -368,14 +369,18 @@ fn main() -> ExitCode {
         // keep serving what it last sent.
         if let Some(name) = feeds.dead() {
             log::error!("prices: the {name} refresher is gone — its prices would freeze");
-            return ExitCode::FAILURE;
+            break ExitCode::FAILURE;
         }
         let (handler, sessions) = server.split();
         handler.pump(sessions, &ev_rx);
         if handler.feed_lost() {
             log::error!("feed: the market feed is gone — the tape and books would freeze");
-            return ExitCode::FAILURE;
+            break ExitCode::FAILURE;
         }
+        if handler.shutdown_requested() {
+            break ExitCode::SUCCESS;
+        }
+        let mut gone = false;
         for _ in 0..APPLY_BATCH {
             match feeds.try_recv() {
                 Ok(snap) => handler.apply(snap),
@@ -387,9 +392,93 @@ fn main() -> ExitCode {
                 // move again, and the exit code is what brings it back.
                 Err(TryRecvError::Disconnected) => {
                     log::error!("prices: the refresher is gone — prices would freeze");
-                    return ExitCode::FAILURE;
+                    gone = true;
+                    break;
                 }
             }
+        }
+        if gone {
+            break ExitCode::FAILURE;
+        }
+    };
+    // Whatever the reason for leaving, the entries go first and the orders
+    // reach the disk last.
+    let clean = withdraw_entries(&mut server, &ev_rx);
+    let (handler, _) = server.split();
+    handler.finish();
+    // A shutdown that left orders with the exchange did not end cleanly.
+    if clean {
+        code
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// How long the stop waits for the exchange to confirm the withdrawals.
+///
+/// The worker paces its calls 100 ms apart and a cancel answers in about
+/// 0.3 s (measured 01.10: `/fapi/v1/time` 0.30 s; the cancels of the live test
+/// of 01.10 came back within a second), so some 2.5 a second: 30 s withdraws
+/// about 75 entries, more than this core has had at once. A stop that runs out
+/// of it still ends, and names what it left.
+const STOP_WITHDRAW: Duration = Duration::from_secs(30);
+/// How often the drain asks again about entries still live.
+const SWEEP_EVERY: Duration = Duration::from_secs(1);
+
+/// The rule the core leaves by (TInvestCore): no order that can open or grow
+/// a position is left resting with no core to watch it. The exits stay, the
+/// terminal's `Start` is shut before the first sweep, and the sweep runs on
+/// every pass, since a pending entry may trigger meanwhile. A stop that cannot
+/// reach the exchange still ends, and says what it leaves behind. The drain
+/// also waits for exits still on their way — an entry that filled while it was
+/// being withdrawn gets one, and leaving before it is out would leave the
+/// position bare. `false` when the stop left orders with the exchange.
+fn withdraw_entries(
+    server: &mut Server<CoreHandler>,
+    rx: &mpsc::Receiver<feed::FeedEvent>,
+) -> bool {
+    let deadline = Instant::now() + STOP_WITHDRAW;
+    let mut held = {
+        let (handler, _) = server.split();
+        handler.begin_stop(engine::now_ms());
+        let left = handler.live_entries();
+        if left == 0 && handler.exits_in_flight() == 0 {
+            return true;
+        }
+        left
+    };
+    // Once a second, not every pass: a cancel the exchange keeps refusing
+    // must not turn into a call every few milliseconds for the whole budget.
+    let mut swept = Instant::now();
+    loop {
+        server.step();
+        let (handler, sessions) = server.split();
+        handler.pump(sessions, rx);
+        if !handler.can_withdraw() {
+            let (left, exits) = (handler.live_entries(), handler.exits_in_flight());
+            log::warn!(
+                "stop: the order worker is gone — {left} entry order(s) stay with the \
+                 exchange, {exits} exit(s) not confirmed: check them by hand"
+            );
+            return left == 0 && exits == 0;
+        }
+        if swept.elapsed() >= SWEEP_EVERY {
+            swept = Instant::now();
+            handler.sweep_entries(engine::now_ms());
+        }
+        let (left, exits) = (handler.live_entries(), handler.exits_in_flight());
+        if left == 0 && exits == 0 {
+            log::info!("stop: every entry order withdrawn");
+            return true;
+        }
+        held = held.max(left);
+        if Instant::now() >= deadline {
+            log::warn!(
+                "stop: {left} of {held} entry order(s) still with the exchange, {exits} exit(s) \
+                 not confirmed after {}s — check them by hand",
+                STOP_WITHDRAW.as_secs()
+            );
+            return false;
         }
     }
 }
