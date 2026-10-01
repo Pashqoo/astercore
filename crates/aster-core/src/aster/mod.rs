@@ -7,4 +7,5 @@
 
 pub mod json;
 pub mod rest;
+pub mod sign;
 pub mod ws;

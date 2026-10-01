@@ -382,6 +382,20 @@ pub struct Ticker24h {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
 pub struct Dec(#[serde(deserialize_with = "str_f64")] pub f64);
 
+/// One asset of `GET /fapi/v3/balance` (signed, weight 5).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Balance {
+    #[serde(default)]
+    pub asset: String,
+    /// Wallet balance.
+    #[serde(default, deserialize_with = "str_f64")]
+    pub balance: f64,
+    #[serde(default, deserialize_with = "str_f64", rename = "crossUnPnl")]
+    pub cross_un_pnl: f64,
+    #[serde(default, deserialize_with = "str_f64", rename = "availableBalance")]
+    pub available: f64,
+}
+
 /// One aggregated trade, from `<symbol>@aggTrade` or `GET /fapi/v1/aggTrades`.
 ///
 /// Measured 01.10 the two carry the same fields under the same names; the

@@ -2,8 +2,8 @@
 //!
 //! Aster speaks the Binance USDⓈ-M Futures dialect: plain `GET`/`POST` with
 //! query parameters, JSON answers, decimal strings for every number. Signed
-//! endpoints are not reached yet — M0 and M1 are entirely public, which is why
-//! the credential question (`PLAN.md` §10) does not block them.
+//! calls take the v3 form (`sign.rs`): the signer's network decides where they
+//! go, the public calls stay on mainnet.
 //!
 //! Synchronous on purpose (`ureq`, no Tokio): the core is thread-per-stream,
 //! and a runtime would be the only async thing in the process.
@@ -16,9 +16,10 @@ use ureq::http::Response;
 use ureq::{Agent, Body};
 
 use super::json::{
-    kline_row, AggTrade, ApiError, BookTicker, DepthSnapshot, ExchangeInfo, Kline, PremiumIndex,
-    ServerTime, Ticker24h,
+    kline_row, AggTrade, ApiError, Balance, BookTicker, DepthSnapshot, ExchangeInfo, Kline,
+    PremiumIndex, ServerTime, Ticker24h,
 };
+use super::sign::Signer;
 
 pub const BASE: &str = "https://fapi.asterdex.com";
 
@@ -78,8 +79,8 @@ pub struct Usage {
 pub struct Rest {
     agent: Agent,
     /// `server_time - local_time`, in milliseconds, from the last
-    /// [`Rest::sync_clock`]. Signed calls add it to their `timestamp`, or the
-    /// gateway answers `-1021 INVALID_TIMESTAMP`.
+    /// [`Rest::sync_clock`]. Signed calls add it to their nonce, which the
+    /// gateway refuses outside ±60 s of its own clock.
     clock_delta_ms: i64,
     usage: Usage,
     /// Round trip of the last call that got an answer of any status.
@@ -93,6 +94,9 @@ impl Rest {
             // must reach `check_status` as a response with a body, not as a
             // transport error that has thrown the body away.
             .http_status_as_error(false)
+            // A signed query is a bearer for its nonce's minute: a 3xx must not
+            // carry it to whatever host the redirect names.
+            .max_redirects(0)
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_global(Some(CALL_TIMEOUT))
             .build()
@@ -243,6 +247,11 @@ impl Rest {
         }
     }
 
+    /// `GET /fapi/v3/balance`, signed, weight 5: every asset of the account.
+    pub fn balance(&mut self, signer: &mut Signer) -> Result<Vec<Balance>, Error> {
+        self.signed_get(signer, "/fapi/v3/balance", &[])
+    }
+
     fn get<T: DeserializeOwned>(&mut self, path: &str, query: &[(&str, &str)]) -> Result<T, Error> {
         let mut url = format!("{BASE}{path}");
         for (i, (k, v)) in query.iter().enumerate() {
@@ -251,11 +260,31 @@ impl Rest {
             url.push('=');
             url.push_str(v);
         }
+        self.fetch(&url, path)
+    }
 
+    /// A v3-signed `GET`: the signed query string goes after `?` as it was
+    /// signed, because the gateway checks the signature against those bytes.
+    fn signed_get<T: DeserializeOwned>(
+        &mut self,
+        signer: &mut Signer,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<T, Error> {
+        let now_us = (now_us() + self.clock_delta_ms * 1000).max(0) as u64;
+        let url = format!(
+            "{}{path}?{}",
+            signer.network().rest_base(),
+            signer.sign_query(query, now_us)
+        );
+        self.fetch(&url, path)
+    }
+
+    fn fetch<T: DeserializeOwned>(&mut self, url: &str, path: &str) -> Result<T, Error> {
         let sent = Instant::now();
         let sending = self
             .agent
-            .get(&url)
+            .get(url)
             .header("Accept", "application/json")
             .call();
         // The elapsed time of the one exchange, whatever came of it: a refusal
@@ -339,5 +368,13 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Microseconds since the Unix epoch, the unit of a v3 nonce.
+pub fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
 }

@@ -14,11 +14,18 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 struct StderrLog;
 
 impl Log for StderrLog {
-    fn enabled(&self, _: &Metadata) -> bool {
-        true
+    // `ureq` writes a request's query into its debug line only when its trace
+    // is enabled (`log_enabled!(Trace)`, asked of this method), and a signed
+    // query carries the signature (`aster/sign.rs`). So the HTTP stack never
+    // gets trace, whatever `ASTER_CORE_LOG` says.
+    fn enabled(&self, m: &Metadata) -> bool {
+        !(m.level() == Level::Trace && m.target().starts_with("ureq"))
     }
 
     fn log(&self, record: &Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
         let level = match record.level() {
             Level::Error => "E",
             Level::Warn => "W",

@@ -20,6 +20,13 @@ ureq = { version = "3", features = ["json", "socks-proxy"] }
 # one thread per stream and no runtime (`PLAN.md`, "Транспорт"). Built on the
 # rustls already in the tree for `ureq`, with the same webpki roots.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+# Aster v3 signing: EIP-712 over secp256k1 with Keccak-256 (`aster/sign.rs`).
+# `k256` 0.13 sits on the same `digest` 0.10 as the `sha3` already in the tree,
+# so the pair adds one curve crate rather than a second hashing generation.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+sha3 = "0.10"
+# Already in the tree under `k256`; wipes the key file's text after parsing.
+zeroize = "1"
 
 # No `libc` yet. TInvestCore carries it so that `systemctl stop` is the same
 # graceful stop as its web page's button — this core has neither a stop path nor
