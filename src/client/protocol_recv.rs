@@ -30,7 +30,7 @@ impl ProtocolCore<'_> {
         max_datagrams: usize,
         mode: &mut RunMode<'_>,
     ) -> RecvPhaseOutcome {
-        let mut buf = [0u8; 65535];
+        let mut buf = std::mem::take(&mut self.client.transport.recv_buf);
         let mut drained_any = false;
         let mut deadline_reached = false;
         let mut datagrams = 0usize;
@@ -69,6 +69,8 @@ impl ProtocolCore<'_> {
                         .transport
                         .current_received_packets
                         .wrapping_add(1);
+                    self.client.transport.current_received_bytes =
+                        self.client.transport.current_received_bytes.wrapping_add(n as u64);
                     let continue_recv = self.process_datagram(&buf[..n], n as u64, mode);
                     self.drain_post_receive_delivery(cur_tm, mode);
                     if !continue_recv {
@@ -95,6 +97,7 @@ impl ProtocolCore<'_> {
             }
         }
 
+        self.client.transport.recv_buf = buf;
         if drained_any {
             self.rearm_recv_poller();
         }

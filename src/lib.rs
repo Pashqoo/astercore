@@ -172,7 +172,7 @@ pub use client::{
     InitialStrategies, LifecycleEvent, LiveCandleSubscription, MoonAccount, MoonBalances,
     MoonCandles, MoonChartAlerts, MoonChartText, MoonClient, MoonClientError, MoonClientEvent,
     MoonClientSnapshot, MoonEmulator, MoonEventQueue, MoonEventSink, MoonHistory, MoonOrders,
-    MoonReports, MoonSettings, MoonStrategies, MoonStreams, MoonTrade, NewOrderParams,
+    MoonReports, MoonSettings, MoonStrategies, MoonStreams, MoonTelegram, MoonTrade, NewOrderParams,
     NewOrderTicket, OrderSide, OrderTarget, PendingOrderParams, RefreshConfig, SellOrderParams,
     SplitOrderParams, StartupState, StartupStatus, TradeContextError, TradesStreamMode,
     TradesSubscription, TransportMode, VStopParams,
@@ -242,6 +242,7 @@ pub use state::{
     ReportFieldKind, ReportFieldValue, ReportHistoryDepth, ReportRecIdRange, ReportRow,
     ReportRowsDeleted, ReportSchema, ReportSchemaField, ReportSyncCheckpoint, ReportSyncComplete,
     ReportSyncPage, ReportSyncRequest, ReportSyncTicket, ReportValue,
+    ReportTrace, ReportTracePoint, ReportTraceTicket,
 };
 #[cfg(any(test, feature = "diagnostics"))]
 #[doc(hidden)]

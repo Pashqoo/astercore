@@ -40,6 +40,8 @@ retains/calculates data only for the listed markets. Passing an empty market
 list means all markets. This filtered storage mode is an accepted Rust API
 deviation for UI clients that want lower memory usage.
 
+For small headless capture stations, use the [Compact profile](#compact-capture-stations).
+
 Unlike MoonBot UI, the Rust library does not subscribe to all trades unless the
 application asks for it. Without a trades subscription intent, incoming trade
 stream packets are treated as unexpected and are dropped instead of becoming
@@ -126,17 +128,33 @@ let ticket = client.history().request_chart_for(&market)?;
 
 `MarketHistoryEvent::Ready` is emitted only after the archive has been merged
 into the market's retained readers. The archive contains detailed futures
-trades, compact mini-candles, LastPrice points, and liquidations. Rows are
-decoded oldest first; live rows received while the archive is in flight are
-preserved, overlapping rows are deduplicated, and the configured ring
-capacities are applied. Restart that chart's cursors from the oldest retained
+trades, compact mini-candles, LastPrice points, and liquidations. Configured ring
+capacities still apply. Restart that chart's cursors from the oldest retained
 row after `Ready` so the newly prepended history is included.
+
+Futures trades are joined by time, not by comparing trade identities: the core
+can aggregate the same trades differently in its archive and live stream.
+MoonProto uses the archive up to one second before its newest trade, then the
+retained live tail. If that tail is shorter or has not caught up, it uses more
+of the archive instead. Existing history older than the archive is preserved.
+Every group with the same timestamp comes from just one input; distinct or
+identical-looking trades within that input are not deduplicated. Late live
+packets cannot append trades inside the already applied archive interval.
+
+The archive is generated on demand. The one-second margin covers ordinary
+aggregation/drain timing; it is not a delivery guarantee. A small volume error
+at the join is possible because aggregation boundaries and timestamp precision
+differ. Retained history is chart data, not an exact exchange execution ledger.
+Do not infer live packet loss from different live/archive row counts. Repeating
+a chart request replaces the overlap rather than accumulating both versions.
 
 Requests for different markets may run concurrently. MoonProto assembles each
 response by request identity, extends its wait after every new chunk, and
 retries the complete request after 15 seconds without progress. Applications
-do not assemble chunks or retry protocol packets themselves. The market must
-already be part of the retained trades scope.
+do not assemble chunks or retry protocol packets themselves. Queue the market's
+trades subscription before its chart request; waiting for published readers is
+not necessary. Outside the selected scope, the request fails through
+`MarketHistoryEvent::Failed`. Forgetting a pair cancels its pending request.
 
 ## Retained Readers
 
@@ -536,7 +554,193 @@ stream can be processed, memory can grow. Keep event callbacks light, use sane
 history capacities/scopes, and use FireTest/diagnostics CPU summaries to catch
 worker overload during integration.
 
+## Compact Capture Stations
+
+Use this profile to save a chart segment around a bot trade: the available
+history before the purchase, the live tape from purchase to close, and a short
+post-close tail. The station stores the segment in its own database or file;
+MoonProto supplies the initial archive and subsequent live rows while retaining
+only selected pairs. No core update or new protocol command is required.
+
+**Subscribe once, request the initial archive, then keep reading the live
+tape until the capture ends.** Do not replace this workflow with periodic
+`request_chart` polling. Receiving the archive does not end the subscription;
+the archive seeds the chart, and the live stream extends it.
+
+```rust
+use moonproto::{ClientConfig, TradesStreamMode, state::MarketHistorySizing};
+
+let cfg = ClientConfig::new(host, port, master_key, mac_key)
+    .with_market_history(MarketHistorySizing::compact_with_budget_percent(100));
+
+// After connecting with cfg, select the first pair to capture.
+client.streams().subscribe_trades_for(TradesStreamMode::TradesOnly, ["BTCUSDT"])?;
+let ticket = client.history().request_chart("BTCUSDT")?;
+// No snapshot/readers wait is needed between these two calls.
+```
+
+Each `subscribe_trades_for` call replaces the selection: pass the complete set
+of pairs still needed, including earlier captures. It does not add one pair to
+the previous set. Selection limits retained memory, not network traffic: while
+subscribed, the core sends the exchange-wide trade stream.
+
+`Compact` is equivalent to `compact_with_budget_percent(100)`. At 100% each
+selected market has capacities of 5,000 rows per trade tape and 1,000 points per
+LastPrice/MarkPrice line, liquidation tape, and mini-candle ring. Values are
+clamped to **75..=200%** and scale all these capacities proportionally. Unlike
+`Auto`, Compact does not depend on host RAM or exchange. The normal terminal
+profile and its 75..=800% control are unchanged.
+
+Compact has no retained MM or 5-minute candle rings and **does not automatically
+request the all-market candles snapshot**, including when the selection changes.
+Use `TradesOnly`; MM data is not needed for this capture workflow. Explicit
+chart archive requests still work. At the usual two-second market refresh,
+1,000 price points represent roughly 33 minutes, not a guaranteed time window.
+Trade rings limit row count, not elapsed time.
+
+### Station Lifecycle
+
+1. **Purchase: start the capture.** From the application's order/report updates,
+   record the trade identity, pair, and desired start time (purchase time minus
+   any pre-purchase context). Add the pair to the selected set, call
+   `subscribe_trades_for(TradesOnly, selected_pairs)`, then immediately request
+   that pair's chart. Live data starts accumulating while the archive is in
+   flight. If the station already records this pair and has the required
+   history, share that recording instead of starting another subscription or
+   archive request.
+2. **Archive ready: seed local storage.** Match `MarketHistoryEvent::Ready` to
+   the request ticket. Obtain the pair's readers from the current snapshot and
+   create a `cursor_from_oldest()` for each required ring. Drain the merged
+   history into the station's storage, filtering by the desired start time.
+   Do not start with `cursor_from_now()`: that would skip the archive and live
+   rows already received. The library performs the archive/live join; the
+   station does not append a separate raw archive on top of live data.
+3. **While open: keep the subscription and save new rows.** Reuse the readers,
+   cursors, and batch buffers; regularly drain new rows into the same local
+   recording. No repeated chart requests are needed during normal connected
+   capture. Do not wait for the deal to close before reading the rings.
+4. **Close: collect the tail.** Record the desired end time as the close time
+   plus the configured tail. Keep recording until that interval has elapsed,
+   perform a final drain, and finalize the stored segment. If the pair was
+   forgotten earlier, select it again and request its archive before collecting
+   the tail; that starts a fresh capture of the available closing window.
+5. **Finish: release the pair.** Remove it from the selection only when no other
+   capture needs it. When no pairs remain, call `unsubscribe_all_trades()`.
+   This sends the wire unsubscribe and releases library-owned histories and
+   the history worker.
+
+### Save Continuously
+
+**A retained ring is a bounded buffer, not storage for the entire deal.** At
+100%, a trade tape holds 5,000 rows, not a guaranteed number of minutes. To keep
+the complete captured interval without growing library RAM, continuously copy
+new rows to the station's database or temporary file and finalize it at the end.
+This is local ring reading, not polling the core for archives.
+
+Use `reader.drain_new_bounded(&mut cursor, batch_size, &mut rows)` with a saved
+cursor per ring. Persist each returned batch before reusing the buffer; when
+`caught_up` is false, continue draining the backlog. Schedule reads frequently
+enough for the selected markets' trade rate. `TradesEvent::Applied` can wake
+the reader, but also read on the next normal capture update: the event is not
+a retained-write barrier. `meta.clipped` means unread rows were overwritten;
+mark that segment incomplete instead of silently calling it complete. See
+[retained readers](#retained-readers) for the cursor API.
+
+Keep all rows in the chosen time interval, including multiple trades with the
+same timestamp. Advance by the ring cursor, not by dropping everything at or
+before the last saved timestamp. Apply the desired time-window filter to each
+batch; late rows need not arrive in timestamp order. Save any required price
+lines, mini-candles, and liquidations through their own readers and cursors.
+
+An archive contains only history the core still retains, trimmed to the
+configured local capacities. Network loss can also leave gaps; automatic
+[stream recovery](#recovery-policy) is not a lossless-recording guarantee.
+Waiting for an archive or seeing `Ready` does not prove that the entire desired
+time interval exists. This workflow records available chart data, not a
+certified exchange execution ledger.
+
+### Capture Limits And Cleanup
+
+A memory-limited station can stop an unfinished capture after ten minutes:
+forget the pair and discard its temporary recording, without saving a finished
+segment. A later sale starts the closing-window capture described above. The
+discarded middle is deliberately not recorded; do not promise a full
+purchase-to-close segment for a capture cancelled by this policy.
+
+Keep at most the station's configured number of pairs; evict older captures
+when admitting a new pair at that limit. Shared pairs remain selected while
+any other capture needs them. These limits are application policy, not timers
+or limits automatically imposed by MoonProto.
+
+Timers, the pair limit, eviction selection, and saving belong to the station,
+not the library. **Strongly prefer a short post-sale interval, for example
+5-15 seconds, and a small pair limit, for example 50.** Longer intervals keep
+more captures active and increase the station's saved data. Slow local draining
+can overwrite unread rows in the finite rings regardless of capture duration.
+More pairs and larger rings require more VPS RAM. A small pair limit permits
+a larger percentage; with more pairs, reduce the percentage or increase RAM.
+
+To forget one pair, call `subscribe_trades_for` with the remaining nonempty
+list. **An empty list means all markets, not none**; use
+`unsubscribe_all_trades()` when the list becomes empty. Drop application-held
+readers and snapshots that reference old rings, plus temporary row copies, when
+forgetting a capture. Keeping a reader alive intentionally keeps its ring alive.
+Freed allocations may be reused by the allocator instead of immediately lowering
+the process's displayed working set.
+
+`MarketHistoryEvent::Ready` confirms the chart was merged into retained history;
+readers are then available in the snapshot. A request outside the current
+selection, or one whose pair is forgotten before completion, produces
+`MarketHistoryEvent::Failed`. Removing a pair cancels its outstanding archive
+collection/retries. Re-selecting it starts fresh storage. The archive contains
+what the core still retains; it cannot guarantee recovery of a discarded buy
+window or every original exchange tick.
+
+### Memory Estimate
+
+On 64-bit builds, trade and price rows occupy 16 bytes; mini-candles occupy
+32 bytes. With every Compact ring materialized at 100%, one pair uses:
+
+```text
+2 trade tapes * 5,000 * 16      = 160,000 bytes
+2 price lines * 1,000 * 16      =  32,000 bytes
+liquidations * 1,000 * 16       =  16,000 bytes
+mini-candles * 1,000 * 32       =  32,000 bytes
+total ring payload             = 240,000 bytes per pair
+```
+
+| Selected pairs | 75% | 100% | 200% |
+| --- | ---: | ---: | ---: |
+| 10 | 1.8 MB | 2.4 MB | 4.8 MB |
+| 50 | 9 MB | 12 MB | 24 MB |
+| 100 | 18 MB | 24 MB | 48 MB |
+
+These are decimal MB of **ring payload, not total process RAM**. Rings allocate
+only on first data: without a spot tape, for example, 50 futures pairs at 100%
+need about 8 MB of ring payload. Add ring/analytics metadata, normal client and
+protocol state, queued work, and any copies retained by the station. Chart
+archives are downloaded and unpacked at the core's size before trimming to the
+small rings, so concurrent archive requests cause temporary memory peaks.
+Request only charts actually needed; the Compact percentage is not a total
+process-memory cap.
+
 ## Recovery Policy
+
+Subscription changes are asynchronous. MoonProto keeps the latest requested
+state across reconnects and repairs reordered stream-control requests:
+
+- After an explicit unsubscribe, incoming live trade packets trigger another
+  unsubscribe, at most once per five seconds. A quiet connection is not polled.
+- While subscribed, fifteen seconds without live trade packets trigger the
+  existing unsubscribe/wait/subscribe sequence, even in the same connection.
+  A genuinely idle core may also cause this harmless retry.
+- A later explicit unsubscribe cancels the intent to resubscribe. Delayed resend
+  responses do not count as evidence that the live stream is still enabled.
+
+Applications do not need a separate subscription watchdog. Recovery is eventual,
+not instantaneous: packets already in flight may arrive after unsubscribe and
+are discarded without recreating retained history. Network outages or exhausted
+transport retries can delay convergence until communication resumes.
 
 MoonClient's trades recovery state maintains up to 50 gap buckets. Missing
 packet numbers are requested for up to three bucket retry cycles with a delay

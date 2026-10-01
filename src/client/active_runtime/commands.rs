@@ -40,7 +40,7 @@ pub(super) enum RuntimeCommand {
     MarketHistory(crate::state::MarketHistoryTicket),
     Ui(UiRuntimeCommand),
     Strat(StratRuntimeCommand),
-    StrategySnapshotBatch(Vec<crate::commands::strategy_serializer::StrategySnapshot>),
+    StrategySnapshotBatch(Vec<crate::commands::strategy_serializer::StrategySnapshot>, bool),
     StrategyFolders {
         strategies: Option<Vec<crate::commands::strategy_serializer::StrategySnapshot>>,
         paths: Vec<String>,
@@ -54,6 +54,7 @@ pub(super) enum RuntimeCommand {
         is_start: bool,
     },
     ReportSchemaRefresh,
+    ReportTraces(crate::state::ReportTraceTicket),
     ReportSync {
         ticket: crate::state::ReportSyncTicket,
         request: crate::state::ReportSyncRequest,
@@ -68,6 +69,8 @@ pub(super) enum RuntimeCommand {
     },
     #[cfg(any(test, feature = "diagnostics"))]
     DebugOutgoingBlackhole(bool),
+    #[cfg(any(test, feature = "diagnostics"))]
+    DebugSendTradesSubscription(bool),
     #[cfg(any(test, feature = "diagnostics"))]
     DebugResetErrEmuDiagnostics,
     #[cfg(any(test, feature = "diagnostics"))]
@@ -117,6 +120,7 @@ pub(super) enum UiRuntimeCommand {
     Shutdown,
     ProblemsClear,
     ProblemsTest(String),
+    Telegram(crate::commands::ui::TelegramAction),
     KernelLicenseStateRequest,
     AutoDetect(bool),
 }
@@ -234,7 +238,7 @@ impl RuntimeCommand {
             Self::MarketHistory(_) => (21, 1),
             Self::Ui(cmd) => cmd.profile_source(),
             Self::Strat(cmd) => cmd.profile_source(),
-            Self::StrategySnapshotBatch(strategies) => (50, strategies.len()),
+            Self::StrategySnapshotBatch(strategies, _) => (50, strategies.len()),
             Self::StrategyFolders { paths, .. } => (50, paths.len()),
             Self::StrategySetChecked { .. } => (51, 1),
             Self::StrategySendCheckedDelta => (52, 0),
@@ -245,8 +249,11 @@ impl RuntimeCommand {
             Self::ReportCheckOpenRows(rec_ids) => (60, rec_ids.len()),
             Self::ReportSetRowsDeleted(batches) => (61, batches.len()),
             Self::ReportAliveMap { .. } => (62, 1),
+            Self::ReportTraces(_) => (63, 1),
             #[cfg(any(test, feature = "diagnostics"))]
             Self::DebugOutgoingBlackhole(_) => (56, 0),
+            #[cfg(any(test, feature = "diagnostics"))]
+            Self::DebugSendTradesSubscription(_) => (93, 0),
             #[cfg(any(test, feature = "diagnostics"))]
             Self::DebugResetErrEmuDiagnostics => (57, 0),
             #[cfg(any(test, feature = "diagnostics"))]
@@ -280,6 +287,7 @@ impl UiRuntimeCommand {
             Self::Shutdown => (42, 0),
             Self::ProblemsClear => (43, 0),
             Self::ProblemsTest(_) => (44, 1),
+            Self::Telegram(_) => (45, 1),
             Self::KernelLicenseStateRequest => (36, 0),
             Self::AutoDetect(_) => (37, 0),
             Self::SharedConfigRequest => (38, 0),

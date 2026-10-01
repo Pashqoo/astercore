@@ -242,7 +242,9 @@ pub(super) fn runtime_loop(
                         + pending.transfer_assets.len()
                         + pending.engine_actions.len(),
                 );
-            let strategy_edits_changed = dispatcher.tick_strategy_edit_timeouts(Instant::now());
+            let now = Instant::now();
+            let strategy_edits_changed = dispatcher.tick_strategy_edit_timeouts(now);
+            dispatcher.tick_report_trace_timeouts(now);
             candles_changed
                 || market_history_changed
                 || coin_card_changed
@@ -395,11 +397,15 @@ impl StartupStatusPublisher {
         self.cached.current_local_udp_port = client.transport.current_local_port;
         self.cached.current_port_sent_packets = client.transport.current_sent_packets;
         self.cached.current_port_received_packets = client.transport.current_received_packets;
+        self.cached.current_port_sent_bytes = client.transport.current_sent_bytes;
+        self.cached.current_port_received_bytes = client.transport.current_received_bytes;
         self.cached.previous_local_udp_port = client.transport.previous_local_port;
         self.cached.sent_packets_before_last_port_change = client.transport.previous_sent_packets;
         self.cached.received_packets_before_last_port_change =
             client.transport.previous_received_packets;
         self.cached.local_port_change_count = client.transport.rebind_count;
+        self.cached.sent_bytes_before_last_port_change = client.transport.previous_sent_bytes;
+        self.cached.received_bytes_before_last_port_change = client.transport.previous_received_bytes;
         if self.startup_finished {
             self.store(now);
             return;
@@ -525,9 +531,13 @@ mod startup_status_tests {
         client.transport.current_local_port = Some(31000);
         client.transport.current_sent_packets = 17;
         client.transport.current_received_packets = 23;
+        client.transport.current_sent_bytes = 170;
+        client.transport.current_received_bytes = 230;
         client.transport.previous_local_port = Some(30999);
         client.transport.previous_sent_packets = 11;
         client.transport.previous_received_packets = 13;
+        client.transport.previous_sent_bytes = 110;
+        client.transport.previous_received_bytes = 130;
         client.transport.rebind_count = 1;
         receive_partial_sliced(&mut client, 7);
         publisher.last_rate_sample_at = Instant::now() - Duration::from_secs(1);
@@ -560,6 +570,10 @@ mod startup_status_tests {
         assert_eq!(status.sent_packets_before_last_port_change, 11);
         assert_eq!(status.received_packets_before_last_port_change, 13);
         assert_eq!(status.local_port_change_count, 1);
+        assert_eq!(status.current_port_sent_bytes, 170);
+        assert_eq!(status.current_port_received_bytes, 230);
+        assert_eq!(status.sent_bytes_before_last_port_change, 110);
+        assert_eq!(status.received_bytes_before_last_port_change, 130);
     }
 
     #[test]
@@ -582,11 +596,15 @@ mod startup_status_tests {
 
         receive_partial_sliced(&mut client, 8);
         client.authorized = true;
+        client.transport.current_sent_bytes = 111;
+        client.transport.current_received_bytes = 222;
         publisher.publish(&client, None, true);
         let status = *shared.read();
         assert_eq!(status.state, StartupState::Ready);
         assert_eq!(status.reconnect_count, 1);
         assert_eq!(status.received_sliced_bytes, bytes_at_ready);
+        assert_eq!(status.current_port_sent_bytes, 111);
+        assert_eq!(status.current_port_received_bytes, 222);
         assert!(status.completed_steps.contains(InitStep::StartupSnapshot));
         assert!(status.completed_steps.contains(InitStep::StartupEvents));
     }
@@ -873,6 +891,9 @@ mod tests {
     fn moon_trade_new_order_builds_v4_start_command() {
         let mut client = ready_client();
         let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut stops = StopSettings::disabled()
+            .with_stop_loss_percent(2.5, 0.1)
+            .with_take_profit_price(15.0);
 
         let changed = handle_trade_action(
             &mut client,
@@ -881,13 +902,15 @@ mod tests {
                 params: NewOrderParams::new("DOGEUSDT", OrderSide::Short, 12.5, 0.25)
                     .with_strategy_id(42)
                     .with_planned_sell_price(15.0)
-                    .with_market_stop(true),
+                    .with_market_stop(true)
+                    .with_stops(stops),
                 request_uid: 0xCAFE_BABE,
             },
         )
         .expect("v4 start command does not need legacy route bytes");
 
         assert!(!changed);
+        stops.take_profit_changed = DelphiBool::TRUE;
         let (_, high, _) = client.take_send_queues_for_test();
         assert_eq!(high.len(), 1);
         match TradeCommand::parse(&high[0].data).expect("valid new order") {
@@ -900,6 +923,7 @@ mod tests {
                     size,
                     price,
                     planned_sell_price,
+                    stops: sent_stops,
                 } => {
                     assert_eq!(cmd.header.uid, 0xCAFE_BABE);
                     assert_eq!(market_name, "DOGEUSDT");
@@ -908,6 +932,7 @@ mod tests {
                     assert_eq!(size, 0.25);
                     assert_eq!(price, 12.5);
                     assert_eq!(planned_sell_price, 15.0);
+                    assert_eq!(sent_stops, Some(stops));
                 }
                 other => panic!("unexpected order payload: {other:?}"),
             },
@@ -919,6 +944,7 @@ mod tests {
     fn moon_trade_new_pending_order_builds_v4_start_pending_command() {
         let mut client = ready_client();
         let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut stops = StopSettings::disabled().with_stop_loss_fixed(2000.0, 0.2);
 
         let changed = handle_trade_action(
             &mut client,
@@ -927,13 +953,15 @@ mod tests {
                 params: PendingOrderParams::new("ETHUSDT", OrderSide::Long, 2100.0, 250.0)
                     .with_strategy_id(42)
                     .with_planned_sell_price(2200.0)
-                    .with_market_stop(true),
+                    .with_market_stop(true)
+                    .with_stops(stops),
                 request_uid: 0xCAFE_BABF,
             },
         )
         .expect("v4 pending command does not need legacy route bytes");
 
         assert!(!changed);
+        stops.take_profit_changed = DelphiBool::TRUE;
         let (_, high, _) = client.take_send_queues_for_test();
         assert_eq!(high.len(), 1);
         match TradeCommand::parse(&high[0].data).expect("valid pending order") {
@@ -946,6 +974,7 @@ mod tests {
                     size,
                     trigger_price,
                     planned_sell_price,
+                    stops: sent_stops,
                 } => {
                     assert_eq!(cmd.header.uid, 0xCAFE_BABF);
                     assert_eq!(market_name, "ETHUSDT");
@@ -954,6 +983,7 @@ mod tests {
                     assert_eq!(size, 250.0);
                     assert_eq!(trigger_price, 2100.0);
                     assert_eq!(planned_sell_price, 2200.0);
+                    assert_eq!(sent_stops, Some(stops));
                 }
                 other => panic!("unexpected order payload: {other:?}"),
             },
@@ -962,30 +992,42 @@ mod tests {
     }
 
     #[test]
-    fn moon_trade_bare_pending_sends_zero_strategy_id() {
-        let mut client = ready_client();
-        let mut dispatcher = crate::events::EventDispatcher::new();
+    fn moon_trade_bare_orders_keep_absent_and_disabled_stops_distinct() {
+        for pending in [false, true] {
+            for stops in [None, Some(StopSettings::disabled())] {
+                let mut client = ready_client();
+                let mut dispatcher = crate::events::EventDispatcher::new();
+                let request_uid = 0xCAFE_BAC0;
+                let kind = if pending {
+                    let mut params = PendingOrderParams::new("ETHUSDT", OrderSide::Long, 2100.0, 250.0);
+                    params.stops = stops;
+                    RuntimeTradeCommandKind::NewPendingOrder { params, request_uid }
+                } else {
+                    let mut params = NewOrderParams::new("ETHUSDT", OrderSide::Long, 2100.0, 250.0);
+                    params.stops = stops;
+                    RuntimeTradeCommandKind::NewOrder { params, request_uid }
+                };
+                handle_trade_action(&mut client, &mut dispatcher, kind).unwrap();
 
-        handle_trade_action(
-            &mut client,
-            &mut dispatcher,
-            RuntimeTradeCommandKind::NewPendingOrder {
-                params: PendingOrderParams::new("ETHUSDT", OrderSide::Long, 2100.0, 250.0),
-                request_uid: 0xCAFE_BAC0,
-            },
-        )
-        .expect("v4 bare pending command does not need legacy route bytes");
-
-        let (_, high, _) = client.take_send_queues_for_test();
-        assert_eq!(high.len(), 1);
-        match TradeCommand::parse(&high[0].data).expect("valid bare pending order") {
-            TradeCommand::OrderCommand(cmd) => match cmd.payload {
-                OrderCommandPayload::StartPending { strategy_id, .. } => {
-                    assert_eq!(strategy_id, 0);
+                let (sliced, high, low) = client.take_send_queues_for_test();
+                assert!(low.is_empty() && sliced.is_empty());
+                assert_eq!(high.len(), 1, "no separate settings or stop commands");
+                let expected = stops.map(|mut stops| {
+                    stops.take_profit_changed = DelphiBool::TRUE;
+                    stops
+                });
+                match TradeCommand::parse(&high[0].data).expect("valid bare order") {
+                    TradeCommand::OrderCommand(cmd) => match cmd.payload {
+                        OrderCommandPayload::Start { strategy_id, stops, .. }
+                        | OrderCommandPayload::StartPending { strategy_id, stops, .. } => {
+                            assert_eq!(strategy_id, 0);
+                            assert_eq!(stops, expected);
+                        }
+                        other => panic!("unexpected order payload: {other:?}"),
+                    },
+                    other => panic!("unexpected trade command: {other:?}"),
                 }
-                other => panic!("unexpected order payload: {other:?}"),
-            },
-            other => panic!("unexpected trade command: {other:?}"),
+            }
         }
     }
 
@@ -1070,6 +1112,58 @@ mod tests {
                 other => panic!("unexpected order payload: {other:?}"),
             },
             other => panic!("unexpected trade command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn report_trace_request_waits_for_init_and_timeout_releases_it() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let (tx, rx) = mpsc::channel();
+        let reports = super::super::handles::MoonReports { tx };
+        let ticket = reports.request_traces(-99).unwrap();
+        let mut deferred = VecDeque::new();
+        assert_eq!(drain_commands_during_startup(&rx, &mut deferred), (false, false));
+        assert_eq!(deferred.len(), 1);
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(sliced.is_empty() && high.is_empty() && low.is_empty());
+        dispatcher.tick_report_trace_timeouts(Instant::now() + Duration::from_secs(60));
+        assert!(dispatcher.take_queued_events().is_empty());
+        drain_deferred_and_live_commands(&mut client, &mut dispatcher, &rx, &mut pending, &mut deferred);
+        assert_eq!(client.take_send_queues_for_test().1.len(), 1);
+        dispatcher.tick_report_trace_timeouts(Instant::now() + Duration::from_secs(60));
+        assert!(matches!(dispatcher.take_queued_events().as_slice(),
+            [crate::Event::Report(crate::ReportEvent::TraceFailed { ticket: actual, .. })] if *actual == ticket));
+        let retry = reports.request_traces(-99).unwrap();
+        assert_ne!(retry, ticket);
+        handle_command(&mut client, &mut dispatcher, rx.recv().unwrap(), &mut pending);
+        assert_eq!(client.take_send_queues_for_test().1.len(), 1);
+    }
+
+    #[test]
+    fn runtime_report_traces_use_high_queue_and_coalesce_only_same_report() {
+        let mut client = ready_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let (tx, rx) = mpsc::channel();
+        let reports = super::super::handles::MoonReports { tx };
+        let first = reports.request_traces(i64::MIN).unwrap();
+        let second = reports.request_traces(99).unwrap();
+        let repeated = reports.request_traces(i64::MIN).unwrap();
+        assert_ne!(first.request_id, repeated.request_id);
+        for command in rx.try_iter() {
+            assert!(!handle_command(&mut client, &mut dispatcher, command, &mut pending));
+        }
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(sliced.is_empty() && low.is_empty());
+        assert_eq!(high.len(), 2);
+        for (wire, expected) in high.iter().zip([first, second]) {
+            let TradeCommand::ReportTraceRequest(request) = TradeCommand::parse(&wire.data).unwrap() else {
+                panic!("not a report trace request");
+            };
+            assert_eq!(request.header.uid, expected.request_id);
+            assert_eq!(request.report_uid, expected.report_uid);
         }
     }
 
@@ -1165,6 +1259,73 @@ mod tests {
     }
 
     #[test]
+    fn compact_capture_queues_charts_without_readers_and_cancels_forgotten_markets() {
+        use crate::state::{MarketHistoryEvent, MarketHistorySizing, MarketHistoryTicket};
+        let mut client = ready_client();
+        client.cfg.market_history = MarketHistorySizing::Compact;
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        dispatcher.set_market_history_sizing(MarketHistorySizing::Compact);
+        let mut pending = RuntimePending::default();
+        handle_command(
+            &mut client, &mut dispatcher,
+            RuntimeCommand::SubscribeTradesFor {
+                want_mm: false,
+                markets: vec!["BTCUSDT".into(), "ETHUSDT".into()],
+            },
+            &mut pending,
+        );
+        assert!(dispatcher.market_history_readers("BTCUSDT").is_none());
+        for (market, id) in [("BTCUSDT", 1), ("ETHUSDT", 2)] {
+            handle_command(
+                &mut client, &mut dispatcher,
+                RuntimeCommand::MarketHistory(MarketHistoryTicket::new(market.into(), id)),
+                &mut pending,
+            );
+        }
+        assert_eq!(pending.market_history.len(), 2);
+        assert_eq!(client.pending_api.pending_market_history.len(), 2);
+        assert!(!pending.auto_candles_requested && pending.auto_candles.is_empty());
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(high.is_empty() && low.is_empty());
+        assert_eq!(sliced.len(), 3, "one subscription and two archives, no full candles");
+
+        handle_command(
+            &mut client, &mut dispatcher,
+            RuntimeCommand::SubscribeTradesFor { want_mm: false, markets: vec!["ETHUSDT".into()] },
+            &mut pending,
+        );
+        assert_eq!(pending.market_history.len(), 1);
+        assert_eq!(pending.market_history[0].ticket.id(), 2);
+        assert_eq!(client.pending_api.pending_market_history.len(), 1);
+        assert!(matches!(
+            dispatcher.take_queued_events().as_slice(),
+            [crate::Event::MarketHistory(MarketHistoryEvent::Failed { ticket, .. })] if ticket.id() == 1
+        ));
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        pending.market_history_apply.push(PendingMarketHistoryApply {
+            ticket: MarketHistoryTicket::new("ETHUSDT".into(), 3),
+            deadline: Instant::now(),
+            rx,
+        });
+        handle_command(&mut client, &mut dispatcher, RuntimeCommand::UnsubscribeAllTrades, &mut pending);
+        assert!(pending.market_history.is_empty() && pending.market_history_apply.is_empty());
+        assert!(client.pending_api.pending_market_history.is_empty());
+        assert!(tx.send(Ok(Default::default())).is_err());
+        assert_eq!(dispatcher.take_queued_events().len(), 2);
+        handle_command(
+            &mut client, &mut dispatcher,
+            RuntimeCommand::MarketHistory(MarketHistoryTicket::new("ETHUSDT".into(), 4)),
+            &mut pending,
+        );
+        assert!(pending.market_history.is_empty());
+        assert!(matches!(
+            dispatcher.take_queued_events().as_slice(),
+            [crate::Event::MarketHistory(MarketHistoryEvent::Failed { ticket, .. })] if ticket.id() == 4
+        ));
+    }
+
+    #[test]
     fn runtime_unsubscribe_without_local_subscription_reaches_wire_queue() {
         let mut client = ready_client();
         let mut dispatcher = crate::events::EventDispatcher::new();
@@ -1185,6 +1346,48 @@ mod tests {
             sliced[0].data.get(11).copied(),
             Some(crate::commands::engine_api::EngineMethod::UnsubscribeAllTrades.to_byte())
         );
+    }
+
+    #[test]
+    fn compact_reselection_ignores_previous_chart_chunks() {
+        use crate::commands::engine_api::{EngineMethod, EngineResponse};
+        use crate::state::{MarketHistorySizing, MarketHistoryTicket};
+        let mut client = ready_client();
+        client.cfg.market_history = MarketHistorySizing::Compact;
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        dispatcher.set_market_history_sizing(MarketHistorySizing::Compact);
+        let mut pending = RuntimePending::default();
+        let subscribe = || RuntimeCommand::SubscribeTradesFor {
+            want_mm: false,
+            markets: vec!["BTCUSDT".into()],
+        };
+        let chart = |id| RuntimeCommand::MarketHistory(MarketHistoryTicket::new("BTCUSDT".into(), id));
+        handle_command(&mut client, &mut dispatcher, subscribe(), &mut pending);
+        handle_command(&mut client, &mut dispatcher, chart(1), &mut pending);
+        let old_uid = pending.market_history[0].uid;
+        handle_command(&mut client, &mut dispatcher, RuntimeCommand::UnsubscribeAllTrades, &mut pending);
+        dispatcher.take_queued_events();
+        handle_command(&mut client, &mut dispatcher, subscribe(), &mut pending);
+        handle_command(&mut client, &mut dispatcher, chart(2), &mut pending);
+        let current = &pending.market_history[0];
+        assert_ne!(current.uid, old_uid);
+        assert_eq!(current.progress.generation(), 0);
+        let old_response = EngineResponse {
+            ver: 1,
+            request_uid: old_uid,
+            method: EngineMethod::RequestMarketHistory,
+            success: true,
+            error_code: 0,
+            error_msg: String::new(),
+            data: vec![0, 0, 1, 0, 0],
+        };
+        assert!(!Client::handle_market_history_chunk_in_pending(&mut client.pending_api, &old_response));
+        assert!(!poll_market_history(&mut client, &mut pending, &mut dispatcher));
+        assert_eq!(pending.market_history.len(), 1);
+        assert_eq!(pending.market_history[0].ticket.id(), 2);
+        assert_eq!(pending.market_history[0].progress.generation(), 0);
+        assert!(dispatcher.take_queued_events().is_empty());
+        assert!(pending.auto_candles.is_empty());
     }
 
     #[test]
@@ -1415,7 +1618,7 @@ mod tests {
         handle_command(
             &mut client,
             &mut dispatcher,
-            RuntimeCommand::StrategySnapshotBatch(rows),
+            RuntimeCommand::StrategySnapshotBatch(rows, false),
             &mut pending,
         );
         let (sliced, _, _) = client.take_send_queues_for_test();
@@ -1445,7 +1648,7 @@ mod tests {
         assert_eq!(reply.folders_last_modified, date);
 
         // Missing occupied folders survive even if a newer tree omits them.
-        let empty = crate::commands::strat::build_snapshot(123, 42, 0, true, &[], date + 1);
+        let empty = crate::commands::strat::build_snapshot(123, 42, 0, true, &[], date + 1, 0);
         receiver.dispatch_into(Command::Strat, &empty, 0, &mut Vec::new());
         assert_eq!(
             receiver.strats().folder_paths().collect::<Vec<_>>(),
@@ -1481,14 +1684,14 @@ mod tests {
         handle_command(
             &mut client,
             &mut dispatcher,
-            RuntimeCommand::StrategySnapshotBatch(rows.clone()),
+            RuntimeCommand::StrategySnapshotBatch(rows.clone(), false),
             &mut pending,
         );
         rows.swap(0, 1);
         handle_command(
             &mut client,
             &mut dispatcher,
-            RuntimeCommand::StrategySnapshotBatch(rows),
+            RuntimeCommand::StrategySnapshotBatch(rows, false),
             &mut pending,
         );
         let (sliced, high, low) = client.take_send_queues_for_test();
@@ -1529,12 +1732,12 @@ mod tests {
             crate::commands::strategy_serializer::StrategyBatchBuilder::folder_payload(vec![
                 "Keep/Nested".into(),
             ]);
-        let payload = crate::commands::strat::build_snapshot(1, 1, 0, true, &data, 100);
+        let payload = crate::commands::strat::build_snapshot(1, 1, 0, true, &data, 100, 0);
         dispatcher.dispatch_into(Command::Strat, &payload, 0, &mut Vec::new());
-        let mut legacy = crate::commands::strat::build_snapshot(2, 200, 0, true, &[], 0);
-        legacy.truncate(legacy.len() - 8);
+        let mut legacy = crate::commands::strat::build_snapshot(2, 200, 0, true, &[], 0, 0);
+        legacy.truncate(legacy.len() - 12);
         dispatcher.dispatch_into(Command::Strat, &legacy, 0, &mut Vec::new());
-        let malformed = crate::commands::strat::build_snapshot(3, 300, 0, true, &[0xff], 200);
+        let malformed = crate::commands::strat::build_snapshot(3, 300, 0, true, &[0xff], 200, 0);
         dispatcher.dispatch_into(Command::Strat, &malformed, 0, &mut Vec::new());
         assert_eq!(dispatcher.strats().folders_last_modified(), 100);
         assert_eq!(dispatcher.strats().folder_paths().count(), 2);
@@ -1556,7 +1759,7 @@ mod tests {
         handle_command(
             &mut client,
             &mut dispatcher,
-            RuntimeCommand::StrategySnapshotBatch(strategies.clone()),
+            RuntimeCommand::StrategySnapshotBatch(strategies.clone(), false),
             &mut pending,
         );
         let (sliced, high, low) = client.take_send_queues_for_test();
@@ -1573,7 +1776,7 @@ mod tests {
         handle_command(
             &mut client,
             &mut dispatcher,
-            RuntimeCommand::StrategySnapshotBatch(strategies.clone()),
+            RuntimeCommand::StrategySnapshotBatch(strategies.clone(), false),
             &mut pending,
         );
         let after = crate::MoonTime::now();
@@ -1646,7 +1849,7 @@ mod tests {
         handle_command(
             &mut client,
             &mut dispatcher,
-            RuntimeCommand::StrategySnapshotBatch(strategies),
+            RuntimeCommand::StrategySnapshotBatch(strategies, false),
             &mut pending,
         );
         let (sliced, high, low) = client.take_send_queues_for_test();
@@ -1654,6 +1857,68 @@ mod tests {
             sliced.is_empty() && high.is_empty() && low.is_empty(),
             "confirmed edit must not be resent"
         );
+    }
+
+    #[test]
+    fn strategy_apply_to_orders_is_one_shot_and_preserves_partial_sends() {
+        use crate::commands::strat::{StratCommand, SSF_APPLY_TO_ORDERS};
+
+        for reorder in [false, true] {
+            let mut client = ready_client();
+            let mut dispatcher = crate::events::EventDispatcher::new();
+            let mut pending = RuntimePending::default();
+            let mut strategies = strategy_test_list(3);
+            apply_strategy_test_list(&mut dispatcher, &strategies);
+            strategies[0].last_date += 1;
+            strategies[0].fields.insert("Comment", FieldValue::String("edited".into()));
+            if reorder {
+                strategies.swap(0, 1);
+            }
+            handle_command(
+                &mut client,
+                &mut dispatcher,
+                RuntimeCommand::StrategySnapshotBatch(strategies.clone(), true),
+                &mut pending,
+            );
+            let (sliced, high, low) = client.take_send_queues_for_test();
+            assert!(high.is_empty() && low.is_empty());
+            assert_eq!(sliced.len(), 1);
+            assert!(sliced[0].u_key.is_none());
+            let StratCommand::Snapshot(snapshot) = StratCommand::parse(&sliced[0].data).unwrap() else {
+                panic!("snapshot");
+            };
+            assert_eq!(snapshot.flags, SSF_APPLY_TO_ORDERS);
+            assert_eq!(snapshot.full, reorder);
+            let batch = crate::commands::strategy_serializer::parse_strategy_batch(&snapshot.data).unwrap();
+            assert_eq!(batch.strategies.len(), if reorder { 3 } else { 1 });
+
+            // A server-requested Full contains pending edits, but never replays the action.
+            let request = crate::commands::strat::build_snapshot_request(99);
+            let context = crate::events::ActiveDispatchContext::from_client(&client);
+            let mut actions = Vec::new();
+            dispatcher.dispatch_into_active_actions(
+                Command::Strat, &request, 0, &mut Vec::new(), &context, &mut actions,
+            );
+            client.apply_active_actions(actions);
+            let (sliced, _, _) = client.take_send_queues_for_test();
+            assert_eq!(sliced.len(), 1);
+            assert!(!sliced[0].u_key.is_none());
+            let StratCommand::Snapshot(automatic) = StratCommand::parse(&sliced[0].data).unwrap() else {
+                panic!("snapshot");
+            };
+            assert!(automatic.full);
+            assert_eq!(automatic.flags, 0);
+
+            dispatcher.dispatch_into(Command::Strat, &sliced[0].data, 0, &mut Vec::new());
+            assert!(dispatcher.strats().strategy_edit(1).is_none());
+            handle_command(
+                &mut client,
+                &mut dispatcher,
+                RuntimeCommand::StrategySnapshotBatch(strategies, true),
+                &mut pending,
+            );
+            assert!(client.take_send_queues_for_test().0.is_empty(), "unchanged confirmed data remains a no-op");
+        }
     }
 
     #[test]
@@ -1674,7 +1939,7 @@ mod tests {
             handle_command(
                 &mut client,
                 &mut dispatcher,
-                RuntimeCommand::StrategySnapshotBatch(strategies.clone()),
+                RuntimeCommand::StrategySnapshotBatch(strategies.clone(), false),
                 &mut pending,
             );
         }
@@ -1682,7 +1947,7 @@ mod tests {
         handle_command(
             &mut client,
             &mut dispatcher,
-            RuntimeCommand::StrategySnapshotBatch(strategies.clone()),
+            RuntimeCommand::StrategySnapshotBatch(strategies.clone(), false),
             &mut pending,
         );
 
@@ -1757,7 +2022,7 @@ mod tests {
         handle_command(
             &mut client,
             &mut dispatcher,
-            RuntimeCommand::StrategySnapshotBatch(strategies),
+            RuntimeCommand::StrategySnapshotBatch(strategies, false),
             &mut pending,
         );
         let (sliced, high, low) = client.take_send_queues_for_test();
@@ -1800,7 +2065,7 @@ mod tests {
         assert!(handle_command(
             &mut client,
             &mut dispatcher,
-            RuntimeCommand::StrategySnapshotBatch(vec![strategy.clone()]),
+            RuntimeCommand::StrategySnapshotBatch(vec![strategy.clone()], false),
             &mut pending,
         ));
         assert!(dispatcher.local_strategy_epoch() > 1_000_000_000_000);
@@ -1870,6 +2135,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeCommand::StrategySnapshotBatch(
             vec![strategy.clone()],
+            false,
         ))
         .unwrap();
 
@@ -1989,6 +2255,40 @@ mod tests {
             matches!(crate::commands::ui::UICommand::parse(&high[1].data),
             Some(crate::commands::ui::UICommand::ProblemsTest(text)) if text == "firetest")
         );
+    }
+
+    #[test]
+    fn telegram_intents_defer_and_reach_encrypted_high_without_changing_auth_state() {
+        use crate::commands::ui::TelegramAction;
+        use crate::state::TelegramLoginMode;
+        let mut client = Client::new(dummy_cfg());
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let (tx, rx) = mpsc::channel();
+        for action in [
+            TelegramAction::Refresh,
+            TelegramAction::SetLoginMode(TelegramLoginMode::Qr),
+            TelegramAction::SetPassword("test-password".into()),
+            TelegramAction::Logout,
+        ] {
+            tx.send(RuntimeCommand::Ui(UiRuntimeCommand::Telegram(action))).unwrap();
+        }
+        let mut deferred = VecDeque::new();
+        drain_commands_during_startup(&rx, &mut deferred);
+        assert_eq!(deferred.len(), 4);
+        let queues = client.take_send_queues_for_test();
+        assert!(queues.0.is_empty() && queues.1.is_empty() && queues.2.is_empty());
+        client.testing_set_domain_ready(true);
+        let (_, changed) = drain_deferred_and_live_commands(
+            &mut client, &mut dispatcher, &rx, &mut pending, &mut deferred,
+        );
+        assert!(!changed);
+        assert!(dispatcher.settings.telegram.is_none());
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(sliced.is_empty() && low.is_empty());
+        assert_eq!(high.iter().map(|item| item.data[0]).collect::<Vec<_>>(), [37, 40, 43, 48]);
+        assert!(high.iter().all(|item| item.encrypted && item.cmd == Command::UI.to_byte()));
+        assert!(deferred.is_empty());
     }
 
     #[test]

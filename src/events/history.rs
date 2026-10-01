@@ -172,6 +172,15 @@ impl EventDispatcher {
     }
 
     #[cfg(any(test, feature = "diagnostics"))]
+    pub(crate) fn queue_market_history_archive(
+        &mut self,
+        ticket: crate::state::MarketHistoryTicket,
+        trades: Vec<crate::state::TradeHistoryRow>,
+    ) {
+        self.queued_events.extend([crate::events::Event::MarketHistoryArchive { ticket, trades }]);
+    }
+
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn diag_fill_market_history_to_capacity(
         &mut self,
         market_name: &str,
@@ -199,7 +208,6 @@ impl EventDispatcher {
     ) {
         if self.trade_storage_scope.as_ref() != scope {
             self.trade_storage_scope = scope.cloned();
-            self.last_market_history_scope = None;
             self.sync_market_history_storage();
             if self.trade_storage_scope.is_some() {
                 self.queue_current_last_price_history(now_time_days);
@@ -283,10 +291,9 @@ impl EventDispatcher {
         let market_names = self.market_history_market_names();
         let has_active_market = self.has_active_market_history_market(&market_names);
         self.ensure_default_market_history_worker(has_active_market);
-        let Some(handle) = &self.market_history else {
-            return;
-        };
-        handle.configure_markets(market_names, self.trade_storage_scope.clone());
+        if let Some(handle) = &self.market_history {
+            handle.configure_markets(market_names, self.trade_storage_scope.clone());
+        }
         self.last_market_history_scope = self.trade_storage_scope.clone();
         self.last_market_history_markets_version = Some(markets_version);
     }
