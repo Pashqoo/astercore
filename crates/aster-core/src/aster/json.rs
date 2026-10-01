@@ -24,23 +24,70 @@ use serde::Deserialize;
 /// Deserialize one of Aster's decimal strings into `f64`.
 ///
 /// An empty string is `0.0`: the exchange uses `""` for "not applicable" on
-/// some optional fields, and a hard error there would reject the symbol.
+/// some optional fields, and a hard error there would reject the symbol. So
+/// are a bare number and `null`, for the reason spelled out on each arm — a
+/// strict decode fails the whole document, not the one field that surprised
+/// it, and this core reads answers of 613 and 766 rows.
 fn str_f64<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
-    let s = String::deserialize(d)?;
-    if s.is_empty() {
-        return Ok(0.0);
+    struct Tolerant;
+
+    impl serde::de::Visitor<'_> for Tolerant {
+        type Value = f64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a decimal string, a number, or null")
+        }
+
+        // The documented shape: `"0.1"`.
+        //
+        // Never fails, and that is the whole point. `#[serde(default)]` covers
+        // an ABSENT field only — a field that is PRESENT and malformed
+        // (`"abc"`, or `"NaN"`, which `parse` accepts happily) would still fail
+        // the decode of all 613 symbols and leave the core with no catalog at
+        // all. So anything unreadable becomes 0.0, which
+        // `model::Market::sizable` turns into a refusal to size that one
+        // market, counted and named in the `catalog:` line. One market degraded
+        // and reported beats the whole catalog lost.
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<f64, E> {
+            Ok(s.parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .unwrap_or(0.0))
+        }
+
+        // A BARE NUMBER, which this exchange's dialect is not supposed to send
+        // and does send: `"count"`-like integers appear unquoted, and a venue
+        // that changes weekly can unquote a price field in any release. Taking
+        // it costs nothing; rejecting it costs the whole answer, because serde
+        // fails the document and not the field.
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<f64, E> {
+            Ok(if v.is_finite() { v } else { 0.0 })
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+
+        // `null`, the one shape `#[serde(default)]` does NOT cover: the field
+        // is present, so the default never fires, and a strict decode would
+        // lose the other 612 symbols over it.
+        fn visit_unit<E: serde::de::Error>(self) -> Result<f64, E> {
+            Ok(0.0)
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<f64, E> {
+            Ok(0.0)
+        }
     }
-    // Never fails, and that is the whole point. `#[serde(default)]` covers an
-    // ABSENT field only — a field that is PRESENT and malformed (`"abc"`, or
-    // `"NaN"`, which `parse` accepts happily) would still fail the decode of
-    // all 613 symbols and leave the core with no catalog at all. So anything
-    // unreadable becomes 0.0, which `model::Market::sizable` turns into a
-    // refusal to size that one market, counted and named in the `catalog:`
-    // line. One market degraded and reported beats the whole catalog lost.
-    Ok(s.parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite())
-        .unwrap_or(0.0))
+
+    // `deserialize_any` rather than `deserialize_str`: the point is to accept
+    // whichever of the three shapes arrives, and an empty string is 0.0 through
+    // the same path as any other unparseable one.
+    d.deserialize_any(Tolerant)
 }
 
 /// `GET /fapi/v1/time`.
@@ -244,12 +291,16 @@ pub enum Filter {
     Other,
 }
 
-/// One row of `GET /fapi/v1/premiumIndex` without a symbol: the funding pair.
+/// One row of `GET /fapi/v1/premiumIndex` without a symbol: the funding pair
+/// and the mark price.
 ///
-/// The answer also carries `markPrice`, `indexPrice` and `interestRate`; they
-/// are not read here. The mark price belongs to the price rows of
-/// `UpdateMarketsList`, which M1 brings along with the `markPrice` stream that
-/// pushes it — a field parsed now would be state nothing reads.
+/// `indexPrice` and `interestRate` are still not read: nothing in the core acts
+/// on them. `markPrice` is, since M0's `UpdateMarketsList` has to carry one —
+/// the price row's mark field has a `found` flag beside it, so a core that
+/// parsed no mark price would be telling the terminal this venue publishes
+/// none. Measured 01.10: all 766 rows carry a positive `markPrice`. The
+/// `markPrice@1s` stream of M1 replaces this snapshot as the source, not the
+/// field.
 ///
 /// Measured 01.10: **766 rows**, more than `exchangeInfo`'s 613 — the answer
 /// also carries index symbols (`GNSUSD`, `USD1USD`, `AAPLUSD`) and symbols the
@@ -275,6 +326,31 @@ pub struct PremiumIndex {
     /// and the terminal's own absence test is this field.
     #[serde(default, rename = "nextFundingTime")]
     pub next_funding_time_ms: i64,
+    /// The exchange's mark price — what `PERCENT_PRICE`, the margin and the
+    /// liquidation price are all computed against, and therefore the price the
+    /// terminal's own band and risk columns mean.
+    #[serde(default, deserialize_with = "str_f64", rename = "markPrice")]
+    pub mark_price: f64,
+}
+
+/// One row of `GET /fapi/v1/ticker/bookTicker` without a symbol: the top of
+/// book of every market in one call.
+///
+/// Measured 01.10: **589 rows for weight 2**, and every one of them carries
+/// both sides. 589 is exactly the number of `TRADING` symbols in the same
+/// snapshot, so a market that is `SETTLING` or `PENDING_TRADING` simply has no
+/// row — matched by symbol like every other merge, never zipped.
+///
+/// This is what makes M0's price rows real prices. `ticker/24hr` carries a last
+/// price but no sides at all, and a bid and an ask invented from the last price
+/// would be a zero spread on the money path of every market at once.
+#[derive(Debug, Deserialize)]
+pub struct BookTicker {
+    pub symbol: String,
+    #[serde(default, deserialize_with = "str_f64", rename = "bidPrice")]
+    pub bid_price: f64,
+    #[serde(default, deserialize_with = "str_f64", rename = "askPrice")]
+    pub ask_price: f64,
 }
 
 /// One row of `GET /fapi/v1/ticker/24hr` without a symbol.

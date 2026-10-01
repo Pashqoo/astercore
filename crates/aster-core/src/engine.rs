@@ -1,0 +1,385 @@
+//! MoonProto `Handler`: the Init spine the terminal has to walk before it is
+//! `Ready`, and the resync it asks for right after.
+//!
+//! The spine is not ours to choose. `moonproto`'s own client fails init unless
+//! BaseCheck, AuthCheck, `GetMarketsList`, `UpdateMarketsList` and the strategy
+//! schema all answer (`client::init::steps`), and it then sends an order
+//! snapshot request, a settings request, its strategy list and a balance
+//! refresh whose replies are *not* part of the barrier. So this file answers
+//! the first group with real data and the second with the honest empty answer
+//! for a core that has no signed access yet (M2).
+//!
+//! Adapted from TInvestCore's `engine.rs`, which is the same spine over 6000
+//! lines of trading on top. What is NOT here is deliberate, not forgotten:
+//! market data (M1), orders (M2), strategies (M3). Every Engine API method
+//! outside the spine answers with a refusal naming itself, which is how the
+//! terminal shows a missing feature instead of waiting out a timeout.
+
+use moonproto::server::codec::engine::{self, EngineMethod, EngineRequest, ServerInfo};
+use moonproto::server::codec::log::log_msg;
+use moonproto::server::codec::{balance, strat, trade, ui, BaseHeader, BASE_HEADER_SIZE};
+use moonproto::server::{Command, Handler, Session};
+
+use crate::model::{Catalog, QUOTE, QUOTE_CODE};
+use crate::prices::Snapshot;
+use crate::strategies::Strategies;
+
+pub const SERVER_NAME: &str = "Astercore";
+pub const EXCHANGE_NAME: &str = "Aster";
+/// Out of the MoonBot `ExchangeCode` range on purpose, one past TInvestCore's
+/// 220: the terminal then names the venue by [`EXCHANGE_NAME`] and draws the
+/// core under `reported` without a logo, instead of borrowing a directory
+/// entry's rules (`venue(221) == None`, verified in the terminal's source).
+pub const EXCHANGE_CODE: u8 = 221;
+pub const SERVER_VERSION: i32 = 1;
+/// `ExchangeTypeMask` bit for a futures venue.
+///
+/// **Not SPOT, which is what TInvestCore reports.** With this bit the terminal
+/// shows only open positions in Assets and reads `leverage_x` per market
+/// (`moon-core/src/feed/types.rs`); with the spot bit a perpetual venue reads
+/// as a wallet of coins.
+const EXCHANGE_TYPE_FUTURES: u8 = 0x02;
+/// Largest payload the core will accept from one client, reported in AuthCheck.
+const MAX_PAYLOAD: i32 = 4 * 1024 * 1024;
+/// What AuthCheck reports as the account until M2 can ask the exchange.
+///
+/// Here rather than in `main.rs` because the contract test asserts the same
+/// string: it is one fact about what the terminal is told, and two copies of it
+/// drift the moment the real account id arrives.
+pub const ACCOUNT_PLACEHOLDER: &str = "aster";
+
+const API: u8 = Command::API.to_byte();
+const STRAT: u8 = Command::Strat.to_byte();
+const UI: u8 = Command::UI.to_byte();
+const ORDER: u8 = Command::Order.to_byte();
+const BALANCE: u8 = Command::Balance.to_byte();
+const LOG: u8 = Command::LogMsg.to_byte();
+
+pub struct CoreHandler {
+    bot_id: i64,
+    /// What AuthCheck reports as the account.
+    ///
+    /// The exchange account id needs a signed call to learn (M2), so until then
+    /// it is [`ACCOUNT_PLACEHOLDER`] — a non-empty string, because an empty one
+    /// reads in the terminal as "not authorized", and a placeholder the trader
+    /// can recognise as one rather than a number that looks like an account.
+    account_id: String,
+    catalog: Catalog,
+    strategies: Strategies,
+    /// Last `TClientSettings` the terminal sent, echoed back on request.
+    ///
+    /// The terminal is the owner of these settings and the core is their
+    /// storage: it asks for them right after init and applies what comes back.
+    /// Starting from the library's defaults rather than an empty blob is what
+    /// keeps that first answer parseable before any terminal has sent one.
+    client_settings: Vec<u8>,
+    /// Last shared-config blob, same contract.
+    shared_config: Vec<u8>,
+    /// How many markets the last book snapshot quoted, so a change is a journal
+    /// line and the steady state is not.
+    quoted: usize,
+    /// `TBalanceFull.epoch`. Fixed at 1 while there is no account to read: the
+    /// epoch exists to tell one snapshot generation from the next, and this
+    /// core has exactly one — the empty one. M2 moves it with the account.
+    balance_epoch: u16,
+}
+
+impl CoreHandler {
+    pub fn new(bot_id: i64, account_id: String, catalog: Catalog, strategies: Strategies) -> Self {
+        // Counted off the catalog rather than started at zero: the startup read
+        // has already quoted it (`main.rs`), and a zero here would make the
+        // first refresh report a change that did not happen.
+        let quoted = catalog.prices().iter().filter(|r| r.bid > 0.0).count();
+        Self {
+            bot_id,
+            account_id,
+            catalog,
+            strategies,
+            client_settings: ui::default_client_settings(0),
+            shared_config: ui::default_shared_config_blob(),
+            quoted,
+            balance_epoch: 1,
+        }
+    }
+
+    /// Apply one snapshot from the price thread. Called from the UDP loop
+    /// between receives, never from inside a request: the request answers
+    /// whatever the last applied snapshot says.
+    pub fn apply(&mut self, snap: Snapshot) {
+        match snap {
+            Snapshot::Book(rows) => {
+                let quoted = self.catalog.apply_book(&rows);
+                // A market that stops being quoted goes into the price rows as
+                // a zero, and the terminal then shows nothing for it — that is
+                // a fact about the venue, so it is said out loud when the count
+                // changes and kept quiet when it does not.
+                if quoted != self.quoted {
+                    log::info!(
+                        "prices: {quoted} of {} markets quoted ({} rows)",
+                        self.catalog.markets().len(),
+                        rows.len()
+                    );
+                    self.quoted = quoted;
+                }
+            }
+            Snapshot::Premium(rows) => {
+                let funded = self.catalog.apply_premium_index(&rows);
+                log::debug!("prices: funding on {funded} markets ({} rows)", rows.len());
+            }
+        }
+    }
+
+    fn server_info(&self) -> Vec<u8> {
+        engine::write_server_info(&ServerInfo {
+            bot_id: self.bot_id,
+            server_name: SERVER_NAME,
+            exchange_code: EXCHANGE_CODE,
+            exchange_name: EXCHANGE_NAME,
+            exchange_type_mask: EXCHANGE_TYPE_FUTURES,
+            base_currency_name: QUOTE,
+            base_currency_code: QUOTE_CODE,
+            server_version: SERVER_VERSION,
+            moonproto_version: i32::from(moonproto::server::codec::PROTO_CMD_VER),
+        })
+    }
+
+    fn on_api(&mut self, session: &mut Session, payload: &[u8]) {
+        let Some(req) = EngineRequest::parse(payload) else {
+            log::warn!("API: unparsable request ({} bytes)", payload.len());
+            return;
+        };
+        let data = match req.method {
+            EngineMethod::BaseCheck => self.server_info(),
+            EngineMethod::AuthCheck => engine::write_auth_check(&self.account_id, MAX_PAYLOAD),
+            EngineMethod::GetMarketsList => engine::write_markets_list(&self.catalog.specs()),
+            // `write_markets_prices` sends no funding (`send_funding = 0`), so
+            // what the terminal knows about funding is the snapshot that rode
+            // the catalog. The refresher keeps the core's own copy current for
+            // the mark price in these rows; carrying the rate and the next
+            // charge in them is M1's work, together with the `markPrice@1s`
+            // stream that makes a per-second update worth sending.
+            EngineMethod::UpdateMarketsList => engine::write_markets_prices(&self.catalog.prices()),
+            EngineMethod::GetMarketsIndexes => {
+                engine::write_markets_indexes(&self.catalog.symbols())
+            }
+            // No token permissions to report: Aster has no such notion, and the
+            // empty answer is what the terminal reads as "no tags".
+            EngineMethod::CheckBinanceTags => Vec::new(),
+            // One-way positions (`positionSide: BOTH`), which is the mode M2's
+            // order model is written against; hedge mode is M5+ (`PLAN.md`).
+            EngineMethod::QueryHedgeMode => engine::write_hedge_mode(false),
+            // The EIP-712 API wallet does not expire (`PLAN.md` §10.1).
+            EngineMethod::CheckAPIExpirationTime => engine::write_no_api_expiration(),
+            // Futures wallet only: no spot/margin wallets to transfer between.
+            EngineMethod::UpdateTransferAssets => engine::write_no_transfer_assets(),
+            other => {
+                // A refusal, not silence. The client waits out a 12 s timeout
+                // for a request nobody answers and then fails the whole step;
+                // an error reply lands at once and names the method, which is
+                // what makes "not implemented yet" visible in the terminal
+                // rather than looking like a dead core.
+                log::debug!("API: {} not implemented", other.name());
+                return self.reply_err(session, &req, "not implemented");
+            }
+        };
+        session.send_encrypted(API, &engine::response_ok(req.uid, req.method, &data), true);
+    }
+
+    fn reply_err(&self, session: &mut Session, req: &EngineRequest, msg: &str) {
+        session.send_encrypted(
+            API,
+            &engine::response_err(req.uid, req.method, 0, msg),
+            true,
+        );
+    }
+
+    fn on_ui(&mut self, session: &mut Session, payload: &[u8]) {
+        let Some(hdr) = BaseHeader::parse(payload) else {
+            return;
+        };
+        match hdr.cmd_id {
+            ui::CMD_CLIENT_SETTINGS => {
+                self.client_settings = payload.to_vec();
+                session.send_encrypted(UI, &ui::with_uid(payload, rand_uid()), true);
+            }
+            ui::CMD_SETTINGS_REQUEST => {
+                let resp = ui::with_uid(&self.client_settings, hdr.uid);
+                session.send_encrypted(UI, &resp, true);
+                // TInvestCore follows this echo with `profit_state`, the deal
+                // counters shown beside the auto-stop caps. Deliberately not
+                // sent here: this core has no deals and no report store (M2),
+                // and a zeroed counter is a claim about trading that has not
+                // happened. It arrives with the reports.
+            }
+            ui::CMD_SHARED_CONFIG => {
+                if let Some(blob) = ui::shared_config_blob(payload) {
+                    self.shared_config = blob.to_vec();
+                }
+                let resp = ui::shared_config_payload(rand_uid(), &self.shared_config);
+                session.send_encrypted(UI, &resp, true);
+            }
+            ui::CMD_SHARED_CONFIG_REQUEST => {
+                let resp = ui::shared_config_payload(hdr.uid, &self.shared_config);
+                session.send_encrypted(UI, &resp, true);
+            }
+            ui::CMD_KERNEL_LICENSE_STATE_REQUEST => {
+                session.send_encrypted(UI, &ui::kernel_license_state(hdr.uid, true), true);
+            }
+            ui::CMD_STRAT_START_STOP | ui::CMD_STRAT_START_STOP_V2 => {
+                let body = &payload[BASE_HEADER_SIZE..];
+                let Some((start, items)) = ui::parse_strat_start_stop(hdr.cmd_id, body) else {
+                    return;
+                };
+                self.strategies.set_running(start);
+                // The per-strategy checkboxes that rode the command. Nothing
+                // here can honour them — there is no strategy list to check off
+                // and nothing to run (M3) — so they are named in the journal
+                // rather than dropped in silence.
+                if !items.is_empty() {
+                    log::info!(
+                        "start/stop carried {} checked flag(s); no strategy list \
+                         to apply them to yet (M3)",
+                        items.len()
+                    );
+                }
+                // The button must not quietly lie. The core keeps the flag
+                // because the terminal's own button follows it, and says in the
+                // terminal's log what the flag does and does not mean while the
+                // strategy engines are not ported.
+                if start {
+                    log::warn!("start requested: no strategy engine yet (M3), nothing is entered");
+                    session.send_encrypted(
+                        LOG,
+                        &log_msg(
+                            now_ms(),
+                            "Astercore M0: strategies are not implemented yet \
+                             — nothing will be entered",
+                        ),
+                        true,
+                    );
+                }
+                // To the sender, which at M0 is the only client there is to
+                // tell. TInvestCore broadcasts this through an outbox every
+                // session drains, so a second terminal's button follows the
+                // first one's; that plumbing arrives with the state worth
+                // converging on (the strategy list, M3). With two terminals
+                // open now the second one's button lags — written down because
+                // a known divergence is worth more than a silent one.
+                session.send_encrypted(STRAT, &strat::runtime_state(rand_uid(), start), true);
+            }
+            other => log::debug!("UI cmd {other} ignored"),
+        }
+    }
+
+    fn on_strat(&mut self, session: &mut Session, payload: &[u8]) {
+        let Some(hdr) = BaseHeader::parse(payload) else {
+            return;
+        };
+        let body = &payload[BASE_HEADER_SIZE..];
+        match hdr.cmd_id {
+            // The mandatory Init step: without this answer the client never
+            // reaches `Ready`.
+            strat::CMD_SCHEMA_REQUEST => {
+                let resp = strat::schema_payload(hdr.uid, self.strategies.schema_blob());
+                session.send_encrypted(STRAT, &resp, true);
+            }
+            strat::CMD_SNAPSHOT => {
+                if let Some(snap) = strat::parse_snapshot(body) {
+                    self.strategies.store(snap);
+                }
+            }
+            other => log::debug!("Strat cmd {other} ignored until M3"),
+        }
+    }
+
+    fn on_order(&mut self, session: &mut Session, payload: &[u8]) {
+        let Some(hdr) = BaseHeader::parse(payload) else {
+            return;
+        };
+        match hdr.cmd_id {
+            // The post-init snapshot request. There is no order path until M2,
+            // and an empty snapshot is the true answer: this core holds no
+            // orders. Silence would leave the terminal's ORDERS table waiting.
+            trade::CMD_ORDER_STATUS_REQUEST if hdr.uid == 0 => {
+                session.send_encrypted(ORDER, &trade::orders_snapshot(0, &[]), true);
+            }
+            trade::CMD_ORDER_STATUS_REQUEST => {
+                session.send_encrypted(ORDER, &trade::order_not_found(hdr.uid), true);
+            }
+            other => log::debug!("Order cmd {other} ignored until M2"),
+        }
+    }
+
+    fn on_balance(&mut self, session: &mut Session, payload: &[u8]) {
+        let Some(hdr) = BaseHeader::parse(payload) else {
+            return;
+        };
+        if matches!(
+            hdr.cmd_id,
+            balance::CMD_REQUEST_REFRESH | balance::CMD_DIGEST
+        ) {
+            // Zeros and no rows: reading the account needs a signed call
+            // (M2), so what this core knows about the money is nothing. The
+            // empty snapshot is how that is spelled on this wire — there is no
+            // "unknown" for a balance — and the terminal draws an empty Assets
+            // panel, which is the right picture for a core that cannot trade
+            // yet. Answering at all matters: the client asks once per init and
+            // again on every digest mismatch, and silence leaves it asking.
+            let resp = balance::balance_full(hdr.uid, self.balance_epoch, 0.0, 0.0, 0.0, &[]);
+            session.send_encrypted(BALANCE, &resp, true);
+        }
+    }
+}
+
+impl Handler for CoreHandler {
+    fn on_connected(&mut self, session: &mut Session) {
+        log::info!("client {:#x} connected", session.client_id());
+        session.send_encrypted(UI, &ui::runtime_state(rand_uid(), true, false), true);
+        let running = self.strategies.running();
+        session.send_encrypted(STRAT, &strat::runtime_state(rand_uid(), running), true);
+    }
+
+    fn on_command(&mut self, session: &mut Session, cmd: u8, payload: &[u8]) {
+        match Command::from_byte(cmd).to_byte() {
+            API => self.on_api(session, payload),
+            STRAT => self.on_strat(session, payload),
+            UI => self.on_ui(session, payload),
+            ORDER => self.on_order(session, payload),
+            BALANCE => self.on_balance(session, payload),
+            _ => log::debug!(
+                "cmd {} ignored, {} bytes",
+                Command::from_byte(cmd).name(),
+                payload.len()
+            ),
+        }
+    }
+
+    fn on_closed(&mut self, client_id: u64) {
+        log::info!("client {client_id:#x} closed");
+    }
+}
+
+/// Unix milliseconds, UTC — the core's one clock.
+///
+/// Aster's own `timezone` is UTC and every timestamp on the wire to it is
+/// unix milliseconds, so unlike TInvestCore there is no Moscow midnight and no
+/// local-time arithmetic anywhere in this core.
+pub fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// A uid for a command the core sends unsolicited. Ported from TInvestCore:
+/// the clock keeps the low bits, a counter the high ones, so two calls in one
+/// nanosecond still differ.
+fn rand_uid() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |d| d.as_nanos() as u64);
+    (nanos & 0x0000_ffff_ffff_ffff) | (SEQ.fetch_add(1, Ordering::Relaxed) << 48)
+}

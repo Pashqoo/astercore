@@ -8,9 +8,11 @@
 //! invent `RUBUSDT` or have every manual order rejected. Verified against the
 //! terminal's source, not assumed.
 
-use moonproto::server::codec::engine::{BaseCurrency, Funding as WireFunding, MarketSpec};
+use moonproto::server::codec::engine::{
+    BaseCurrency, Funding as WireFunding, MarketSpec, PriceRow,
+};
 
-use crate::aster::json::{ExchangeInfo, Filter, PremiumIndex, SymbolInfo, Ticker24h};
+use crate::aster::json::{BookTicker, ExchangeInfo, Filter, PremiumIndex, SymbolInfo, Ticker24h};
 
 /// Quote currency this core trades.
 ///
@@ -27,7 +29,7 @@ pub const QUOTE: &str = "USDT";
 /// reads the string for display and the ordinal for its money path, and a core
 /// whose two disagree is a core whose orders are priced in one currency and
 /// sized in another. Changing the quote means changing both, here, once.
-const QUOTE_CODE: BaseCurrency = BaseCurrency::USDT;
+pub const QUOTE_CODE: BaseCurrency = BaseCurrency::USDT;
 
 /// A perpetual whose `deliveryDate` is this is vanilla — the value is a
 /// sentinel for "never" (year 2101), not a date. 577 of 596 carry it.
@@ -57,7 +59,7 @@ pub struct Funding {
     /// `nextFundingTime`, unix milliseconds, UTC, and expected to be > 0.
     ///
     /// Not an invariant the type enforces — the struct is plain data — but one
-    /// every write path in this module keeps: [`Catalog::apply_funding`] stores
+    /// every write path in this module keeps: [`Catalog::apply_premium_index`] stores
     /// `None` for a row without a charge time rather than a rate beside a zero,
     /// which is the shape the terminal reads as no funding at all while the
     /// rate sits right there.
@@ -197,6 +199,24 @@ pub struct Market {
     pub quote_volume_24h: Option<f64>,
     /// Last traded price, from the same call and `None` for the same reason.
     pub last_price: Option<f64>,
+    /// Top of book, from `ticker/bookTicker` and `None` until it is read.
+    ///
+    /// Both sides or neither: a book row carries the two together, and half a
+    /// top of book is a quote nobody can act on. Measured 01.10 the answer
+    /// covers the `TRADING` symbols and no others, so a `SETTLING` or
+    /// `PENDING_TRADING` market keeps `None` for as long as it is listed, and
+    /// [`Catalog::prices`] sends it to the terminal as a zero — which is how
+    /// both sides of that wire spell "no quote".
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    /// Mark price from `premiumIndex`, `None` until it is read.
+    ///
+    /// The exchange's own reference price: `PERCENT_PRICE`, the margin and the
+    /// liquidation price are all computed against it, so it is what the
+    /// terminal's band and risk columns mean. Not the last trade, and not
+    /// derived from the book — the two differ on a thin market, which is
+    /// exactly where the difference matters.
+    pub mark_price: Option<f64>,
     /// Funding, once `premiumIndex` has been read, and `None` when the exchange
     /// published no row for this symbol — measured 01.10, `MBLUSDT` is such a
     /// market. Not a zero: a rate of exactly zero is a real answer between
@@ -620,13 +640,33 @@ impl Catalog {
         filled
     }
 
-    /// Merge one `premiumIndex` answer: the funding pair per market.
+    /// Merge one `premiumIndex` answer: the funding pair and the mark price per
+    /// market.
     ///
     /// Same matching rule and same reason, with the asymmetry the other way
     /// round as well: measured 01.10 the answer has 766 rows for 596 markets
     /// AND still leaves `MBLUSDT` without one. The markets it does not name
-    /// keep `funding: None`.
-    pub fn apply_funding(&mut self, rows: &[PremiumIndex]) -> usize {
+    /// keep `funding: None` and `mark_price: None`.
+    ///
+    /// Named after the answer rather than after one of its two fields: both the
+    /// funding pair and the mark price come from this one call, and a caller
+    /// that read the name as "funding only" would go looking for a second
+    /// request that does not exist.
+    ///
+    /// Returns how many markets ended up WITH funding — the figure the
+    /// `catalog:` line reports — not how many rows matched. The mark-price
+    /// coverage is counted separately by [`Catalog::summary`], because the two
+    /// differ: a row with a mark price and no charge time fills one and not the
+    /// other.
+    pub fn apply_premium_index(&mut self, rows: &[PremiumIndex]) -> usize {
+        // Cleared first for the same reason as the book, and it is the same
+        // kind of answer: the exchange's current word on every market it
+        // publishes these numbers for. A market that drops out of it has no
+        // mark price and no funding, rather than yesterday's.
+        for m in &mut self.markets {
+            m.mark_price = None;
+            m.funding = None;
+        }
         let mut filled = 0;
         for r in rows {
             let Ok(i) = self
@@ -635,6 +675,10 @@ impl Catalog {
             else {
                 continue;
             };
+            // Zero is not a mark price: it is what an absent or unreadable
+            // field decodes to (`json::str_f64`), and a zero reference price
+            // would read on the terminal as a market priced at nothing.
+            self.markets[i].mark_price = (r.mark_price > 0.0).then_some(r.mark_price);
             // A row without a charge time is not funding, whatever rate it
             // carries: the terminal's own absence test is the time, so keeping
             // it would show nothing on screen while counting as funding in the
@@ -651,6 +695,118 @@ impl Catalog {
             filled += usize::from(self.markets[i].funding.is_some());
         }
         filled
+    }
+
+    /// Merge one `ticker/bookTicker` answer: the top of book per market.
+    ///
+    /// The answer is the exchange's COMPLETE word on what is quoted, not a
+    /// patch: measured 01.10 it carries a row for every one of the 589
+    /// `TRADING` symbols and for nothing else. So every quote is dropped first
+    /// and only this answer's rows are stored — a market that falls out of a
+    /// later answer (it stops trading, it is delisted) loses its quote instead
+    /// of keeping the last one it ever had. Merging in place would leave that
+    /// market quoted at a price nobody is offering, for as long as the process
+    /// runs.
+    ///
+    /// A row is a quote only if both sides are positive and the bid is not
+    /// above the ask. Half a top of book is not one, and a crossed pair cannot
+    /// come from one book — both sides of a row are read off the same one — so
+    /// it is garbage from a partial or reordered answer rather than a market to
+    /// act on.
+    ///
+    /// Returns how many markets ended up quoted, which the `catalog:` line and
+    /// the `prices:` line report: the difference from the catalog size is the
+    /// markets that are not `TRADING`, and a sudden drop there is the exchange
+    /// thinning out.
+    ///
+    /// An EMPTY answer therefore clears every quote. That is the same statement
+    /// as any other answer — nothing is quoted — and it is also how the
+    /// refresher reports an outage it has given up on (`prices.rs`), which is
+    /// the one way a core that cannot reach the exchange can stop presenting
+    /// old prices as current.
+    pub fn apply_book(&mut self, rows: &[BookTicker]) -> usize {
+        for m in &mut self.markets {
+            m.bid = None;
+            m.ask = None;
+        }
+        let mut filled = 0;
+        for r in rows {
+            let Ok(i) = self
+                .markets
+                .binary_search_by(|m| m.symbol.as_str().cmp(&r.symbol))
+            else {
+                continue;
+            };
+            if r.bid_price > 0.0 && r.ask_price > 0.0 && r.bid_price <= r.ask_price {
+                let m = &mut self.markets[i];
+                m.bid = Some(r.bid_price);
+                m.ask = Some(r.ask_price);
+                filled += 1;
+            }
+        }
+        filled
+    }
+
+    /// Market symbols in `m_index` order — the body of `GetMarketsIndexes`.
+    ///
+    /// The same order as [`Catalog::specs`] by construction (both walk the one
+    /// sorted vector), which is the whole contract of that message: the
+    /// terminal maps these names onto the indexes every later indexed packet
+    /// uses.
+    pub fn symbols(&self) -> Vec<&str> {
+        self.markets.iter().map(|m| m.symbol.as_str()).collect()
+    }
+
+    /// Position of a symbol in that order, or `None` for a market this core
+    /// does not carry.
+    pub fn index_of_symbol(&self, symbol: &str) -> Option<u16> {
+        self.markets
+            .binary_search_by(|m| m.symbol.as_str().cmp(symbol))
+            .ok()
+            .map(|i| i as u16)
+    }
+
+    /// The price rows of `UpdateMarketsList`, in `m_index` order: one row per
+    /// market, every time.
+    ///
+    /// A market with no quote is sent as **zeros**, not left out. Leaving it
+    /// out does not clear anything on the other side — the terminal's client
+    /// overwrites only the rows it receives (`state/markets/prices.rs`), so an
+    /// omitted market keeps whatever it was last told, which is precisely the
+    /// stale quote this core must not leave standing. A zero, by contrast, is
+    /// read as absent on both sides of that boundary: the terminal passes the
+    /// bid through its own `positive()` filter (`moon-core/src/market/source/
+    /// read.rs`) and the client's price-mean and chart-step arithmetic is
+    /// guarded by an epsilon, so a zero row shows no price and poisons no
+    /// delta window — verified in their source, not assumed.
+    ///
+    /// One reader there is NOT guarded, and it is harmless: the client
+    /// recomputes `price.min_lot_size = max(step × mid, min_notional)` on every
+    /// row, so a zero collapses it to the market's `MIN_NOTIONAL` — 5 USDT on
+    /// this venue, which is the floor it would have anyway — and the next
+    /// quoted row restores it. It is also what the contract test reads to tell
+    /// "the row arrived as zeros" from "no row arrived at all", since the
+    /// client's own default for an untouched market is a zero everywhere.
+    ///
+    /// Measured 01.10 this is 596 rows of which 589 carry a quote; the other
+    /// seven are the `SETTLING` and `PENDING_TRADING` markets, which the
+    /// exchange quotes no book for and the terminal must therefore show no
+    /// price for.
+    ///
+    /// The mark price rides along when it is known; `write_markets_prices`
+    /// carries a `found` flag beside it, and a zero there says "no mark price"
+    /// rather than "zero".
+    pub fn prices(&self) -> Vec<PriceRow> {
+        self.markets
+            .iter()
+            .enumerate()
+            .map(|(i, m)| PriceRow {
+                m_index: i as u16,
+                bid: m.bid.unwrap_or(0.0),
+                ask: m.ask.unwrap_or(0.0),
+                last: m.mark_price.unwrap_or(0.0),
+            })
+            .collect()
     }
 
     /// The catalog as `GetMarketsList` rows, in `m_index` order.
@@ -712,11 +868,27 @@ impl Catalog {
             .iter()
             .filter(|m| m.alias_1000().is_some())
             .count();
+        // The two the price rows of `UpdateMarketsList` are built from. Counted
+        // here for the same reason as funding and turnover: a market with no
+        // top of book goes into those rows as a zero and the terminal shows no
+        // price for it — a fact the journal must state rather than leave to be
+        // noticed on screen.
+        let quoted = self
+            .markets
+            .iter()
+            .filter(|m| m.bid.is_some() && m.ask.is_some())
+            .count();
+        let marked = self
+            .markets
+            .iter()
+            .filter(|m| m.mark_price.is_some())
+            .count();
         let mut line = format!(
             "catalog: {total} {QUOTE} perpetuals, {trading} trading, \
              {sessions} with sessions, {delivering} with a delivery date, \
              {aliases} 1000-aliases; funding {funded}/{total}, \
-             turnover {turnover}/{total}; \
+             turnover {turnover}/{total}, quoted {quoted}/{total}, \
+             marks {marked}/{total}; \
              {}; skipped {} on quote, {} not a perpetual",
             tags.join(", "),
             self.skipped_quote,
@@ -857,6 +1029,9 @@ fn market_of(s: &SymbolInfo) -> Market {
         tags: tags_of(s),
         quote_volume_24h: None,
         last_price: None,
+        bid: None,
+        ask: None,
+        mark_price: None,
         funding: None,
     };
     for f in &s.filters {
@@ -991,6 +1166,9 @@ mod tests {
             tags: vec![Tag::Top, Tag::Crypto],
             quote_volume_24h: None,
             last_price: None,
+            bid: None,
+            ask: None,
+            mark_price: None,
             funding: None,
         }
     }
@@ -1223,11 +1401,32 @@ mod tests {
         }
     }
 
+    /// A funding row with no mark price, which is the shape that keeps the
+    /// funding assertions about funding alone; the mark price has its own test.
     fn premium(symbol: &str, rate: f64, next_ms: i64) -> PremiumIndex {
         PremiumIndex {
             symbol: symbol.into(),
             last_funding_rate: rate,
             next_funding_time_ms: next_ms,
+            mark_price: 0.0,
+        }
+    }
+
+    /// A row that carries a mark price and no funding.
+    fn premium_marked(symbol: &str, mark: f64) -> PremiumIndex {
+        PremiumIndex {
+            symbol: symbol.into(),
+            last_funding_rate: 0.0,
+            next_funding_time_ms: 0,
+            mark_price: mark,
+        }
+    }
+
+    fn book(symbol: &str, bid: f64, ask: f64) -> BookTicker {
+        BookTicker {
+            symbol: symbol.into(),
+            bid_price: bid,
+            ask_price: ask,
         }
     }
 
@@ -1449,7 +1648,7 @@ mod tests {
             ticker("BTCUSDT", 83_906.0, 658_458_631.25),
         ]);
         assert_eq!(filled, 1);
-        let filled = cat.apply_funding(&[
+        let filled = cat.apply_premium_index(&[
             premium("GNSUSD", 0.001, 1), // an index symbol, not a market
             premium("BTCUSDT", 0.000_089_79, 1_790_870_400_000),
         ]);
@@ -1467,6 +1666,120 @@ mod tests {
         assert_eq!(mbl.funding, None);
         assert_eq!(spec_of(mbl).volume, 0.0);
         assert!(cat.summary().contains("funding 1/2"), "{}", cat.summary());
+    }
+
+    /// The price rows are the one message M0 sends on a period, and two rules
+    /// decide them: one row per market whatever its state, and a quote only
+    /// where the exchange published one.
+    #[test]
+    fn price_rows_cover_every_market_and_quote_only_the_quoted_ones() {
+        let mut cat = Catalog::build(&info(vec![
+            sym("AAAUSDT", "{}", &[], "TRADING", 0),
+            sym("BBBUSDT", "{}", &[], "SETTLING", 0),
+            sym("CCCUSDT", "{}", &[], "TRADING", 0),
+        ]));
+        // What the exchange answered on 01.10: a row per TRADING symbol and
+        // none for the others.
+        assert_eq!(
+            cat.apply_book(&[
+                book("CCCUSDT", 9.0, 9.5),
+                book("AAAUSDT", 1.0, 1.5),
+                book("ZZZUSD1", 7.0, 7.5), // a quote this core does not carry
+            ]),
+            2
+        );
+        cat.apply_premium_index(&[PremiumIndex {
+            symbol: "AAAUSDT".into(),
+            last_funding_rate: 0.0001,
+            next_funding_time_ms: 1_790_870_400_000,
+            mark_price: 1.25,
+        }]);
+
+        let rows = cat.prices();
+        assert_eq!(rows.len(), 3, "every market is sent, quoted or not");
+        // Indexes are positions in the catalog, not in the answer.
+        assert_eq!((rows[0].m_index, rows[0].bid, rows[0].ask), (0, 1.0, 1.5));
+        assert_eq!(rows[0].last, 1.25, "the mark price rides the same row");
+        assert_eq!(
+            (rows[1].m_index, rows[1].bid, rows[1].ask, rows[1].last),
+            (1, 0.0, 0.0, 0.0),
+            "an unquoted market is sent as zeros, which both sides read as absent"
+        );
+        assert_eq!((rows[2].m_index, rows[2].bid, rows[2].ask), (2, 9.0, 9.5));
+        assert_eq!(
+            rows[2].last, 0.0,
+            "a market with no mark price says so, and `mark_price_found` is 0"
+        );
+        // `GetMarketsIndexes` must agree with those positions or every later
+        // indexed packet lands on the wrong market.
+        assert_eq!(cat.symbols(), ["AAAUSDT", "BBBUSDT", "CCCUSDT"]);
+        assert_eq!(cat.index_of_symbol("CCCUSDT"), Some(2));
+        assert_eq!(cat.index_of_symbol("NOSUCHUSDT"), None);
+        assert!(
+            cat.summary().contains("quoted 2/3") && cat.summary().contains("marks 1/3"),
+            "{}",
+            cat.summary()
+        );
+    }
+
+    /// The answer is the exchange's whole word, so what it stops naming stops
+    /// being quoted. Keeping the old row is how a delisted market would go on
+    /// showing a price nobody is offering for as long as the core runs.
+    #[test]
+    fn a_market_missing_from_a_later_answer_loses_its_quote() {
+        let mut cat = Catalog::build(&info(vec![
+            sym("AAAUSDT", "{}", &[], "TRADING", 0),
+            sym("BBBUSDT", "{}", &[], "TRADING", 0),
+        ]));
+        assert_eq!(
+            cat.apply_book(&[book("AAAUSDT", 1.0, 1.5), book("BBBUSDT", 2.0, 2.5)]),
+            2
+        );
+        // BBBUSDT went `SETTLING` between two answers.
+        assert_eq!(cat.apply_book(&[book("AAAUSDT", 1.0, 1.5)]), 1);
+        let bbb = cat.get("BBBUSDT").expect("BBBUSDT");
+        assert_eq!((bbb.bid, bbb.ask), (None, None));
+        assert_eq!(cat.prices()[1].bid, 0.0, "and the terminal is told so");
+
+        // The same rule under the premium answer: a market that drops out of it
+        // has no mark price, not the last one it had.
+        cat.apply_premium_index(&[premium_marked("AAAUSDT", 1.25)]);
+        cat.apply_premium_index(&[premium_marked("BBBUSDT", 2.25)]);
+        assert_eq!(cat.get("AAAUSDT").expect("AAAUSDT").mark_price, None);
+        assert_eq!(cat.get("BBBUSDT").expect("BBBUSDT").mark_price, Some(2.25));
+
+        // An empty answer is the same statement about every market, and it is
+        // how the refresher reports an outage it has given up on.
+        assert_eq!(cat.apply_book(&[]), 0);
+        assert!(cat.prices().iter().all(|r| r.bid == 0.0 && r.ask == 0.0));
+    }
+
+    /// Both sides of a row come off one book, so a crossed pair is garbage from
+    /// a partial or reordered answer — not a market to quote.
+    #[test]
+    fn a_crossed_or_half_quote_is_not_a_quote() {
+        let mut cat = Catalog::build(&info(vec![sym("AAAUSDT", "{}", &[], "TRADING", 0)]));
+        for (bid, ask) in [(1.0, 0.0), (0.0, 1.5), (1.6, 1.5)] {
+            assert_eq!(
+                cat.apply_book(&[book("AAAUSDT", bid, ask)]),
+                0,
+                "{bid}/{ask}"
+            );
+            let m = cat.get("AAAUSDT").expect("AAAUSDT");
+            assert_eq!((m.bid, m.ask), (None, None), "{bid}/{ask}");
+        }
+        // The equal pair is a real one-tick market, not a crossed book.
+        assert_eq!(cat.apply_book(&[book("AAAUSDT", 1.5, 1.5)]), 1);
+    }
+
+    /// Zero is how an absent or unreadable `markPrice` decodes, and a market
+    /// priced at nothing is not a reference price.
+    #[test]
+    fn a_zero_mark_price_is_absent_rather_than_zero() {
+        let mut cat = Catalog::build(&info(vec![sym("AAAUSDT", "{}", &[], "TRADING", 0)]));
+        cat.apply_premium_index(&[premium("AAAUSDT", 0.0001, 1_790_870_400_000)]);
+        assert_eq!(cat.get("AAAUSDT").expect("AAAUSDT").mark_price, None);
+        assert!(cat.summary().contains("marks 0/1"), "{}", cat.summary());
     }
 
     #[test]
@@ -1498,13 +1811,16 @@ mod tests {
         // A rate with no time: the terminal would show no funding whatever the
         // rate says, so storing it would be a figure in the journal and nothing
         // on screen.
-        assert_eq!(cat.apply_funding(&[premium("BTCUSDT", 0.000_1, 0)]), 0);
+        assert_eq!(
+            cat.apply_premium_index(&[premium("BTCUSDT", 0.000_1, 0)]),
+            0
+        );
         assert_eq!(cat.get("BTCUSDT").expect("BTCUSDT").funding, None);
         assert!(cat.summary().contains("funding 0/1"), "{}", cat.summary());
 
         // The same row with a time is kept.
         assert_eq!(
-            cat.apply_funding(&[premium("BTCUSDT", 0.000_1, 1_790_870_400_000)]),
+            cat.apply_premium_index(&[premium("BTCUSDT", 0.000_1, 1_790_870_400_000)]),
             1
         );
         assert!(cat.get("BTCUSDT").expect("BTCUSDT").funding.is_some());

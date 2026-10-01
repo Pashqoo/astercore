@@ -5,4 +5,9 @@
 //! deleted rather than left beside the new code.
 
 pub mod aster;
+pub mod engine;
+pub mod key_store;
 pub mod model;
+pub mod prices;
+pub mod stderr_log;
+pub mod strategies;

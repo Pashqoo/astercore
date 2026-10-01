@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use ureq::http::Response;
 use ureq::{Agent, Body};
 
-use super::json::{ApiError, ExchangeInfo, PremiumIndex, ServerTime, Ticker24h};
+use super::json::{ApiError, BookTicker, ExchangeInfo, PremiumIndex, ServerTime, Ticker24h};
 
 pub const BASE: &str = "https://fapi.asterdex.com";
 
@@ -148,6 +148,17 @@ impl Rest {
     /// header rather than either number.
     pub fn ticker_24h_all(&mut self) -> Result<Vec<Ticker24h>, Error> {
         self.get("/fapi/v1/ticker/24hr", &[])
+    }
+
+    /// `GET /fapi/v1/ticker/bookTicker` for every symbol at once: the top of
+    /// book of the whole catalog.
+    ///
+    /// Measured 01.10: 589 rows, `x-mbx-used-weight-1m: 2` right after it — the
+    /// cheapest call the core makes. It is what the price rows of
+    /// `UpdateMarketsList` are built from until M1's `depth20` stream arrives,
+    /// and at that weight it can be re-read on a period without a meter.
+    pub fn book_ticker_all(&mut self) -> Result<Vec<BookTicker>, Error> {
+        self.get("/fapi/v1/ticker/bookTicker", &[])
     }
 
     /// `GET /fapi/v1/premiumIndex` for every symbol at once: the funding pair.
