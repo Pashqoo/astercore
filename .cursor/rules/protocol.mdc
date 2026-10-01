@@ -1,0 +1,144 @@
+---
+description: MoonProto wire-контракт со стороны сервера — транспорт, handshake, init-spine и гейты терминала после Ready
+globs: crates/moonproto/src/server/**,crates/aster-core/**
+alwaysApply: false
+---
+
+# MoonProto: контракт сервера
+
+> **Происхождение.** Файл перенесён из TInvestCore (`.cursor/rules/protocol.mdc`) и остаётся
+> верным, потому что `crates/moonproto/src/server/` в двух репозиториях совпадает побайтово,
+> кроме докстрингов (сверено диффом 01.10). Это контракт **терминала**, брокера в нём нет —
+> поэтому переносится почти целиком. Правлено под Aster: идентичность ядра (код 221, `FUTURES`,
+> `USDT`), зашитые нулями поля `Market`, природа снимков стакана.
+
+Источник истины — upstream-клиент в `crates/moonproto/src/{transport,protocol,commands,client}`.
+Серверные кодеки: `server/codec/{engine,strat,ui,balance,trade,market_data}.rs`, каждый тестируется против
+upstream-парсера. Общий заголовок команд `BaseHeader`: `cmd_id:u8 + ver:u16(=4) + uid:u64`.
+Команды с `ver > 4` клиент пропускает.
+
+## Транспорт и сессия (`server/{wire,session,mod}.rs`)
+- ServerMsgHeader 7 байт (rnd, checksum u32, ver=3, cmd); ClientMsgHeader 15 (+client_id u64).
+  SipHash-1-3 MAC + xoroshiro-обфускация; режимы V0 / V1 (STUN-обёртка) / V2 (DNS warmup «MP»).
+- Handshake: Hello → WhoAreYou → ImFriend → Fine; HelloAgain → Fine или WantNewHello.
+  Session keys: `generate_session_sub_keys(master, client_id, server_token, session_rnd)`;
+  server decode = client_encode, server encode = client_decode.
+- Crypted: IV12+Tag16+PKCS7, plaintext header 12 байт (rnd u16, msg_num u64, cmd, want_ack);
+  msg_num стартует с 2047. Sliced: SliceHeader 4 байта, блок 0 несёт wire cmd, ACK256.
+- Ping 57 байт каждые 1000 мс; клиент offline через 2300 мс без пакетов. PMTU-проба сверху вниз.
+- Sliced-отправитель (`Session::flush_sliced`, зеркало клиентского `retry_sliced`): `send_wire`
+  только ставит датаграмму в очередь (меньше блоков — раньше); блоки уходят из `tick` под байтовый
+  бюджет `can_send_rate × 5 мс` (старт 2 МБ/с, клампы 256 КБ..8 МБ), повтор блока через
+  `path_delay = rtt×1.1+10` (rtt 0 → 200 мс), один ретрай на проход; ACK с новыми флагами
+  восстанавливает `retries_left` (30). Скорость раз в пинг, если бюджет использовался ≥80 %:
+  EMA доли ретрансмитов завершённых датаграмм ≥5 % → ×0.85, <1 % → +3 % (мин. +32 КБ).
+  RSQ в Ping = доля уникальных блоков среди принятых от клиента за интервал пинга ×255 (255 при
+  простое) — клиент по нему правит свой `can_send_rate` (0.92/0.85). Семантика RSQ в Delphi
+  неизвестна, это наше допущение (11.09, отзыв разработчика MoonBot).
+- Плейнтекстом допустимы API GetMarketsList/UpdateMarketsList/RequestCandlesData и публичный
+  фид TradesStream/TradesResendResponse/OrderBook (`Session::send`, транспорт сам SynLZ-жмёт);
+  всё остальное (Order/UI/Strat/API/Balance) — только Crypted, иначе клиент дропает.
+
+## Init-spine (обязателен до `LifecycleEvent::Ready`)
+BaseCheck → AuthCheck → GetMarketsList → UpdateMarketsList → StratSchema → PostInitFlush.
+- BaseCheck data: bot_id i64, server_name, exchange_code u8, exchange_name, type_mask u8
+  (SPOT=1, FUTURES=2), dex_name, base_currency_name, base_currency_code u8, server_version i32,
+  moonproto_version i32. Неизвестный exchange_code (у нас **221**) — терминал именует площадку по
+  exchange_name («**Aster**») и рисует её в секции `reported` без логотипа (`venue(221) == None`,
+  `moon-core/src/venue.rs`); без exchange_code Identity не отправляется.
+  type_mask у нас **FUTURES=2**, не SPOT: с этим битом терминал в окне Assets показывает только
+  открытые позиции (баланс здесь — маржинальная валюта, а не купленный актив) и читает
+  `leverage_x` по рынкам (`moon-core/src/feed/types.rs`). base_currency — `USDT`,
+  `BaseCurrency::USDT`=1.
+- Market: 10 str, 6 i32, i64, 20 f64, 5 bool, futures_type u8 (`BaseCurrency::EMPTY`=25 ⇒ SPOT).
+  Клиент ключует рынки по `bn_market_name` (symbol); `m_index` = позиция в списке.
+  **Энкодер был унаследован от TInvestCore и зашивал нулями всё, что у MOEX отсутствовало, а у
+  Aster есть; закрыто 01.10** — `futures_type` (`USDT`, иначе терминал считает перп спотом),
+  `is_btc_market`, `market_currency_canonic` (свёрнутая монета: `1000SHIB` → `SHIB`),
+  `leading1000`/`k1000`/`has_1000_prefix_alias` (12 символов), `bn_multiplier_up`/`down`
+  (`PERCENT_PRICE`, у каждого символа свой), `bn_min_price`/`bn_max_price`, `bn_delivery_time`
+  (19 символов доставляются, сентинел 2101 года в провод не уходит), `funding_rate` (**в
+  процентах**, не дробью) и `funding_time` (Delphi-дни UTC, читатель апстрима сам сдвигает его в
+  локальную зону). Замеры — `PLAN.md`, раздел «Находка M0».
+  Нулями остаются честные: `bn_max_notional` (фильтра `MAX_NOTIONAL` у Aster нет), `bn_max_value`,
+  `bn_iceberg*`, `bn_margin_table_id`, `bn_only_isolated` и пара `bid_*`/`ask_*`.
+  Растяжку держат тесты `an_aster_market_row_round_trips_through_the_upstream_parser`,
+  `a_market_without_funding_sends_zero_rather_than_1970`,
+  `a_1000_alias_market_names_its_multiplier_and_folds_its_coin`,
+  `a_settling_market_carries_its_delivery_instant`.
+- EngineResponse: cmd 1, own_uid, request_uid, method, success, error_code, error_msg,
+  is_compressed (raw deflate), data_size, data. Сжимаем от 1 КБ.
+- StratSchema: Strat cmd 8 = `size:u32 + raw-deflate blob`; blob: ver=1, kinds(u8 cnt: ord u8,
+  str8), fields(u16 cnt: str8 name, type_id, flags, layout, [default], visibility bits, [static]).
+  Запрос схемы (cmd 7) приходит сразу после AuthCheck.
+
+## После Ready (терминал сам шлёт, отвечаем)
+- UI 2 SettingsRequest → UI 1 ClientSettings (uid не сверяется). UI 1 от терминала → echo тем же
+  телом (терминал сравнивает распарсенные поля, без echo `is_idle=false` и drive не стартует).
+- UI 29 SharedConfigRequest (ретрай 5 с) → UI 28 `len:u32 + gzip(MBSP)`; UI 28 от терминала → echo.
+  Дефолт: `serialize_payload(&SharedConfig::default())` + gzip.
+- Order 45 (uid 0 = весь снапшот) → Order 43 `from_uid u64 + range_end_uid u64 + records`.
+- Balance 5 → Balance 3 `epoch u16, total, locked, full, special (f64), count i32 + rows`.
+- UI 20 RuntimeState, Strat 10 — шлём при подключении. News — пустые, не блокируют.
+- UI 24 ProfitState — в ответ на UI 2 SettingsRequest (до Ready клиент его не применяет) и всем при
+  изменении итогов; раз в минуту перепроверка (почасовое окно сдвигается само).
+- GetMarketsIndexes: `count i32 + bn_market_name[]`. CancelAllOrders (API 11, кнопка «Cancel ALL
+  orders» настроек ядра) → ok с пустыми данными, действие — `trading.mdc`. Остальные API-методы пока
+  `response_err`.
+
+## Маркет-дата (`server/codec/market_data.rs`, всё UTC в Delphi-днях)
+- TradesStream: `base_time f64 + packet_num u16 + секции[idx u16 (type<<14, 0=futures), cnt u8,
+  rows(delta i16 мс, price f32, qty f32 со знаком)] + flags u8`. Клиент применяет только после
+  `indexes_synchronized`; без пакетов >5 с после SubscribeAllTrades — unsubscribe/resubscribe,
+  поэтому пустой heartbeat раз в 1 с. Пропуск packet_num → `TradesResend(cnt u8, nums u16[])`
+  → TradesResendResponse `cnt u8 + [len u16 + пакет]`.
+- OrderBook (SynLZ): `idx u16, seq u16, flags(bit0 full, bit1 kind), bid_cnt u16, уровни f32 f32`.
+  Шлём всегда full, kind 0 (futures — терминал читает его для незнакомой площадки). Полные
+  снимки здесь не наша натяжка, а свойство источника: `<symbol>@depth20@100ms` каждым сообщением
+  отдаёт топ-20 целиком — замерено 01.10, 55 сообщений, всегда ровно (20, 20) уровней и ни одного
+  с нулевым объёмом, тогда как `@depth` за те же 6 с дал 478 нулевых (удаления). Поэтому ни
+  локального стакана, ни `U`/`u`/`pu`-менеджмента, ни сшивки со снимком по REST в ядре нет. SubscribeOrderBook/UnsubscribeOrderBook — батч имён; клиент сам шлёт
+  `RequestOrderBookFull(idx u16, kind u8)`.
+- Свечи: `GetCoinCardCandles(name, kind u8)` → `count i32 + TDeepPrice(open,close,high,low,vol
+  f32, time f64)`; `SubscribeCandles(names[], kind u8)` → ok + `TCandleTFStateCommand` (API cmd 4)
+  и живые `TCandleUpdateCommand` (API cmd 3, unreliable). Live применяется только поверх
+  загруженной истории. `RequestCandlesData` — chunked zlib v2, 5m-свечи. У TInvestCore они собирались из его
+  структуры `Windows`, которой в этом репозитории нет: на Aster источник — `/fapi/v1/klines`
+  (интервал `5m` отдаётся биржей напрямую). Работа M1.
+- `RequestMarketHistory(name)` — chunked raw-deflate архив v1: trades 16 Б/строка, остальные
+  секции пустые. Chunk = `[idx u16][total u16] + slice`, по одному EngineResponse (60 КиБ).
+
+## Стратегии / детекты / отчёты (wire, разведка 11.09; app-контракт — `crates/moonproto/docs/{strats,reports}.md`)
+- Strat (cmd 30), строки `u16 len + utf8`: 1 SnapshotRequest (S→C, клиент отвечает Full), 2 Snapshot
+  `server_epoch u64, client_max_last_date u64, size u32, full u8, data(raw-deflate TStrategySerializer)
+  [, folders_last_modified i64]`, 3 Delete `strategy_id u64 [, folder_path]`, 4 SellPriceUpdate
+  `id u64, f64`, 5 CheckedSync `cnt u16 + (id u64, checked u8)[] [, is_delta u8]`, 6 CheckedEcho (S→C),
+  7/8 схема, 9 DetectSignal `market str, strategy_id u64, is_short u8, kind u8 (ROW 1|CHART_ONLY 2|ALERT 4),
+  0u8 [, msg][, pos_val f64, val f64, row_flags u8][, obj_uid u64]`, 10 RuntimeState `running u8`.
+  Start/Stop — UI 4 `is_start u8 + cnt u16 + checked items` (UI 3 — без items). Терминал редактирует
+  (правка бампает только `last_date`, `strategy_ver` ядро сохраняет), ядро хранит список: на Full/Partial
+  применяет с rollback guard (`last_date`/`strategy_ver` оба `>=` — своя копия остаётся), Full не удаляет
+  отсутствующих, порядок берёт при `server_epoch > свой`, папки при большем `folders_last_modified`; в ответ
+  бродкаст Full (весь список + папки, `folders_last_modified ≠ 0` — иначе клиент блокирует folder-API) или
+  Partial по присланным id (отклонённая ревизия возвращается копией ядра; `EditConfirmed` только при равных
+  (last_date, ver) и полях, отсутствующее поле == default). Пост-init терминал шлёт Full(epoch 0, пусто) —
+  ответ Full обязателен. Delete 3 → бродкаст того же Delete (клиент удаляет по приёму); CheckedSync 5 →
+  Echo 6 отправителю + CheckedSync всем; UI 3/4 → checked + RuntimeState 10 всем.
+- Blob стратегий: NameDict/PathDict (`u16 cnt` + str8), `cnt u16`, запись `id u64, ver i32, last_date u64,
+  checked u8, kind u8, path_id u16, fields u16 × (idx u16, tid u8 [|0x80 zero], value)`; строки u16 len;
+  default-поля не пишутся, но словарь объявляет все поля kind'а (отсутствие = сброс в default).
+- Схема: kinds 0–23 фиксированы терминалом (Manual=12, Alerts=22, Watcher=23, PumpDetection=5, Drops=2…);
+  UI хардкодит поля `StrategyName`, `SignalType`, `SoundAlert`, `KeepAlert`, `AddToChart`, `KeepInChart`,
+  `OrderSize`, `SellPrice`, `UseStopLoss`, `StopLoss`, `CoinsWhiteList/BlackList`, `Comment`.
+- Отчёты — подкоманды Order (28): 37→38 схема (SynLZ: ver u8, cnt u16 × (str8 name, kind u8 Int/Float/Text,
+  str8 sql)), обязательное поле `newRecID`; 34 SyncRequest `from_rec_id i64, depth_days u16` → 39 Page
+  `request_uid, epoch i32≠0, last_rec_id, max_rec_id, row_count u16, SynLZ(rows)`; строка `cnt u16 ×
+  (idx u16, kind u8, i64|f64|u16-str)`; 32 Upsert `rec_id + row`, 33 Delete; 40 CheckRows `cnt u16 + i64[]`
+  → по каждому 32/33; 48 SetRowsDeleted `deleted u8, ranges u16×(i64,i64), singles u16×i64` — ядро
+  бродкастит эхо; 49 AliveMap `up_to i64` → 50 `uid, epoch, covered, RleLZ(bitmap bit rec_id-1)`.
+  Реализовано (`reports.rs`, `server/codec/report.rs`): схема — колонки MoonBot `Orders`, `newRecID`
+  с индексом 0 и sql `INTEGER` (клиент сравнивает схему по индексу/имени/типу/sql, append-only в
+  пределах жизни процесса; SQLite `ADD COLUMN` не принимает `PRIMARY KEY`). Свежий курсор (from 0)
+  фильтрует по `BuyDate` глубиной (0 → 30 дней, 65535 → всё), продолжение — `rec_id >= from`
+  без фильтра; страница ≤ 48 КБ до сжатия. Alive map: `up_to` за high-water больше чем на 2^20 —
+  игнор. 32 рассылается всем сессиям (без схемы клиент его отбрасывает).

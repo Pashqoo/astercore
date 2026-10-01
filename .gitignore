@@ -1,9 +1,18 @@
 /target
+_target/
+
+# Credentials and key material. Named widely on purpose: `*.key` alone did not
+# cover a file called `asterkey`, and the gap is only visible until something is
+# actually pasted into it.
 *.key
+asterkey*
+*secret*
+*.env
 .env
+probe.env
+
 .DS_Store
 /data/
+/logs/
 .claude/settings.local.json
 /todo.md
-_target/
-/logs/

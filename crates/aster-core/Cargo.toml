@@ -1,0 +1,24 @@
+[package]
+name = "aster-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Aster execution core speaking MoonProto to MoonTerminal"
+
+[dependencies]
+moonproto.workspace = true
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Synchronous HTTP, no Tokio: the core is a thread-per-stream design and a
+# runtime would be the only async thing in it. `socks-proxy` is carried from
+# the start because a host that cannot reach Aster directly is a deployment
+# question (PLAN.md §10), not a code change.
+ureq = { version = "3", features = ["json", "socks-proxy"] }
+
+# No `libc` yet. TInvestCore carries it so that `systemctl stop` is the same
+# graceful stop as its web page's button — this core has neither a stop path nor
+# a page, and a dependency whose comment promises behaviour the tree lacks is
+# the inherited-but-now-wrong case the project's own rules name. It comes back
+# with the signal handling in M4.

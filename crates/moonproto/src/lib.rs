@@ -153,6 +153,8 @@ mod ntp;
 pub mod shared_config;
 pub mod state;
 pub mod time;
+// Astercore: server side of the wire (not upstream). See crates/moonproto/src/server/.
+pub mod server;
 
 // Low-level wire machinery: kept crate-internal. The high-level API
 // (`client` / `events` / `state`) is the application model; the byte-level

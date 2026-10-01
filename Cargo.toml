@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/moonproto", "crates/aster-core"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+moonproto = { path = "crates/moonproto" }
