@@ -399,7 +399,9 @@ alwaysApply: true
 - Ручной ордер (strategy_id 0) берёт дефолты тулбара из `ClientSettings` (`ui::manual_defaults`:
   TP = `effective_take_profit_percent`, стоп = |`price_drop_level`| % только при
   `panic_if_price_drop`; терминал шлёт настройки и ждёт эхо перед `Start`): стоп через
-  `set_stops(percent)` — всегда; `planned_sell` = `nearest(price·(1±TP))` — только если терминал
+  `set_stops(percent)` — всегда (**Astercore 01.10:** кроме ордера с собственным хвостом
+  `StopSettings` в `Start` — тогда ставятся его стопы, как командой `Stops`; терминал на 9fd0490 их
+  шлёт); `planned_sell` = `nearest(price·(1±TP))` — только если терминал
   не прислал свой `sell` (upstream 0.44.0 шлёт цель селла сам, стоп — никогда; инцидент 14.09:
   BTCUSDperpA — селл был, стопа нет, т.к. стоп ставился лишь при `planned_sell = 0`). Процентный стоп хранится (`stop_pct`) и
  пересчитывается от `mean_price` при любом ненулевом исполнении (фил может быть лучше лимита).

@@ -1831,12 +1831,29 @@ impl Orders {
             return fx;
         };
         let was = (o.stop_pct, o.stop_price, o.stop_spread);
+        // A percent is a distance from the entry, whatever its sign on the
+        // wire; a stop «on» at 0 % or at no price at all is no stop — at the
+        // entry it would fire on the first tick against it.
+        let on = on && level.is_finite() && if fixed { level > 0.0 } else { level != 0.0 };
+        let level = level.abs();
+        let spread = if spread.is_finite() {
+            spread.abs()
+        } else {
+            0.0
+        };
         o.stop_pct = if on && !fixed { level } else { 0.0 };
         o.stop_price = match (on, fixed) {
             (false, _) => 0.0,
             (true, true) => level,
             (true, false) => o.pct_stop(),
         };
+        // A percent that prices the stop at or below zero (a long's 100 % and
+        // more) is no stop either — once the entry is known; before it (a
+        // market or pending entry) the percent waits for the fill.
+        if on && !fixed && o.stop_price <= 0.0 && o.entry() > 0.0 {
+            o.stop_pct = 0.0;
+            o.stop_price = 0.0;
+        }
         o.stop_spread = if on { spread } else { 0.0 };
         // The terminal sends the whole stop group when any part changes.
         if (o.stop_pct, o.stop_price, o.stop_spread) == was {
@@ -3164,6 +3181,7 @@ mod tests {
             size,
             price,
             planned_sell: planned,
+            stops: None,
         }
     }
 
@@ -3190,6 +3208,25 @@ mod tests {
             Action::Post { key, .. } => key.clone(),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A stop «on» at 0 % would sit at the entry and fire on the first tick
+    /// against it; one at 100 % of a long prices below zero. Neither is a stop.
+    /// A real percent is a distance, whatever its sign on the wire.
+    #[test]
+    fn a_stop_with_no_real_distance_is_off() {
+        let model = sber_model();
+        let sber = model.get("u-sber").unwrap();
+        let mut orders = Orders::new();
+        let id = orders.start(0, &start(3000.0, 300.0, 0.0), sber, 1).changed[0];
+        orders.set_stops(id, true, false, 0.0, 0.0);
+        assert_eq!(orders.get(id).unwrap().record().stop, None);
+        orders.set_stops(id, true, false, 100.0, 0.0);
+        assert_eq!(orders.get(id).unwrap().record().stop, None);
+        orders.set_stops(id, true, false, f64::NAN, 0.0);
+        assert_eq!(orders.get(id).unwrap().record().stop, None);
+        orders.set_stops(id, true, false, -2.0, 0.5);
+        assert_eq!(orders.get(id).unwrap().record().stop, Some((294.0, 0.5)));
     }
 
     #[test]

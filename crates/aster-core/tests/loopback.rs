@@ -28,8 +28,11 @@ use aster_core::engine::{
 use aster_core::feed::{FeedCommand, FeedEvent};
 use aster_core::load::Load;
 use aster_core::model::Catalog;
+use aster_core::order_store::OrderStore;
+use aster_core::orders::Action;
 use aster_core::strategies::Strategies;
 use aster_core::stream_health::StreamHealth;
+use aster_core::trading::TradeCommand;
 use moonproto::server::codec::market_data::{delphi_days, Candle};
 use moonproto::server::key_export::ServerKey;
 use moonproto::server::Server;
@@ -382,15 +385,36 @@ struct FedCore {
 
 impl FedCore {
     fn start() -> Self {
+        Self::start_with(|h| h)
+    }
+
+    /// The core with an account: the order worker is the returned receiver,
+    /// and the order store a fresh file of its own.
+    fn trading() -> (Self, Receiver<TradeCommand>) {
+        let (tx, rx) = mpsc::channel();
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "astercore-loopback-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (store, saved) = OrderStore::open(dir.join("orders.json"));
+        let core = Self::start_with(move |h| h.with_trading(tx, store, saved));
+        (core, rx)
+    }
+
+    fn start_with(setup: impl FnOnce(CoreHandler) -> CoreHandler) -> Self {
         let mut key = ServerKey::generate(None, 0, TransportMode::V2);
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (ev_tx, ev_rx) = mpsc::channel();
-        let handler = CoreHandler::new(1, ACCOUNT_PLACEHOLDER.into(), catalog(), Strategies::new())
-            .with_feed(FeedLink {
-                tx: cmd_tx,
-                health: StreamHealth::default(),
-                load: Arc::new(Load::default()),
-            });
+        let handler = setup(
+            CoreHandler::new(1, ACCOUNT_PLACEHOLDER.into(), catalog(), Strategies::new())
+                .with_feed(FeedLink {
+                    tx: cmd_tx,
+                    health: StreamHealth::default(),
+                    load: Arc::new(Load::default()),
+                }),
+        );
         let mut server = Server::bind(&key, handler).expect("bind");
         key.port = server.local_addr().expect("local_addr").port();
         let stop = Arc::new(AtomicBool::new(false));
@@ -986,5 +1010,211 @@ fn a_start_without_an_account_comes_back_as_buy_fail_with_its_reason() {
         "BuyFail image: {failed}, log line: {reason:?} — a refused Start must reach the terminal"
     );
 
+    let _ = client.disconnect();
+}
+
+/// The next order call the core hands its worker.
+fn next_action(rx: &Receiver<TradeCommand>) -> Action {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left).expect("an order call") {
+            TradeCommand::Exchange { action, .. } => return action,
+            TradeCommand::OpenOrders => {}
+        }
+    }
+}
+
+/// A Start carrying its own stops (the `StopSettings` tail): the entry goes
+/// to the exchange, and the order the terminal is shown has those stops — the
+/// position is not opened unprotected.
+#[test]
+fn a_start_with_its_own_stops_keeps_them() {
+    let (core, orders) = FedCore::trading();
+    let client = core.connect();
+    let stops = moonproto::StopSettings::disabled()
+        .with_stop_loss_percent(2.5, 0.5)
+        .with_trailing_percent(1.2, 0.3);
+    client
+        .trade()
+        .new_order(
+            moonproto::NewOrderParams::new("BTCUSDT", moonproto::OrderSide::Long, 83_000.0, 100.0)
+                .with_stops(stops),
+        )
+        .expect("the order request itself is sent");
+    let action = next_action(&orders);
+    assert!(
+        matches!(&action, Action::Post { price: Some(p), lots: 1, sell: false, .. } if *p == 83_000.0),
+        "{action:?}"
+    );
+    let mut seen = None;
+    let shown = wait_until(Duration::from_secs(5), || {
+        for event in client.drain_events() {
+            if let Event::Order(
+                moonproto::state::OrderEvent::Created(o) | moonproto::state::OrderEvent::Updated(o),
+            ) = event
+            {
+                if o.stops.stop_loss_enabled() && o.stops.trailing_enabled() {
+                    seen = Some((o.stops.stop_loss_level(), o.stops.trailing_level()));
+                    return true;
+                }
+            }
+        }
+        false
+    });
+    assert!(shown, "no order image with the stops it was placed with");
+    // The stop-loss shows as its price, 2.5 % under the entry (83000 →
+    // 80925); the trailing as the percent it trails by.
+    assert_eq!(seen, Some((80_925.0, 1.2)));
+    let _ = client.disconnect();
+}
+
+/// The terminal's emulator mode on a core without an emulator: the entry is
+/// refused with its reason and nothing reaches the exchange — a paper trade
+/// must never become a real one.
+#[test]
+fn an_entry_in_emulator_mode_is_refused_not_sent() {
+    let (core, orders) = FedCore::trading();
+    let client = core.connect();
+    let mut settings = moonproto::ClientSettingsCommand::default();
+    settings.emu_mode = true;
+    send_settings(&client, settings);
+    client
+        .trade()
+        .new_order(moonproto::NewOrderParams::new(
+            "BTCUSDT",
+            moonproto::OrderSide::Long,
+            80_000.0,
+            100.0,
+        ))
+        .expect("the order request itself is sent");
+    let (mut reason, mut failed) = (None, false);
+    let answered = wait_until(Duration::from_secs(5), || {
+        for event in client.drain_events() {
+            match event {
+                Event::ServerLog(log) if log.msg.contains("emulator mode is on") => {
+                    reason = Some(log.msg.clone());
+                }
+                Event::Order(
+                    moonproto::state::OrderEvent::Created(o)
+                    | moonproto::state::OrderEvent::Updated(o),
+                ) if o.status == moonproto::OrderWorkerStatus::BuyFail => failed = true,
+                _ => {}
+            }
+        }
+        reason.is_some() && failed
+    });
+    assert!(answered, "refusal line {reason:?}, BuyFail {failed}");
+    let call = std::iter::from_fn(|| orders.try_recv().ok())
+        .find(|c| matches!(c, TradeCommand::Exchange { .. }));
+    assert!(call.is_none(), "an emulated entry reached the order worker");
+    let _ = client.disconnect();
+}
+
+/// Send the terminal's settings and wait until the core has answered them,
+/// so whatever the test sends next is read after them.
+fn send_settings(client: &MoonClient, settings: moonproto::ClientSettingsCommand) {
+    let _ = client.drain_events();
+    client.settings().send(settings).expect("settings sent");
+    let echoed = wait_until(Duration::from_secs(5), || {
+        client.drain_events().into_iter().any(|e| {
+            matches!(
+                e,
+                Event::Settings(moonproto::state::SettingsEvent::ClientSettingsUpdated)
+            )
+        })
+    });
+    assert!(echoed, "the core did not answer the settings");
+}
+
+/// A manual order without its own stops takes the toolbar's: the take
+/// profit as its planned exit (+2 % of 83000 = 84660) and the stop, 1.5 %
+/// under the entry (81755).
+#[test]
+fn a_manual_order_takes_the_toolbars_take_profit_and_stop() {
+    let (core, orders) = FedCore::trading();
+    let client = core.connect();
+    let mut settings = moonproto::ClientSettingsCommand::default();
+    settings.x_sell = 2;
+    settings.panic_if_price_drop = true;
+    settings.price_drop_level = -1.5;
+    send_settings(&client, settings);
+    client
+        .trade()
+        .new_order(moonproto::NewOrderParams::new(
+            "BTCUSDT",
+            moonproto::OrderSide::Long,
+            83_000.0,
+            100.0,
+        ))
+        .expect("the order request itself is sent");
+    assert!(matches!(next_action(&orders), Action::Post { .. }));
+    let mut seen = None;
+    let shown = wait_until(Duration::from_secs(5), || {
+        for event in client.drain_events() {
+            if let Event::Order(
+                moonproto::state::OrderEvent::Created(o) | moonproto::state::OrderEvent::Updated(o),
+            ) = event
+            {
+                if o.stops.stop_loss_enabled() {
+                    seen = Some((o.planned_sell_price, o.stops.stop_loss_level()));
+                    return true;
+                }
+            }
+        }
+        false
+    });
+    assert!(shown, "no order image with the toolbar's stop");
+    assert_eq!(seen, Some((84_660.0, 81_755.0)));
+    let _ = client.disconnect();
+}
+
+/// A pending order's own stops are set when it is armed, not when it
+/// triggers: nothing reaches the exchange yet, and the image has them — the
+/// 3 % stop priced from the trigger (85000 → 82450).
+#[test]
+fn a_pending_order_keeps_its_own_stops_while_it_waits() {
+    let (core, orders) = FedCore::trading();
+    let client = core.connect();
+    // A pending order needs the market's price to tell its trigger's side.
+    core.ev_tx
+        .send(FeedEvent::Trade {
+            symbol: "BTCUSDT".into(),
+            price: 83_700.0,
+            qty: 0.01,
+            time_ms: now_ms(),
+        })
+        .unwrap();
+    let stops = moonproto::StopSettings::disabled().with_stop_loss_percent(3.0, 0.0);
+    client
+        .trade()
+        .new_pending_order(
+            moonproto::PendingOrderParams::new(
+                "BTCUSDT",
+                moonproto::OrderSide::Long,
+                85_000.0,
+                100.0,
+            )
+            .with_stops(stops),
+        )
+        .expect("the order request itself is sent");
+    let shown = wait_until(Duration::from_secs(5), || {
+        client.drain_events().into_iter().any(|e| {
+            matches!(
+                e,
+                Event::Order(
+                    moonproto::state::OrderEvent::Created(o)
+                    | moonproto::state::OrderEvent::Updated(o)
+                ) if o.stops.stop_loss_enabled() && o.stops.stop_loss_level() == 82_450.0
+            )
+        })
+    });
+    assert!(shown, "no image of the pending order with its stop");
+    let call = std::iter::from_fn(|| orders.try_recv().ok())
+        .find(|c| matches!(c, TradeCommand::Exchange { .. }));
+    assert!(
+        call.is_none(),
+        "a pending order reached the exchange before its trigger"
+    );
     let _ = client.disconnect();
 }

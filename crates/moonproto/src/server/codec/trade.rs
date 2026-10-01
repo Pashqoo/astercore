@@ -76,7 +76,30 @@ pub struct StartOrder {
     pub size: f64,
     pub price: f64,
     pub planned_sell: f64,
+    /// The order's own initial stops, when the terminal sent them (the
+    /// 46-byte `StopSettings` tail, since upstream 9fd0490). `None` leaves the
+    /// core's defaults; a record with everything off disables them.
+    pub stops: Option<InitialStops>,
 }
+
+/// An order's initial stops, as the `Stops` command (3) carries them: the
+/// same fields, the same meanings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InitialStops {
+    pub sl_on: bool,
+    pub sl_fixed: bool,
+    pub sl_level: f64,
+    pub sl_spread: f64,
+    pub trail_on: bool,
+    pub trail_fixed: bool,
+    pub trail_level: f64,
+    pub trail_spread: f64,
+    pub tp_on: bool,
+    pub tp: f64,
+}
+
+/// Bytes of the `StopSettings` record on the wire.
+const STOP_SETTINGS_SIZE: usize = 46;
 
 /// `TOrderCommand` bodies the core acts on; everything else is `Other`.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,16 +128,7 @@ pub enum OrderCommand {
     /// when `trail_fixed`); `tp` is a price.
     Stops {
         order_id: u64,
-        sl_on: bool,
-        sl_fixed: bool,
-        sl_level: f64,
-        sl_spread: f64,
-        trail_on: bool,
-        trail_fixed: bool,
-        trail_level: f64,
-        trail_spread: f64,
-        tp_on: bool,
-        tp: f64,
+        stops: InitialStops,
     },
     /// Panic sell on/off for one order.
     Panic {
@@ -169,16 +183,7 @@ impl OrderCommand {
             },
             3 => Self::Stops {
                 order_id: r.u64(),
-                sl_on: r.u8() != 0,
-                sl_fixed: r.u8() != 0,
-                sl_level: r.f64(),
-                sl_spread: r.f64(),
-                trail_on: r.u8() != 0,
-                trail_fixed: r.u8() != 0,
-                trail_level: r.f64(),
-                trail_spread: r.f64(),
-                tp_on: r.u8() != 0,
-                tp: r.f64(),
+                stops: r.stops(),
             },
             5 => Self::Panic {
                 order_id: r.u64(),
@@ -198,6 +203,11 @@ impl OrderCommand {
                     size: r.f64(),
                     price: r.f64(),
                     planned_sell: r.f64(),
+                    stops: None,
+                };
+                let start = StartOrder {
+                    stops: (r.0.len() >= STOP_SETTINGS_SIZE).then(|| r.stops()),
+                    ..start
                 };
                 if opcode == 10 {
                     Self::Start(start)
@@ -268,6 +278,24 @@ impl Reader<'_> {
 
     fn f64(&mut self) -> f64 {
         f64::from_le_bytes(self.take())
+    }
+
+    /// A `StopSettings` record, the `Stops` command's and a start's tail
+    /// alike. Its last byte, the terminal's «take profit set by hand» latch,
+    /// is not read: the core does not use it.
+    fn stops(&mut self) -> InitialStops {
+        InitialStops {
+            sl_on: self.u8() != 0,
+            sl_fixed: self.u8() != 0,
+            sl_level: self.f64(),
+            sl_spread: self.f64(),
+            trail_on: self.u8() != 0,
+            trail_fixed: self.u8() != 0,
+            trail_level: self.f64(),
+            trail_spread: self.f64(),
+            tp_on: self.u8() != 0,
+            tp: self.f64(),
+        }
     }
 
     fn short_string(&mut self) -> String {
@@ -531,6 +559,7 @@ mod tests {
                 size: 3000.0,
                 price: 310.5,
                 planned_sell: 320.0,
+                stops: None,
             })
         );
         let (_, cmd) = parse_cmd(OrderCommandPayload::StartPending {
@@ -545,8 +574,11 @@ mod tests {
         });
         assert!(matches!(cmd, OrderCommand::StartPending(s) if s.price == 300.0 && !s.is_short));
         // Since upstream 9fd0490 a start may carry its own initial stops as a
-        // 46-byte tail. Not read here yet (orders are M2), but it must not
-        // break the parse of what precedes it.
+        // 46-byte tail, written here by the upstream client's own writer.
+        let stops = crate::commands::trade::StopSettings::disabled()
+            .with_stop_loss_percent(2.5, 0.5)
+            .with_trailing_percent(1.2, 0.3)
+            .with_take_profit_price(310.0);
         let (_, cmd) = parse_cmd(OrderCommandPayload::Start {
             market_name: "SBER".into(),
             is_short: false,
@@ -555,9 +587,50 @@ mod tests {
             size: 1.0,
             price: 300.0,
             planned_sell_price: 0.0,
+            stops: Some(stops),
+        });
+        let OrderCommand::Start(s) = cmd else {
+            panic!("{cmd:?}");
+        };
+        assert_eq!((s.price, s.size), (300.0, 1.0));
+        assert_eq!(
+            s.stops,
+            Some(InitialStops {
+                sl_on: true,
+                sl_fixed: false,
+                sl_level: 2.5,
+                sl_spread: 0.5,
+                trail_on: true,
+                trail_fixed: false,
+                trail_level: 1.2,
+                trail_spread: 0.3,
+                tp_on: true,
+                tp: 310.0,
+            })
+        );
+        // Explicitly disabled is a record, not an absence.
+        let (_, cmd) = parse_cmd(OrderCommandPayload::StartPending {
+            market_name: "SBER".into(),
+            is_short: false,
+            use_market_stop: false,
+            strategy_id: 0,
+            size: 1.0,
+            trigger_price: 300.0,
+            planned_sell_price: 0.0,
             stops: Some(crate::commands::trade::StopSettings::disabled()),
         });
-        assert!(matches!(cmd, OrderCommand::Start(s) if s.price == 300.0 && s.size == 1.0));
+        assert!(matches!(
+            cmd,
+            OrderCommand::StartPending(StartOrder {
+                stops: Some(InitialStops {
+                    sl_on: false,
+                    trail_on: false,
+                    tp_on: false,
+                    ..
+                }),
+                ..
+            })
+        ));
         let (_, cmd) = parse_cmd(OrderCommandPayload::TargetBuy {
             order_id: 7,
             price: 1.5,
@@ -626,16 +699,18 @@ mod tests {
                 },
                 OrderCommand::Stops {
                     order_id: 5,
-                    sl_on: true,
-                    sl_fixed: false,
-                    sl_level: 1.5,
-                    sl_spread: 0.4,
-                    trail_on: false,
-                    trail_fixed: false,
-                    trail_level: 0.0,
-                    trail_spread: 0.0,
-                    tp_on: true,
-                    tp: 330.0,
+                    stops: InitialStops {
+                        sl_on: true,
+                        sl_fixed: false,
+                        sl_level: 1.5,
+                        sl_spread: 0.4,
+                        trail_on: false,
+                        trail_fixed: false,
+                        trail_level: 0.0,
+                        trail_spread: 0.0,
+                        tp_on: true,
+                        tp: 330.0,
+                    },
                 },
             ),
             (
@@ -645,16 +720,18 @@ mod tests {
                 },
                 OrderCommand::Stops {
                     order_id: 6,
-                    sl_on: false,
-                    sl_fixed: false,
-                    sl_level: 0.0,
-                    sl_spread: 0.0,
-                    trail_on: true,
-                    trail_fixed: false,
-                    trail_level: 1.0,
-                    trail_spread: 0.5,
-                    tp_on: false,
-                    tp: 0.0,
+                    stops: InitialStops {
+                        sl_on: false,
+                        sl_fixed: false,
+                        sl_level: 0.0,
+                        sl_spread: 0.0,
+                        trail_on: true,
+                        trail_fixed: false,
+                        trail_level: 1.0,
+                        trail_spread: 0.5,
+                        tp_on: false,
+                        tp: 0.0,
+                    },
                 },
             ),
             (
@@ -735,6 +812,7 @@ mod tests {
                 size: 0.0,
                 price: 0.0,
                 planned_sell: 0.0,
+                stops: None,
             }),
             "zero-tail reads like Delphi"
         );

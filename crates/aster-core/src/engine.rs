@@ -7,13 +7,13 @@
 //! snapshot request, a settings request, its strategy list and a balance
 //! refresh whose replies are *not* part of the barrier. So this file answers
 //! the first group with real data, the balance with the account when the core
-//! has a key (`account.rs`), and the rest with the honest empty answer of a
-//! core that does not trade yet (M2).
+//! has a key (`account.rs`), and its orders (`orders.rs`, M2).
 //!
 //! Adapted from TInvestCore's `engine.rs`, which is the same spine over 6000
 //! lines of trading on top. Market data (M1) is here: the tape, the books and
-//! the candles the terminal subscribes to, fed from `feed.rs`. What is NOT here
-//! is deliberate, not forgotten: orders (M2), strategies (M3). Every Engine API
+//! the candles the terminal subscribes to, fed from `feed.rs`; so is manual
+//! trading (M2). What is NOT here is deliberate, not forgotten: strategies and
+//! the emulator (M3), reports (M4). Every Engine API
 //! method outside what is implemented answers with a refusal naming itself,
 //! which is how the terminal shows a missing feature instead of waiting out a
 //! timeout.
@@ -26,7 +26,7 @@ use std::time::Instant;
 use moonproto::server::codec::engine::{self, EngineMethod, EngineRequest, ServerInfo};
 use moonproto::server::codec::log::log_msg;
 use moonproto::server::codec::market_data::{self, DeepHistoryKind, BOOK_KIND_FUTURES};
-use moonproto::server::codec::trade::{OrderCommand, StartOrder};
+use moonproto::server::codec::trade::{InitialStops, OrderCommand, StartOrder};
 use moonproto::server::codec::{balance, strat, trade, ui, BaseHeader, BASE_HEADER_SIZE};
 use moonproto::server::{Command, Handler, Session};
 
@@ -189,6 +189,8 @@ pub struct CoreHandler {
     watch_at: i64,
     /// When to read the account's open orders (`TradeCommand::OpenOrders`).
     open_orders_due: Option<i64>,
+    /// The toolbar's defaults for manual orders, from `TClientSettings`.
+    manual: ui::ManualDefaults,
 }
 
 impl CoreHandler {
@@ -229,6 +231,7 @@ impl CoreHandler {
             outbox: Vec::new(),
             watch_at: 0,
             open_orders_due: None,
+            manual: ui::ManualDefaults::default(),
         }
     }
 
@@ -259,6 +262,7 @@ impl CoreHandler {
         }
         if !saved.client_settings.is_empty() {
             self.client_settings = saved.client_settings;
+            self.read_manual_defaults();
         }
         // What the exchange holds now: the restored orders are read against
         // it before any terminal acts on them.
@@ -983,6 +987,7 @@ impl CoreHandler {
         match hdr.cmd_id {
             ui::CMD_CLIENT_SETTINGS => {
                 self.client_settings = payload.to_vec();
+                self.read_manual_defaults();
                 session.send_encrypted(UI, &ui::with_uid(payload, rand_uid()), true);
             }
             ui::CMD_SETTINGS_REQUEST => {
@@ -1112,8 +1117,7 @@ impl CoreHandler {
 
     /// `TOrderCommand` from the terminal; results go out through `effects`.
     /// Ported from TInvestCore without what this core does not have yet: the
-    /// manual strategy and the toolbar's stop and take profit (M3), MoveAll,
-    /// the emulator.
+    /// manual strategy and the emulator (M3), MoveAll.
     fn on_order_command(&mut self, req_uid: u64, body: &[u8]) {
         let now = now_ms();
         let fx = match OrderCommand::parse(body) {
@@ -1135,33 +1139,7 @@ impl CoreHandler {
             }
             OrderCommand::CancelBuy { order_id } => self.orders.cancel_buy(order_id, now),
             OrderCommand::CancelSell { order_id } => self.orders.cancel(order_id, Leg::Sell),
-            OrderCommand::Stops {
-                order_id,
-                sl_on,
-                sl_fixed,
-                sl_level,
-                sl_spread,
-                trail_on,
-                trail_fixed,
-                trail_level,
-                trail_spread,
-                tp_on,
-                tp,
-            } => {
-                let mut fx = self
-                    .orders
-                    .set_stops(order_id, sl_on, sl_fixed, sl_level, sl_spread);
-                fx.extend(self.orders.set_trailing(
-                    order_id,
-                    trail_on,
-                    trail_fixed,
-                    trail_level,
-                    trail_spread,
-                    tp_on,
-                    tp,
-                ));
-                fx
-            }
+            OrderCommand::Stops { order_id, stops } => self.apply_stops(order_id, &stops),
             OrderCommand::Panic { order_id, enabled } => {
                 let uid = self.orders.get(order_id).map(|o| o.uid.clone());
                 match uid.as_deref().and_then(|u| self.catalog.get(u)) {
@@ -1233,10 +1211,121 @@ impl CoreHandler {
             );
             return self.orders.fail_start(req_uid, s, &reason, now);
         }
-        if pending {
-            self.orders.start_pending(req_uid, s, m, now)
+        let manual = self.manual;
+        let is_manual = s.strategy_id == 0;
+        // No emulator in this core yet (M3): an order the trader means as a
+        // paper one — any order while the terminal's emulator mode is on —
+        // must not reach the exchange as a real one.
+        if manual.emulator {
+            let reason = format!(
+                "{}: emulator mode is on, and this core has no emulator yet: nothing is placed",
+                s.market
+            );
+            return self.orders.fail_start(req_uid, s, &reason, now);
+        }
+        let mut s = s.clone();
+        let mut notes = Vec::new();
+        // The toolbar's take profit, when the order names no exit — MoonBot
+        // applies its `cfg` to a manual order (TInvestCore, as is). It is the
+        // planned sell, which the order's own stops do not speak of, so it
+        // applies whether or not they came with it.
+        let entry = if s.price > 0.0 { s.price } else { m.last() };
+        let k = if s.is_short { -1.0 } else { 1.0 };
+        let at = |pct: f64| m.nearest(entry * (1.0 + k * pct / 100.0));
+        if is_manual && s.planned_sell <= 0.0 && manual.take_profit_pct > 0.0 {
+            match (entry > 0.0).then(|| at(manual.take_profit_pct)) {
+                Some(tp) if tp > 0.0 => s.planned_sell = tp,
+                _ => notes.push(format!(
+                    "{}: no price for the toolbar's take profit {}%: the order has none",
+                    s.market, manual.take_profit_pct
+                )),
+            }
+        }
+        let mut fx = if pending {
+            self.orders.start_pending(req_uid, &s, m, now)
         } else {
-            self.orders.start(req_uid, s, m, now)
+            self.orders.start(req_uid, &s, m, now)
+        };
+        fx.logs.extend(notes);
+        let id = fx.changed.first().copied().unwrap_or(0);
+        if is_manual && manual.manual_strategy.is_some() {
+            fx.logs.push(format!(
+                "{}: «use the manual strategy» is not supported yet (M3): \
+                 the order takes the toolbar's settings",
+                s.market
+            ));
+        }
+        // A pending order counts as placed: its stops are set now and wait
+        // with it, so the entry is protected the moment it goes out.
+        let placed = self
+            .orders
+            .get(id)
+            .is_some_and(|o| o.status == trade::status::BUY_SET || o.is_pending());
+        if !placed {
+            return fx;
+        }
+        // The order's own stops, as the `Stops` command sets them; without
+        // them, the toolbar's for a manual order.
+        if let Some(st) = s.stops {
+            fx.extend(self.apply_stops(id, &st));
+            return fx;
+        }
+        if !is_manual {
+            return fx;
+        }
+        if manual.stop_pct > 0.0 {
+            fx.extend(self.orders.set_stops(id, true, false, manual.stop_pct, 0.0));
+        }
+        // The toolbar's trailing stop, from its take profit when it has one.
+        if manual.trailing_pct > 0.0 {
+            let from = (manual.trailing_from_pct > 0.0 && entry > 0.0)
+                .then(|| at(manual.trailing_from_pct))
+                .filter(|p| *p > 0.0);
+            fx.extend(self.orders.set_trailing(
+                id,
+                true,
+                false,
+                manual.trailing_pct,
+                0.0,
+                from.is_some(),
+                from.unwrap_or(0.0),
+            ));
+        }
+        fx
+    }
+
+    /// An order's stops as the `Stops` command carries them.
+    fn apply_stops(&mut self, id: u64, st: &InitialStops) -> Effects {
+        let mut fx = self
+            .orders
+            .set_stops(id, st.sl_on, st.sl_fixed, st.sl_level, st.sl_spread);
+        fx.extend(self.orders.set_trailing(
+            id,
+            st.trail_on,
+            st.trail_fixed,
+            st.trail_level,
+            st.trail_spread,
+            st.tp_on,
+            st.tp,
+        ));
+        fx
+    }
+
+    /// The manual-order defaults of the terminal's last `TClientSettings`:
+    /// the toolbar's stop, take profit, trailing, and the emulator mode.
+    fn read_manual_defaults(&mut self) {
+        match ui::manual_defaults(&self.client_settings) {
+            Some(m) => {
+                if m.emulator != self.manual.emulator {
+                    log::info!("emulator mode {}", if m.emulator { "on" } else { "off" });
+                }
+                self.manual = m;
+            }
+            None => log::warn!(
+                "client settings: unreadable, the previous manual defaults stay \
+                 (emulator mode {})",
+                if self.manual.emulator { "on" } else { "off" }
+            ),
         }
     }
 
