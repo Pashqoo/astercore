@@ -94,7 +94,8 @@ pub enum ControlCmd {
     /// applied at once. `Err` — nothing was changed and why.
     Leverage {
         edit: LevEdit,
-        reply: Reply<Result<(), String>>,
+        /// `true` when the settings switch something on (a pass has work to do).
+        reply: Reply<Result<bool, String>>,
     },
     /// The page's strategy helper: screen the whole catalog with one
     /// strategy's settings, `fields` moved as the operator moved them. Read

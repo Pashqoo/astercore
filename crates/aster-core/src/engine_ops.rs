@@ -733,7 +733,7 @@ impl CoreHandler {
     /// The page's leverage settings: the same as a terminal's Apply — kept, acted on at once and
     /// shown to the terminals that are connected. Refused without an account, where nothing
     /// could be acted on, and for a Config line no terminal could have typed.
-    fn leverage_edited(&mut self, e: &control::LevEdit) -> Result<(), String> {
+    fn leverage_edited(&mut self, e: &control::LevEdit) -> Result<bool, String> {
         if self.levman.is_none() {
             return Err("no account: this core only emulates, leverage is not managed".into());
         }
@@ -750,10 +750,10 @@ impl CoreHandler {
             limits: levman::Limits::parse(&e.lev_control),
         };
         let payload = config.to_wire(rand_uid());
-        self.lev_manage_set(&payload)?;
+        let held = self.lev_manage_set(&payload)?;
         // The terminals' own window shows what the core now holds.
         self.outbox.push((UI, payload));
-        Ok(())
+        Ok(held.is_active())
     }
 
     /// One edit from the page: merge it, apply what applies at once, save.
@@ -1270,8 +1270,8 @@ impl CoreHandler {
             last: self
                 .lev_status
                 .lock()
-                .map(|l| l.clone())
-                .unwrap_or_default(),
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         }
     }
 }

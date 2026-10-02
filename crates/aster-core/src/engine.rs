@@ -1444,7 +1444,12 @@ impl CoreHandler {
             // settings, and acted on at once by the leverage worker.
             ui::CMD_LEV_MANAGE => match self.lev_manage_set(payload) {
                 Ok(_) => session.send_encrypted(UI, &ui::with_uid(payload, rand_uid()), true),
-                Err(e) => log::warn!("leverage: {e}"),
+                // Refused: the terminal's window keeps what it typed, so it is told in its log.
+                Err(e) => {
+                    log::warn!("leverage: {e}");
+                    let text = format!("leverage settings not applied: {e}");
+                    session.send_encrypted(LOG, &log_msg(now_ms(), &text), true);
+                }
             },
             // MoonBot's guarded shutdown: refused while the core holds a
             // position — its exit, or the want of one, needs a core to watch
@@ -1660,10 +1665,7 @@ impl CoreHandler {
             config.auto_isolated,
             config.auto_cross,
         );
-        self.lev_manage = payload.to_vec();
-        if let Some(file) = &self.lev_file {
-            levman::save(file, payload);
-        }
+        // The worker first: settings it never got are not settings the core holds.
         match &self.levman {
             Some(tx) => {
                 if tx.send(levman::Msg::Config(config.clone())).is_err() {
@@ -1672,6 +1674,10 @@ impl CoreHandler {
                 }
             }
             None => log::warn!("leverage: no account, the settings are kept but not applied"),
+        }
+        self.lev_manage = payload.to_vec();
+        if let Some(file) = &self.lev_file {
+            levman::save(file, payload);
         }
         Ok(config)
     }

@@ -618,6 +618,7 @@ function renderTrading(s) {
    poll in flight must not take the field from under somebody typing. */
 let levTouched = false;
 let levBusy = false;
+let levEdits = 0;
 function renderLeverage(s) {
   const v = s.leverage;
   if (!levTouched && v.config) {
@@ -653,31 +654,31 @@ function renderLeverage(s) {
 }
 
 for (const id of ['lev_control', 'lev_fix', 'lev_max', 'lev_up', 'lev_fix_on', 'lev_iso', 'lev_cross']) {
-  $(id).addEventListener('input', () => { levTouched = true; });
+  $(id).addEventListener('input', () => { levTouched = true; levEdits++; });
 }
 $('lev_apply').addEventListener('click', async () => {
   const fix = Number($('lev_fix').value.trim() || 0);
   if (!Number.isInteger(fix) || fix < 0 || fix > 1000) { say($('lev_msg'), 'the fixed leverage is a whole number from 0 to 1000', 'err'); return; }
   if (!confirm('Apply now? The core will change leverage and margin on the exchange for every market without a position or order.')) return;
   levBusy = true;
+  const seen = levEdits;
   $('lev_apply').disabled = true;
   try {
-    await call('/api/leverage', {
+    const answer = await call('/api/leverage', {
       auto_max_order: $('lev_max').checked, auto_lev_up: $('lev_up').checked,
       auto_isolated: $('lev_iso').checked, auto_cross: $('lev_cross').checked,
       auto_fix_lev: $('lev_fix_on').checked, fix_lev: fix, lev_control: $('lev_control').value,
     });
-    const acts = $('lev_max').checked || ($('lev_fix_on').checked && fix > 0)
-      || $('lev_iso').checked || $('lev_cross').checked;
+    const acts = answer.active;
     say($('lev_msg'), acts ? 'applied — the pass is running'
-      : 'saved — nothing is switched on, so nothing is sent', acts ? 'ok' : 'warn');
+      : 'saved — nothing is switched on (no positive limit, fixed leverage or margin box), so nothing is sent', acts ? 'ok' : 'warn');
     await poll();
-    levTouched = false;
+    if (levEdits === seen) levTouched = false;
   } catch (e) {
     say($('lev_msg'), String(e.message || e), 'err');
   } finally {
     levBusy = false;
-    $('lev_apply').disabled = false;
+    $('lev_apply').disabled = !(lastStatus && lastStatus.leverage.applies);
   }
 });
 

@@ -624,7 +624,9 @@ fn route(web: &Web, req: &Request) -> Response {
                 |reply| ControlCmd::Leverage { edit, reply },
                 ASK_WAIT,
             ) {
-                Ok(Ok(())) => Response::json(200, &json!({ "applied": true })),
+                Ok(Ok(active)) => {
+                    Response::json(200, &json!({ "applied": true, "active": active }))
+                }
                 Ok(Err(e)) => Response::json(400, &json!({ "error": e })),
                 Err(e) => busy(&e),
             },
@@ -1259,7 +1261,7 @@ mod tests {
                 ControlCmd::Leverage { edit, reply } => {
                     assert!(edit.auto_max_order && edit.auto_lev_up && !edit.auto_isolated);
                     assert_eq!(edit.lev_control, "200 def");
-                    reply.send(Ok(())).unwrap();
+                    reply.send(Ok(true)).unwrap();
                 }
                 other => panic!("not Leverage: {}", name_of(&other)),
             }
