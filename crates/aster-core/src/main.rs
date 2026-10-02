@@ -443,9 +443,10 @@ fn main() -> ExitCode {
     let (store, saved) = OrderStore::open(PathBuf::from(orders_file));
     let mut handler = handler.with_orders(store, saved);
     if let Some((account_rest, signer, first)) = account {
-        // The order worker signs with a clone of the account's signer: one
-        // wallet, one nonce sequence (`Signer`). Its own client, on the same
-        // network, measured against the same gateway.
+        // The order workers sign with clones of the account's signer: one
+        // wallet, one nonce sequence (`Signer`). `orders_rest` is the first
+        // worker's client — on the same network, measured against the same
+        // gateway; `trading::start` builds the others the same way.
         let mut orders_rest = Rest::on(signer.network());
         orders_rest.set_clock_delta_ms(account_rest.clock_delta_ms());
         let trading = trading::start(orders_rest, signer.clone(), grids, ev_tx.clone());
@@ -628,11 +629,12 @@ fn flush_sessions(server: &mut Server<CoreHandler>, rx: &mpsc::Receiver<feed::Fe
 
 /// How long the stop waits for the exchange to confirm the withdrawals.
 ///
-/// The worker paces its calls 100 ms apart and a cancel answers in about
-/// 0.3 s (measured 01.10: `/fapi/v1/time` 0.30 s; the cancels of the live test
-/// of 01.10 came back within a second), so some 2.5 a second: 30 s withdraws
-/// about 75 entries, more than this core has had at once. A stop that runs out
-/// of it still ends, and names what it left.
+/// A cancel answers in about 0.3–0.45 s (measured 01.10 and 02.10) and takes no place in the
+/// order budget. The calls of one market go one after another on its worker, the markets side by
+/// side on twelve (`trading::start`): 65 entries over some forty markets were withdrawn in about
+/// 30 s by the single worker of 02.10 and now take a few seconds, but a market with many entries
+/// still goes one at a time, so the budget stays: 30 s withdraws some 75 entries on one market.
+/// A stop that runs out of it still ends, and names what it left.
 const STOP_WITHDRAW: Duration = Duration::from_secs(30);
 /// How often the drain asks again about entries still live.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);

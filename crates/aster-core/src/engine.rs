@@ -298,9 +298,6 @@ pub struct CoreHandler {
     stopping: bool,
     /// The terminal asked the core to leave and it agreed (`TShutdownCommand`).
     shutdown_requested: bool,
-    /// The order worker itself is the thread that died: nothing can be
-    /// withdrawn through it.
-    worker_lost: bool,
     /// Markets the exchange takes no new positions on (`-4140`/`-4141` on an
     /// entry), for this run: an entry there is refused by the core.
     closed_markets: HashMap<String, i64>,
@@ -408,7 +405,6 @@ impl CoreHandler {
             manual: ui::ManualDefaults::default(),
             stopping: false,
             shutdown_requested: false,
-            worker_lost: false,
             closed_markets: HashMap::new(),
             shots: MoonShot::default(),
             windows: Windows::default(),
@@ -929,7 +925,6 @@ impl CoreHandler {
             FeedEvent::Lost(what) => {
                 log::error!("feed: {what} is gone");
                 self.feed_lost = true;
-                self.worker_lost |= what == crate::trading::WORKER;
             }
             FeedEvent::Trading(ev) => self.on_trading(ev),
             FeedEvent::UserOrder(o) => {
@@ -2041,9 +2036,11 @@ impl CoreHandler {
             .count()
     }
 
-    /// There is an order worker to send the withdrawals to.
+    /// There is an order router to send the withdrawals to. One worker lost is no reason not to
+    /// withdraw through the rest: the entries on its market come back `Failed` and are named as
+    /// left (`trading::start`).
     pub fn can_withdraw(&self) -> bool {
-        self.trading.is_some() && !self.worker_lost
+        self.trading.is_some()
     }
 
     /// Nothing waits in the outbox for the sessions.
