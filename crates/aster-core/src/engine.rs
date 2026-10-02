@@ -1698,6 +1698,31 @@ impl CoreHandler {
     /// price crosses its trigger). A manual entry on a market whose trade
     /// stream is down is refused: its price is not the market's.
     fn start_order(&mut self, req_uid: u64, s: &StartOrder, pending: bool, now: i64) -> Effects {
+        // A hand order as it arrived from the terminal (strategies log their own entries): the
+        // direction is the terminal's bit, copied verbatim into the order — when one goes the
+        // wrong way, this line says which way it was asked to go. Logged before the refusals,
+        // which then follow with their own reason.
+        if s.strategy_id == 0 {
+            log::info!(
+                "order request: {} {} {} {} size {} USDT{}",
+                s.market,
+                if s.is_short { "SHORT" } else { "LONG" },
+                if pending {
+                    "pending, trigger"
+                } else if s.price > 0.0 {
+                    "limit"
+                } else {
+                    "market"
+                },
+                s.price,
+                s.size,
+                if s.planned_sell > 0.0 {
+                    format!(", exit {}", s.planned_sell)
+                } else {
+                    String::new()
+                }
+            );
+        }
         if self.stopping {
             // The sweep has been through: an entry placed now would outlive
             // the process that placed it.
