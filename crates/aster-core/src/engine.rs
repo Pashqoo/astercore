@@ -108,6 +108,46 @@ const TELEGRAM_UNSUPPORTED: &str = r#"{"enabled":false,"service_online":false,"s
 const PUMP_BATCH: usize = 256;
 /// How often stream liveness is judged.
 const HEALTH_EVERY_MS: i64 = 1_000;
+/// How often the strategy pass reports what it costs.
+const SHOTS_REPORT_MS: i64 = 300_000;
+
+/// What the strategy pass costs, reported once per [`SHOTS_REPORT_MS`]: the number that decides
+/// how often it may run (MoonBot checks a MoonShot corridor every 16 ms).
+#[derive(Default)]
+struct ShotsCost {
+    passes: u32,
+    total: std::time::Duration,
+    max: std::time::Duration,
+    since: i64,
+}
+
+impl ShotsCost {
+    /// Adds one pass; the report line when the interval is up, and the count starts over.
+    fn record(&mut self, took: std::time::Duration, now: i64) -> Option<String> {
+        if self.since == 0 {
+            self.since = now;
+        }
+        self.passes += 1;
+        self.total += took;
+        self.max = self.max.max(took);
+        if now - self.since < SHOTS_REPORT_MS {
+            return None;
+        }
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        let line = format!(
+            "shots: {} passes in {} s, avg {:.2} ms, max {:.2} ms",
+            self.passes,
+            (now - self.since) / 1000,
+            ms(self.total) / f64::from(self.passes),
+            ms(self.max)
+        );
+        *self = Self {
+            since: now,
+            ..Self::default()
+        };
+        Some(line)
+    }
+}
 /// The strategy pass runs this often, and at once after an order report or a
 /// trade that extends a strike (TInvestCore's period).
 const SHOTS_PERIOD_MS: i64 = 1_000;
@@ -243,6 +283,7 @@ pub struct CoreHandler {
     windows: Windows,
     shots_at: i64,
     shots_due: bool,
+    shots_cost: ShotsCost,
     /// The markets' mean hourly delta and when it was taken.
     market_delta: (Option<f64>, i64),
     /// When the core started: warm-up bars that end before it seed the
@@ -343,6 +384,7 @@ impl CoreHandler {
             shots: MoonShot::default(),
             windows: Windows::default(),
             shots_at: 0,
+            shots_cost: ShotsCost::default(),
             shots_due: false,
             market_delta: (None, 0),
             started_at: now_ms(),
@@ -642,7 +684,11 @@ impl CoreHandler {
         // Not while stopping: an entry placed now would be one more to
         // withdraw. `start_order` is the terminal's door, shut by the same flag.
         if !self.stopping && (self.shots_due || now - self.shots_at >= SHOTS_PERIOD_MS) {
+            let began = Instant::now();
             self.run_shots(now);
+            if let Some(line) = self.shots_cost.record(began.elapsed(), now) {
+                log::info!("{line}");
+            }
         }
         if self.open_orders_due.is_some_and(|due| now >= due) {
             self.open_orders_due = None;
@@ -3210,5 +3256,27 @@ fn action_leg(a: &Action) -> Leg {
         | Action::Replace { leg, .. }
         | Action::Query { leg, .. }
         | Action::QueryRequest { leg, .. } => *leg,
+    }
+}
+
+#[cfg(test)]
+mod shots_cost_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_cost_is_reported_once_per_interval_and_counted_afresh() {
+        let mut c = ShotsCost::default();
+        let ms = Duration::from_millis;
+        assert!(c.record(ms(2), 1_000).is_none());
+        assert!(c.record(ms(6), 2_000).is_none());
+        let line = c
+            .record(ms(4), 1_000 + SHOTS_REPORT_MS)
+            .expect("the interval is up");
+        assert_eq!(line, "shots: 3 passes in 300 s, avg 4.00 ms, max 6.00 ms");
+        // The next interval starts from this pass, with nothing carried over.
+        assert!(c.record(ms(1), 2_000 + SHOTS_REPORT_MS).is_none());
+        let line = c.record(ms(1), 1_000 + 2 * SHOTS_REPORT_MS).unwrap();
+        assert_eq!(line, "shots: 2 passes in 300 s, avg 1.00 ms, max 1.00 ms");
     }
 }
