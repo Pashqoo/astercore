@@ -510,6 +510,18 @@ pub struct CoreOrder {
     /// and starts over when an exit is live.
     #[serde(skip)]
     panic_fails: u32,
+    /// The planned exit was refused by the exchange (`-2022` with a rival order resting, a
+    /// margin or price refusal): the position stands without its exit, and the core asks again
+    /// (`watch`) until one is live. Persisted — a restart must not forget a position that is
+    /// unprotected. `None` is a file from before the field existed (`restore` then judges by the
+    /// shape of the leg); `Some(false)` is a decision that stands — an exit that is live, or
+    /// cancelled by hand — and is not second-guessed after a restart.
+    exit_refused: Option<bool>,
+    /// When the next attempt is due (0 = none pending), and how many were refused in a row.
+    #[serde(skip)]
+    exit_retry_at: i64,
+    #[serde(skip)]
+    exit_fails: u32,
     rev: u64,
     done_ms: i64,
 }
@@ -1022,6 +1034,22 @@ impl Orders {
                 continue;
             }
             let id = o.id;
+            // A position whose planned exit was refused before it opened stands unprotected:
+            // from a file written before the flag existed it is recognised by the shape
+            // `retry_exits` looks for (a flag that IS in the file is believed as it is).
+            if o.exit_refused.is_none()
+                && o.status == status::BUY_DONE
+                && o.planned_ratio > 0.0
+                && !o.panic
+                && o.sell.state.canceled
+                && !o.sell.state.opened
+            {
+                o.exit_refused = Some(true);
+            }
+            if o.exit_refused == Some(true) {
+                // Due at once: it stood unprotected across the restart.
+                o.exit_retry_at = 1;
+            }
             for leg in [Leg::Buy, Leg::Sell] {
                 let live = matches!(
                     (leg, o.status),
@@ -1859,6 +1887,10 @@ impl Orders {
             (leg, o.status),
             (Leg::Buy, status::BUY_SET) | (Leg::Sell, status::SELL_SET)
         );
+        if leg == Leg::Sell {
+            // A hand cancel of the exit is a decision: no retry of a refused one behind it.
+            (o.exit_refused, o.exit_retry_at) = (Some(false), 0);
+        }
         let ex = o.leg(leg);
         if active {
             ex.cancel_requested = true;
@@ -2134,6 +2166,45 @@ impl Orders {
     /// fell behind the book by a tick is moved again after `PANIC_CHASE_MS`.
     pub fn watch(&mut self, model: &Catalog, now_ms: i64) -> Effects {
         let mut fx = self.pending_due(model, now_ms);
+        // A position whose planned exit the exchange refused is asked for it again.
+        let again: Vec<(u64, f64)> = self
+            .map
+            .values()
+            .filter(|o| {
+                o.status == status::BUY_DONE
+                    && o.exit_refused == Some(true)
+                    && !o.panic
+                    && o.planned_ratio > 0.0
+                    && o.exit_retry_at > 0
+                    && now_ms >= o.exit_retry_at
+                    // Not while an exit is already out or being asked about.
+                    && !o.sell.uncertain
+                    && !o.sell.executions.last().is_some_and(Execution::is_live)
+            })
+            .map(|o| (o.id, round_tick(o.entry() * o.planned_ratio, o.tick)))
+            .collect();
+        for (id, price) in again {
+            let tries = self.map.get_mut(&id).map_or(0, |o| {
+                o.exit_retry_at = 0;
+                o.exit_fails + 1
+            });
+            let placed = self.place_exit(id, price, false);
+            if let Some(o) = self.map.get_mut(&id) {
+                if placed.is_empty() {
+                    // Nothing left to place (no units, no price): no retry behind it.
+                    o.exit_refused = Some(false);
+                } else {
+                    fx.logs.push(format!(
+                        "{}: the exit was refused; placing it again at {price} (try {tries})",
+                        o.market
+                    ));
+                }
+            }
+            if !placed.is_empty() {
+                fx.actions.extend(placed);
+                self.bump(id, &mut fx);
+            }
+        }
         for o in self.map.values_mut() {
             let id = o.id;
             // Where the legs rest, taken off the walk that is already here: a
@@ -2310,6 +2381,34 @@ impl Orders {
         let armed = std::mem::replace(&mut o.panic, true);
         if !armed {
             self.bump(id, &mut fx);
+        }
+        // The core's own resting entries that would stand against this exit (a long entry beside
+        // a short's buy-back, the other way round for a long): on a one-way account the
+        // exchange refuses a reduce-only order that such an order could flip (`-2022`), and
+        // a panic that cannot be placed is no panic. Taken off first, and said.
+        let (uid, short, emulated) = {
+            let o = &self.map[&id];
+            (o.uid.clone(), o.is_short, o.emulator)
+        };
+        if !emulated {
+            let rivals: Vec<u64> = self
+                .map
+                .values()
+                .filter(|r| {
+                    r.id != id
+                        && r.uid == uid
+                        && !r.emulator
+                        && r.is_short != short
+                        && r.status == status::BUY_SET
+                })
+                .map(|r| r.id)
+                .collect();
+            for rival in rivals {
+                fx.logs.push(format!(
+                    "{uid}: cancelling the resting entry {rival:#x} that stands against this exit"
+                ));
+                fx.extend(self.cancel(rival, Leg::Buy));
+            }
         }
         let o = &self.map[&id];
         if o.status == status::BUY_SET && o.buy.filled_lots > 0 {
@@ -2525,6 +2624,18 @@ impl Orders {
             if leg == Leg::Sell && o.panic {
                 o.panic_fails = o.panic_fails.saturating_add(1);
                 o.panic_next = now_ms + panic_retry_ms(o.panic_fails);
+            } else if leg == Leg::Sell
+                && o.planned_ratio > 0.0
+                && !o.sell.state.opened
+                && o.exit_retry_at == 0
+            {
+                // The planned exit, refused before it ever stood: asked again, less and less
+                // often. (Not an exit the user or a strategy moved — it has stood, and what
+                // they asked for is not ours to override with the plan; and not the same
+                // refusal reported twice, by the reply and by the stream.)
+                o.exit_refused = Some(true);
+                o.exit_fails = o.exit_fails.saturating_add(1);
+                o.exit_retry_at = now_ms + panic_retry_ms(o.exit_fails);
             }
         } else if current
             && leg == Leg::Sell
@@ -2535,6 +2646,7 @@ impl Orders {
         {
             // The exit is live: the refusals before it are over.
             o.panic_fails = 0;
+            (o.exit_refused, o.exit_fails, o.exit_retry_at) = (Some(false), 0, 0);
         }
         self.set_status(id, next, now_ms);
         let o = self.map.get_mut(&id).expect("order");
@@ -3511,6 +3623,179 @@ mod tests {
         orders.respec(|_| Some(&coarse));
         let o = orders.get(1).unwrap();
         assert_eq!((o.lot, o.buy.filled_lots), (5.0, 4));
+    }
+
+    /// A planned exit the exchange refused (here `-2022`, a reduce-only order beside a rival
+    /// resting order) is asked for again, less and less often, until one is live; a position
+    /// must not stand without its exit while one can be placed. A hand cancel of the exit ends
+    /// the retries, and the flag survives a restart.
+    #[test]
+    fn a_refused_planned_exit_is_placed_again_until_it_is_live() {
+        let model = sber_model();
+        let sber = model.get("u-sber").unwrap();
+        let mut orders = Orders::new();
+        let fx = orders.start(1, &start(7000.0, 310.0, 320.0), sber, 1);
+        let key = post_key(&fx);
+        let fx = orders.apply(&update(&key, "9001", ExecStatus::Filled, 2, 2, 309.5), 20);
+        let exit_key = post_key(&fx);
+        // The exchange refuses the exit.
+        let mut refused = update(&exit_key, "", ExecStatus::Rejected, 2, 0, 0.0);
+        refused.sell = true;
+        orders.apply(&refused, 30);
+        let o = orders.get(1).unwrap();
+        assert_eq!(o.status, status::BUY_DONE);
+        assert_eq!(o.exit_refused, Some(true));
+        // Nothing before the pause, a new Post after it.
+        assert!(orders.watch(&model, 5_000).actions.is_empty());
+        let fx = orders.watch(&model, 10_100);
+        let retry = fx
+            .actions
+            .iter()
+            .find(|a| matches!(a, Action::Post { sell: true, .. }))
+            .expect("the exit is asked for again");
+        let Action::Post { key: retry_key, .. } = retry else {
+            unreachable!()
+        };
+        assert_ne!(retry_key, &exit_key, "under a fresh key");
+        // Refused again: the pause doubles (20 s).
+        let mut refused = update(retry_key, "", ExecStatus::Rejected, 2, 0, 0.0);
+        refused.sell = true;
+        orders.apply(&refused, 10_200);
+        assert!(orders.watch(&model, 25_000).actions.is_empty());
+        let fx = orders.watch(&model, 30_300);
+        let Some(Action::Post { key: live_key, .. }) = fx
+            .actions
+            .iter()
+            .find(|a| matches!(a, Action::Post { sell: true, .. }))
+            .cloned()
+        else {
+            panic!("a third try");
+        };
+        // This one is accepted: the flag and the retries end.
+        let mut accepted = update(&live_key, "9002", ExecStatus::New, 2, 0, 0.0);
+        accepted.sell = true;
+        orders.apply(&accepted, 30_400);
+        let o = orders.get(1).unwrap();
+        assert_eq!(o.status, status::SELL_SET);
+        assert_ne!(o.exit_refused, Some(true));
+        assert!(orders.watch(&model, 600_000).actions.is_empty());
+    }
+
+    /// The decision not to have the exit stands: cancelling it by hand stops the retries.
+    #[test]
+    fn a_hand_cancel_of_the_exit_ends_the_retries() {
+        let model = sber_model();
+        let sber = model.get("u-sber").unwrap();
+        let mut orders = Orders::new();
+        let fx = orders.start(1, &start(7000.0, 310.0, 320.0), sber, 1);
+        let key = post_key(&fx);
+        let fx = orders.apply(&update(&key, "9001", ExecStatus::Filled, 2, 2, 309.5), 20);
+        let mut refused = update(&post_key(&fx), "", ExecStatus::Rejected, 2, 0, 0.0);
+        refused.sell = true;
+        orders.apply(&refused, 30);
+        assert_eq!(orders.get(1).unwrap().exit_refused, Some(true));
+        orders.cancel(1, Leg::Sell);
+        assert_ne!(orders.get(1).unwrap().exit_refused, Some(true));
+        assert!(orders.watch(&model, 60_000).actions.is_empty());
+    }
+
+    /// A panic exit that a rival resting entry would make the exchange refuse (`-2022` on a
+    /// one-way account) takes the rival off first: a short's buy-back beside a resting long.
+    #[test]
+    fn a_panic_exit_cancels_the_resting_entry_that_stands_against_it() {
+        let model = sber_model();
+        let sber = model.get("u-sber").unwrap();
+        let mut orders = Orders::new();
+        // A short in position.
+        let mut short = start(3000.0, 300.0, 0.0);
+        short.is_short = true;
+        let fx = orders.start(1, &short, sber, 1);
+        let key = post_key(&fx);
+        let mut filled = update(&key, "9001", ExecStatus::Filled, 1, 1, 300.0);
+        filled.sell = true;
+        orders.apply(&filled, 2);
+        assert_eq!(orders.get(1).unwrap().status, status::BUY_DONE);
+        // A long entry resting beside it, acknowledged by the exchange.
+        let fx = orders.start(2, &start(3000.0, 290.0, 0.0), sber, 3);
+        let rival_key = post_key(&fx);
+        orders.apply(&update(&rival_key, "9100", ExecStatus::New, 1, 0, 0.0), 4);
+        assert_eq!(orders.get(2).unwrap().status, status::BUY_SET);
+
+        let fx = orders.set_panic(1, true, sber, 10);
+        assert!(
+            fx.actions.iter().any(
+                |a| matches!(a, Action::Cancel { order: 2, leg: Leg::Buy, exchange_id, .. } if exchange_id == "9100")
+            ),
+            "{:?}",
+            fx.actions
+        );
+        assert!(fx
+            .logs
+            .iter()
+            .any(|l| l.contains("stands against this exit")));
+        // A rival of the SAME direction as the position is not one.
+        let fx = orders.set_panic(2, true, sber, 11);
+        assert!(!fx
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::Cancel { order: 1, .. })));
+    }
+
+    /// The flag in the file is believed: a cancelled exit stays cancelled across a restart, and
+    /// only a file from before the flag existed is judged by the shape of the leg.
+    #[test]
+    fn a_restored_flag_is_believed_and_a_missing_one_is_judged_by_shape() {
+        let model = sber_model();
+        let sber = model.get("u-sber").unwrap();
+        let build = |flag: Option<bool>| {
+            let mut orders = Orders::new();
+            let fx = orders.start(1, &start(7000.0, 310.0, 320.0), sber, 1);
+            let key = post_key(&fx);
+            let fx = orders.apply(&update(&key, "9001", ExecStatus::Filled, 2, 2, 309.5), 20);
+            let mut refused = update(&post_key(&fx), "", ExecStatus::Rejected, 2, 0, 0.0);
+            refused.sell = true;
+            orders.apply(&refused, 30);
+            let mut persisted = orders.persisted();
+            // What the file says about the flag.
+            match flag {
+                Some(v) => persisted[0]["exit_refused"] = serde_json::json!(v),
+                None => {
+                    persisted[0].as_object_mut().unwrap().remove("exit_refused");
+                }
+            }
+            let list: Vec<CoreOrder> = persisted
+                .into_iter()
+                .map(|v| serde_json::from_value(v).unwrap())
+                .collect();
+            let mut back = Orders::new();
+            back.restore(list);
+            back
+        };
+        // Missing (an old file): the shape says «refused before it opened» → retried at once.
+        let back = build(None);
+        assert_eq!(back.get(1).unwrap().exit_refused, Some(true));
+        assert!(!back.clone_actions_after_watch(&model).is_empty());
+        // Explicitly false (the user cancelled it): left alone.
+        let back = build(Some(false));
+        assert_eq!(back.get(1).unwrap().exit_refused, Some(false));
+        assert!(back.clone_actions_after_watch(&model).is_empty());
+        // Explicitly true: retried at once.
+        let back = build(Some(true));
+        assert!(!back.clone_actions_after_watch(&model).is_empty());
+    }
+
+    impl Orders {
+        /// What the first `watch` after a restore would send (the orders are consumed).
+        fn clone_actions_after_watch(&self, model: &Catalog) -> Vec<Action> {
+            let mut me = Orders::new();
+            let list: Vec<CoreOrder> = self
+                .persisted()
+                .into_iter()
+                .map(|v| serde_json::from_value(v).unwrap())
+                .collect();
+            me.restore(list);
+            me.watch(model, 1_000_000).actions
+        }
     }
 
     /// The retry of a refused panic exit backs off from 10 s to 160 s.
