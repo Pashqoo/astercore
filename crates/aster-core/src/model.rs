@@ -1063,37 +1063,41 @@ impl Catalog {
     /// upper case, so the upper-cased spelling is the other candidate. MoonBot
     /// lists name coins, not symbols (`btc, eth`, `1000pepe` in its own
     /// strategy files), so a word that is no symbol is tried as a coin: the
-    /// one market whose base asset it is, or whose folded `1000` coin
-    /// ([`Market::alias_1000`], what the terminal is told as the canonic
-    /// currency: `pepe` for `1000PEPEUSDT`).
+    /// one market whose base asset it is, and failing that the one whose
+    /// folded `1000` coin it is ([`Market::alias_1000`], what the terminal is
+    /// told as the canonic currency: `pepe` for `1000PEPEUSDT`). The base goes
+    /// first, so a `PEPEUSDT` listed beside `1000PEPEUSDT` keeps `pepe`.
     pub fn index_of_symbol_ci(&self, symbol: &str) -> Option<u16> {
         let up = symbol.to_ascii_uppercase();
         self.index_of_symbol(symbol)
             .or_else(|| self.index_of_symbol(&up))
-            .or_else(|| {
-                let mut by_base = self.bases(&up);
-                let first = by_base.next()?;
-                by_base.next().is_none().then_some(first)
+            .or_else(|| match self.coins(&up)[..] {
+                [one] => Some(one),
+                _ => None,
             })
     }
 
     /// Whether an inexact spelling is refused because two markets answer to
     /// it: two markets on one coin. Not seen on Aster: the catalog holds only
-    /// `USDT`-quoted markets, and their bases are unique (checked 02.10
-    /// against `exchangeInfo`). Kept for the screener's log line, which tells
-    /// «ambiguous» from «unknown».
+    /// `USDT`-quoted markets, their bases are unique and no folded `1000` coin
+    /// is another market's base (both checked 02.10 against `exchangeInfo`).
+    /// Kept for the screener's log line, which tells «ambiguous» from
+    /// «unknown».
     pub fn symbol_is_ambiguous(&self, symbol: &str) -> bool {
-        self.bases(&symbol.to_ascii_uppercase()).nth(1).is_some()
+        self.coins(&symbol.to_ascii_uppercase()).len() > 1
     }
 
-    /// Markets whose base asset or folded `1000` coin is `up`.
-    fn bases<'a>(&'a self, up: &'a str) -> impl Iterator<Item = u16> + 'a {
-        self.iter()
-            .filter(move |(_, m)| {
-                m.base.eq_ignore_ascii_case(up)
-                    || m.alias_1000().is_some_and(|c| c.eq_ignore_ascii_case(up))
-            })
-            .map(|(i, _)| i)
+    /// The markets a coin names: those whose base asset is `up`, or if none,
+    /// those whose folded `1000` coin is.
+    fn coins(&self, up: &str) -> Vec<u16> {
+        let by = |is: &dyn Fn(&Market) -> bool| -> Vec<u16> {
+            self.iter().filter(|(_, m)| is(m)).map(|(i, _)| i).collect()
+        };
+        let base = by(&|m| m.base.eq_ignore_ascii_case(up));
+        if !base.is_empty() {
+            return base;
+        }
+        by(&|m| m.alias_1000().is_some_and(|c| c.eq_ignore_ascii_case(up)))
     }
 
     /// The market at `m_index`.
@@ -1673,6 +1677,13 @@ mod tests {
         assert_eq!(two.index_of_symbol_ci("btc"), None);
         assert!(two.symbol_is_ambiguous("btc"));
         assert_eq!(two.index_of_symbol_ci("btcusdc"), Some(0));
+        // A plain market beside its `1000` listing keeps the plain coin.
+        let both = Catalog::of(vec![
+            market("1000PEPEUSDT", "1000PEPE", 0.0000001, 1.0),
+            market("PEPEUSDT", "PEPE", 0.00000001, 1.0),
+        ]);
+        assert_eq!(both.index_of_symbol_ci("pepe"), Some(1));
+        assert!(!both.symbol_is_ambiguous("pepe"));
     }
 
     #[test]

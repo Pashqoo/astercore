@@ -1104,8 +1104,8 @@ impl MoonShot {
             return Cow::Borrowed(p);
         }
         // A catalog collision names the second market `T_CLASS` after the
-        // first took `T`: only a listed `T` that is itself a market takes its
-        // twins.
+        // first took `T`: only a listed `T` that names a market (a symbol or
+        // a coin) takes its twins.
         let twins: Vec<String> = black
             .iter()
             .filter(|t| model.index_of_symbol_ci(t).is_some())
