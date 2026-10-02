@@ -16,7 +16,7 @@ use crate::aster::ws::{Beat, Stamp};
 /// NOT TInvestCore's 15 s. There the gateway pinged every 5 s, so a silence
 /// was a dead stream. Here the gateway pings every 5 MINUTES and Aster's tape
 /// is thin — measured 01.10 on the `aggTrade` stream, which the core then read (it reads the raw `trade`
-/// stream since 02.10, 18-28 % more frames on liquid markets, from one 40 s and two 90 s samples;
+/// stream since 02.10, 12-60 % more frames on liquid markets, from four 40-90 s samples;
 /// the figure was not re-measured): 200 markets' tape delivered 3–14 frames in 8–12 s, a quiet chunk can say nothing for a while and be perfectly alive.
 /// So staleness is judged on the stream that cannot be quiet: `!markPrice@arr`
 /// pushes the whole catalog every 3 s (measured), and 15 s is five missed

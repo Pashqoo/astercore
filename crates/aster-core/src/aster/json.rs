@@ -789,7 +789,7 @@ impl From<MarkPriceUpdate> for PremiumIndex {
 #[serde(tag = "e")]
 pub enum StreamEvent {
     /// `<symbol>@trade`: one fill. The stream the core reads, because `aggTrade` merges the fills
-    /// of one taker order at one price (measured 02.10: 18-28 % fewer prints on BTCUSDT and
+    /// of one taker order at one price (measured 02.10: 11-37 % fewer prints on BTCUSDT and
     /// SOLUSDT than the exchange's raw tape in the same window). The fields the core reads are
     /// those of [`AggTrade`] under the same names, so it is decoded as one (`a` defaults to 0).
     #[serde(rename = "trade")]
