@@ -17,3 +17,6 @@ probe.env
 /logs/
 .claude/settings.local.json
 /todo.md
+
+# Formula notes from the strategy tuner side: working docs, not for the public repo
+_doc/STRATEGY_FORMULAS/
