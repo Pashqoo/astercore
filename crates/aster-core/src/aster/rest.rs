@@ -18,7 +18,8 @@ use ureq::{Agent, Body};
 
 use super::json::{
     kline_row, AggTrade, ApiError, Balance, BookTicker, DepthSnapshot, ExchangeInfo, Kline,
-    ListenKey, OrderReply, PositionRisk, PremiumIndex, ServerTime, Ticker24h,
+    LeverageSet, ListenKey, OrderReply, PositionRisk, PremiumIndex, ServerTime, SymbolBrackets,
+    Ticker24h,
 };
 use super::sign::{Network, Signer};
 use crate::api_meter::{self, Call};
@@ -324,6 +325,40 @@ impl Rest {
                     .map_err(|e| Error::Decode(format!("/fapi/v3/positionRisk: {e}")))
             })
             .collect()
+    }
+
+    /// `POST /fapi/v3/leverage`, signed, weight 1: `symbol`'s leverage on this account. The
+    /// answer says what the exchange now holds, which is what the caller trusts.
+    pub fn set_leverage(
+        &mut self,
+        signer: &mut Signer,
+        symbol: &str,
+        leverage: i32,
+    ) -> Result<LeverageSet, Error> {
+        let leverage = leverage.to_string();
+        self.signed_send(
+            Method::Post,
+            signer,
+            "/fapi/v3/leverage",
+            &[("symbol", symbol), ("leverage", &leverage)],
+        )
+    }
+
+    /// `GET /fapi/v3/leverageBracket`, signed, weight 1: every symbol's notional brackets, whose
+    /// first one carries the leverage the account may ask for. Rows the core has no use for are
+    /// not decoded, for the reason `balance` gives.
+    pub fn leverage_brackets(
+        &mut self,
+        signer: &mut Signer,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<Vec<SymbolBrackets>, Error> {
+        let rows: Vec<serde_json::Value> =
+            self.signed_get(signer, "/fapi/v3/leverageBracket", &[])?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| r.get("symbol").and_then(|s| s.as_str()).is_some_and(&keep))
+            .filter_map(|r| serde_json::from_value(r).ok())
+            .collect())
     }
 
     /// `GET /fapi/v3/positionSide/dual`, signed, weight 30: `true` when the account is in hedge

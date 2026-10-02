@@ -171,8 +171,10 @@ alwaysApply: true
   M0–M4, задел.
 - **Делистинги**: `status` `SETTLING`/`CLOSE` и `deliveryDate` (19 символов доставляются) →
   `PanicSellDelisted` применим.
-- **Плечо**: `/fapi/v1/leverageBracket` и `ACCOUNT_CONFIG_UPDATE`. `exchangeInfo` даёт только
-  `requiredMarginPercent` — это потолок инструмента (5.0 → 20×), а не плечо счёта.
+- **Плечо** (по докам v3, **живьём не проверено**): текущее — `leverage` в `/fapi/v3/positionRisk`,
+  потолок — первый брекет `/fapi/v3/leverageBracket`, смена — `POST /fapi/v3/leverage`.
+  `ACCOUNT_CONFIG_UPDATE` ядро не потребляет. `exchangeInfo` даёт только `requiredMarginPercent` —
+  потолок инструмента (5.0 → 20×), запасной вариант, а не плечо счёта.
 
 ### Сессии вместо расписания
 

@@ -134,6 +134,14 @@ pub enum TradeCommand {
     },
     /// Read the account's live orders → `TradingEvent::OpenOrders`.
     OpenOrders,
+    /// Set `symbol`'s leverage on the exchange → `FeedEvent::LeverageSet`, addressed to the
+    /// terminal request it answers.
+    SetLeverage {
+        client_id: u64,
+        request_uid: u64,
+        symbol: String,
+        leverage: i32,
+    },
 }
 
 pub enum TradingEvent {
@@ -216,18 +224,35 @@ pub fn start(
         })
         .collect();
     let (reads, reader_rx) = mpsc::channel::<()>();
+    let signer_for_leverage = signer.clone();
     let reader = Reader {
         rest: client(),
         signer,
         grids,
         ev: ev.clone(),
-        clock,
+        clock: Arc::clone(&clock),
     };
     thread::Builder::new()
         .name("aster-order-read".into())
         .spawn(move || reader.run(&reader_rx))
         .expect("spawn");
-    let router = Router { boxes, reads, ev };
+    let (leverages, leverage_rx) = mpsc::channel::<LeverageJob>();
+    let setter = Leverager {
+        rest: client(),
+        signer: signer_for_leverage,
+        ev: ev.clone(),
+        clock,
+    };
+    thread::Builder::new()
+        .name("aster-leverage".into())
+        .spawn(move || setter.run(&leverage_rx))
+        .expect("spawn");
+    let router = Router {
+        boxes,
+        reads,
+        leverages,
+        ev,
+    };
     thread::Builder::new()
         .name("aster-orders".into())
         .spawn(move || {
@@ -456,6 +481,7 @@ impl Mailbox {
 struct Router {
     boxes: Vec<Arc<Mailbox>>,
     reads: Sender<()>,
+    leverages: Sender<LeverageJob>,
     ev: Sender<FeedEvent>,
 }
 
@@ -477,6 +503,22 @@ impl Router {
                         .send(FeedEvent::Trading(TradingEvent::OpenOrdersFailed));
                 }
             }
+            TradeCommand::SetLeverage {
+                client_id,
+                request_uid,
+                symbol,
+                leverage,
+            } => {
+                let job = LeverageJob {
+                    client_id,
+                    request_uid,
+                    symbol,
+                    leverage,
+                };
+                if let Err(mpsc::SendError(job)) = self.leverages.send(job) {
+                    let _ = self.ev.send(job.failed(GONE_LEVERAGE));
+                }
+            }
         }
     }
 
@@ -489,6 +531,100 @@ impl Router {
 
 /// What a call whose worker is gone is told.
 const GONE: &str = "the order worker is gone";
+const GONE_LEVERAGE: &str = "the leverage thread is gone";
+
+/// One leverage change asked by a terminal.
+struct LeverageJob {
+    client_id: u64,
+    request_uid: u64,
+    symbol: String,
+    leverage: i32,
+}
+
+impl LeverageJob {
+    fn failed(self, msg: &str) -> FeedEvent {
+        FeedEvent::LeverageSet {
+            client_id: self.client_id,
+            request_uid: self.request_uid,
+            symbol: self.symbol,
+            result: Err(msg.to_string()),
+        }
+    }
+}
+
+/// The leverage thread name in `FeedEvent::Lost`.
+pub const LEVERAGER: &str = "the leverage thread";
+
+/// Changes leverage on the exchange, one at a time, on a thread of its own: a rare write that
+/// must neither stand behind the order workers' calls nor hold the account reader. It shares the
+/// wallet's signer (one nonce sequence) and the gateway clock with them. A call that failed
+/// without the exchange's refusal is not repeated: the terminal is told, and the trader presses
+/// again — the change is idempotent, but a silent second attempt is not what was asked.
+struct Leverager {
+    rest: Rest,
+    signer: Signer,
+    ev: Sender<FeedEvent>,
+    clock: Arc<Clock>,
+}
+
+impl Leverager {
+    fn run(self, rx: &Receiver<LeverageJob>) {
+        let lost = self.ev.clone();
+        let run = panic::catch_unwind(AssertUnwindSafe(|| self.serve(rx)));
+        if run.is_err() {
+            let _ = lost.send(FeedEvent::Lost(LEVERAGER));
+        }
+    }
+
+    fn serve(self, rx: &Receiver<LeverageJob>) {
+        let Self {
+            mut rest,
+            mut signer,
+            ev,
+            clock,
+        } = self;
+        while let Ok(job) = rx.recv() {
+            rest.set_clock_delta_ms(clock.delta());
+            let result = match rest.set_leverage(&mut signer, &job.symbol, job.leverage) {
+                // An echo that is no leverage is no confirmation: the terminal is told, and the
+                // next read of the account says what the exchange holds.
+                Ok(done) if done.leverage < 1 => Err(format!(
+                    "the exchange answered leverage {} for {}",
+                    done.leverage, job.symbol
+                )),
+                Ok(done) => {
+                    log::info!("leverage: {} set to {}x", job.symbol, done.leverage);
+                    Ok(done.leverage)
+                }
+                Err(e) => {
+                    log::warn!("leverage: {} to {}x failed: {e}", job.symbol, job.leverage);
+                    if clock_suspect(&e) {
+                        clock.kick();
+                    }
+                    // A call whose fate is unknown (a timeout, a 5xx) may have taken effect: the
+                    // terminal is told so, and the balance rows show what is in force after
+                    // the next read.
+                    if definitive(&e) {
+                        Err(e.to_string())
+                    } else {
+                        Err(format!(
+                            "{e} (outcome unknown, the next balance read shows it)"
+                        ))
+                    }
+                }
+            };
+            let sent = ev.send(FeedEvent::LeverageSet {
+                client_id: job.client_id,
+                request_uid: job.request_uid,
+                symbol: job.symbol,
+                result,
+            });
+            if sent.is_err() {
+                return;
+            }
+        }
+    }
+}
 
 /// The exchange's order budget as the entries are held to it: the times of the recent order-making
 /// calls, the exits' too. An exit takes its place at once; an entry waits until it fits both windows.
@@ -1349,7 +1485,18 @@ mod tests {
         let boxes = (0..WORKERS).map(|_| Arc::new(Mailbox::default())).collect();
         let (reads, reader_rx) = mpsc::channel();
         let (ev, ev_rx) = mpsc::channel();
-        (Router { boxes, reads, ev }, reader_rx, ev_rx)
+        // The leverage thread is not started in these tests: its end is dropped.
+        let (leverages, _) = mpsc::channel();
+        (
+            Router {
+                boxes,
+                reads,
+                leverages,
+                ev,
+            },
+            reader_rx,
+            ev_rx,
+        )
     }
 
     fn exchange(uid: &str, order: u64, leg: Leg) -> TradeCommand {

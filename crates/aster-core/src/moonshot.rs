@@ -3739,8 +3739,8 @@ impl WorkWindow {
 /// (`availableBalance`) as of its last snapshot, less what the entries placed
 /// since took (the snapshot already excludes the margin its live orders
 /// block). An entry is charged its whole notional, not its margin: the
-/// account's leverage per market is not read yet, and charging the notional
-/// errs on the side of not spending. The emulator is not checked.
+/// account's leverage per market is read (`Account::leverage`) but not used here,
+/// and charging the notional errs on the side of not spending. The emulator is not checked.
 #[derive(Debug, Default)]
 struct Funds {
     budget: Option<f64>,

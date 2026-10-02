@@ -205,7 +205,7 @@ MoonShot из списка клиента входит, исполняется �
 **Долги M3** (записаны, не забыты): `DontSellBelowLiq`/`StopAboveLiq`/`PanicSellDelisted`
 в схеме, но не читаются (на Aster применимы — цена ликвидации, дата поставки);
 `ReportToTelegram`/`ReportTradesToTelegram` — до M4; флаг `SSF_APPLY_TO_ORDERS` снимка не
-читается; ключи сортировки `Funding`/`MarkPrice` не перенесены; плечо по рынку не читается, и
+читается; ключи сортировки `Funding`/`MarkPrice` не перенесены; плечо по рынку читается (02.10), но
 `CheckFreeBalance` берёт с бюджета весь нотионал, а не маржу; `TradingStartDelay` после смены
 статуса не воспроизводится (статус читается раз на старте).
 
@@ -793,8 +793,7 @@ M2 закрыт; M3 — выше, в «Где мы сейчас».
 обновляется ответом следующего `Query`, а не сразу; код ответа Aster на повтор `clientOrderId`
 не известен (модель повторов не делает — сверяет по ключу).
 Известные пределы шага 2: два вызова — два момента (расхождение на одно обновление, сходится
-через 15 с); `liq_price` и плечо в `TBalanceFull` не пишутся (кодек `server/codec/balance.rs`
-их не несёт); листинг после старта входит в equity со следующего старта.
+через 15 с); `liq_price` в `TBalanceFull` не пишется (плечо пишется с 02.10); листинг после старта входит в equity со следующего старта.
 
 **Названные долги** (не забытые, записанные): «использовать ручную стратегию» терминала — M3
 (ордер берёт тулбар, строка в журнале); `parse_snapshot` (`server/codec/strat.rs`) не читает `flags` (`SSF_APPLY_TO_ORDERS`) и `snapshot()`
@@ -1023,7 +1022,13 @@ crates/moonproto https://github.com/Moonbot-Tech/MoonProtoBeta <rev>` → **от
 - `base_currency_name/code` = `USDT`; `exchange_type_mask` = **`FUTURES`**;
   `exchange_code` = **221**, `exchange_name` = `"Aster"` (220 занят T-Invest). `venue(221) == None`
   → терминал рисует ядро в секции `reported` без логотипа, как и tinvest-core.
-- `leverage_x` по рынку — из `/fapi/v1/leverageBracket` и `ACCOUNT_CONFIG_UPDATE`, **отдельным
+- **Плечо, сделано 02.10 (не проверено живьём):** `leverage_x` по рынку — из `leverage` строк
+  `positionRisk` (`Account.leverage`, строка у позиции или отдельная «только плечо» у плоского
+  рынка), максимум плеча — из первого брекета `/fapi/v3/leverageBracket` (читается раз на старте,
+  `Market.bracket_leverage`), `SetLeverage` терминала — подписанный `POST /fapi/v3/leverage` на
+  потоке `aster-leverage`, ответ терминалу отложенный. `ACCOUNT_CONFIG_UPDATE` не потребляется:
+  смена плеча вне ядра видна после очередного чтения: событие user-стрима (в том числе это) будит перечтение, иначе — период 15 с. Подтверждённая смена удерживается 20 с поверх чтения, начатого до неё. Было: `leverage_x` по рынку — из
+  `/fapi/v1/leverageBracket` и `ACCOUNT_CONFIG_UPDATE`, **отдельным
   подписанным вызовом**, которого в срезе каталога нет: `exchangeInfo` даёт только
   `requiredMarginPercent` (5.0 → потолок 20×), и это верхняя граница инструмента, а не плечо
   счёта. Поэтому `Market` несёт процент, а не поле `leverage`, которое читалось бы как

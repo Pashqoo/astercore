@@ -20,6 +20,7 @@ const F_POS_PRICE: u32 = 1 << 3;
 const F_POS_DIR: u32 = 1 << 5;
 const F_ASSET_BALANCE: u32 = 1 << 14;
 const F_ASSET_BALANCE_FULL: u32 = 1 << 15;
+const F_LEVERAGE: u32 = 1 << 20;
 
 /// One market row of the full balance.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -28,6 +29,12 @@ pub struct BalanceItem<'a> {
     /// Free units of the asset and free + blocked.
     pub asset_balance: f64,
     pub asset_balance_full: f64,
+    /// Leverage of the market, `0` when it is not stated: the flag is then left out and the
+    /// terminal reads its default, which it shows as unknown.
+    pub leverage: i32,
+    /// A row that carries the leverage and nothing else: no position, no balance. The terminal
+    /// takes a market with neither as flat, which is what it is.
+    pub leverage_only: bool,
     /// Open derivative position: signed size (long > 0) and entry price.
     pub pos_size: f64,
     pub pos_price: f64,
@@ -54,17 +61,28 @@ pub fn balance_full(
     for item in items {
         super::write_str(&mut out, item.market);
         out.extend_from_slice(&0u64.to_le_bytes()); // balance_hash
-        let flags = F_POS_SIZE | F_POS_PRICE | F_POS_DIR | F_ASSET_BALANCE | F_ASSET_BALANCE_FULL;
-        out.extend_from_slice(&flags.to_le_bytes());
-        out.extend_from_slice(&item.pos_size.abs().to_le_bytes());
-        out.extend_from_slice(&item.pos_price.to_le_bytes());
-        out.push(if item.pos_size < 0.0 {
-            POS_DIR_SELL
+        let stated = if item.leverage > 0 { F_LEVERAGE } else { 0 };
+        let held = if item.leverage_only {
+            0
         } else {
-            POS_DIR_BUY
-        });
-        out.extend_from_slice(&item.asset_balance.to_le_bytes());
-        out.extend_from_slice(&item.asset_balance_full.to_le_bytes());
+            F_POS_SIZE | F_POS_PRICE | F_POS_DIR | F_ASSET_BALANCE | F_ASSET_BALANCE_FULL
+        };
+        out.extend_from_slice(&(held | stated).to_le_bytes());
+        // Values follow the bit order of the flags (Delphi field order).
+        if !item.leverage_only {
+            out.extend_from_slice(&item.pos_size.abs().to_le_bytes());
+            out.extend_from_slice(&item.pos_price.to_le_bytes());
+            out.push(if item.pos_size < 0.0 {
+                POS_DIR_SELL
+            } else {
+                POS_DIR_BUY
+            });
+            out.extend_from_slice(&item.asset_balance.to_le_bytes());
+            out.extend_from_slice(&item.asset_balance_full.to_le_bytes());
+        }
+        if item.leverage > 0 {
+            out.extend_from_slice(&item.leverage.to_le_bytes());
+        }
     }
     out
 }
@@ -118,5 +136,57 @@ mod tests {
             .unwrap()
             .items
             .is_empty());
+    }
+
+    #[test]
+    fn leverage_rides_with_a_position_or_alone_and_is_left_out_when_unknown() {
+        let rows = [
+            BalanceItem {
+                market: "BTCUSDT",
+                pos_size: -0.5,
+                pos_price: 60_000.0,
+                leverage: 20,
+                ..BalanceItem::default()
+            },
+            BalanceItem {
+                market: "ETHUSDT",
+                leverage: 7,
+                leverage_only: true,
+                ..BalanceItem::default()
+            },
+            BalanceItem {
+                market: "SOLUSDT",
+                pos_size: 3.0,
+                pos_price: 150.0,
+                ..BalanceItem::default()
+            },
+        ];
+        let raw = balance_full(1, 1, 0.0, 0.0, 0.0, &rows);
+        let parsed =
+            parse_balance(raw[0], &raw[super::super::BASE_HEADER_SIZE..]).expect("balance");
+        let by = |name: &str| {
+            parsed
+                .items
+                .iter()
+                .find(|i| i.market_name == name)
+                .expect(name)
+        };
+        let btc = by("BTCUSDT");
+        assert_eq!(
+            (btc.pos_size, btc.pos_price, btc.leverage_x),
+            (0.5, 60_000.0, 20)
+        );
+        assert_eq!(btc.pos_dir, OrderType::Sell);
+        let eth = by("ETHUSDT");
+        assert_eq!(
+            (eth.leverage_x, eth.pos_size, eth.asset_balance),
+            (7, 0.0, 0.0)
+        );
+        let sol = by("SOLUSDT");
+        assert_eq!(
+            (sol.pos_size, sol.leverage_x),
+            (3.0, 1),
+            "unknown stays the default"
+        );
     }
 }

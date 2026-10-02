@@ -949,6 +949,7 @@ fn the_account_reaches_the_client_and_a_closed_position_goes_flat() {
                 size: -0.002,
                 entry: 83_000.0,
             }],
+            ..Account::default()
         })))
         .unwrap();
     let (money, btc) = next_balance(&client, "BTCUSDT");
@@ -965,6 +966,7 @@ fn the_account_reaches_the_client_and_a_closed_position_goes_flat() {
             free: 1000.0,
             equity: 1000.0,
             positions: Vec::new(),
+            ..Account::default()
         })))
         .unwrap();
     let (money, btc) = next_balance(&client, "BTCUSDT");
@@ -1046,7 +1048,7 @@ fn next_action(rx: &Receiver<TradeCommand>) -> Action {
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left).expect("an order call") {
             TradeCommand::Exchange { action, .. } => return action,
-            TradeCommand::OpenOrders => {}
+            TradeCommand::OpenOrders | TradeCommand::SetLeverage { .. } => {}
         }
     }
 }
@@ -1540,7 +1542,7 @@ fn a_failed_open_orders_read_is_asked_again() {
                 assert!(sent.elapsed() >= Duration::from_secs(9), "asked at once");
                 break;
             }
-            TradeCommand::Exchange { .. } => {}
+            TradeCommand::Exchange { .. } | TradeCommand::SetLeverage { .. } => {}
         }
     }
 }
@@ -1787,4 +1789,185 @@ fn an_emulated_moonshot_enters_and_exits_on_the_tape_and_never_reaches_the_excha
         .find(|c| matches!(c, TradeCommand::Exchange { .. }));
     assert!(call.is_none(), "an emulated order reached the order worker");
     let _ = client.disconnect();
+}
+
+/// The account's leverage reaches the terminal in the balance rows it already reads: with a
+/// position on its row, alone for a market that is flat, and a market the exchange stated nothing
+/// for keeps the terminal's own default (shown as unknown), not a made-up 1x.
+#[test]
+fn the_account_leverage_reaches_the_client_with_and_without_a_position() {
+    let (core, _orders) = FedCore::trading();
+    let client = core.connect();
+    client.balances().refresh().unwrap();
+    let _ = next_balance(&client, "BTCUSDT");
+
+    let mut leverage = std::collections::BTreeMap::new();
+    leverage.insert("BTCUSDT".to_string(), 20);
+    leverage.insert("TONUSDT".to_string(), 7);
+    core.ev_tx
+        .send(FeedEvent::Account(Some(Account {
+            free: 700.0,
+            equity: 1009.5,
+            positions: vec![Position {
+                symbol: "BTCUSDT".into(),
+                size: -0.002,
+                entry: 83_000.0,
+            }],
+            leverage,
+        })))
+        .unwrap();
+    let (_, btc) = next_balance(&client, "BTCUSDT");
+    assert_eq!(
+        (btc.pos_size, btc.leverage_x),
+        (0.002, 20),
+        "on the position's row"
+    );
+    let snap = client.snapshot().expect("snapshot");
+    let ton = snap
+        .markets()
+        .iter()
+        .find(|h| h.with(|m| m.symbol() == "TONUSDT"))
+        .expect("market")
+        .balance_position();
+    assert_eq!(
+        (ton.pos_size, ton.leverage_x),
+        (0.0, 7),
+        "alone, for a flat market"
+    );
+}
+
+/// `SetLeverage` goes to the exchange through the order path, and the terminal's answer is the
+/// exchange's: success moves the leverage on its balance row at once, a refusal reaches it as
+/// the exchange's own text with the leverage untouched. A bad request never leaves the core.
+#[test]
+fn set_leverage_goes_to_the_exchange_and_the_answer_is_the_exchanges() {
+    let (core, orders) = FedCore::trading();
+    let client = core.connect();
+    // The connect-time snapshot is consumed first, so the one waited for below is ours.
+    client.balances().refresh().unwrap();
+    let _ = next_balance(&client, "BTCUSDT");
+    core.ev_tx
+        .send(FeedEvent::Account(Some(Account {
+            free: 10.0,
+            equity: 10.0,
+            positions: Vec::new(),
+            leverage: [("BTCUSDT".to_string(), 20)].into(),
+        })))
+        .unwrap();
+    let (_, btc) = next_balance(&client, "BTCUSDT");
+    assert_eq!(btc.leverage_x, 20);
+
+    let action = |client: &MoonClient| {
+        let mut got = None;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                for e in client.drain_events() {
+                    if let Event::EngineAction(a) = e {
+                        got = Some(a);
+                        return true;
+                    }
+                }
+                false
+            }),
+            "no answer to SetLeverage"
+        );
+        got.expect("action")
+    };
+    let asked = |rx: &Receiver<TradeCommand>| loop {
+        let call = rx.recv_timeout(Duration::from_secs(5)).expect("the call");
+        if let TradeCommand::SetLeverage {
+            client_id,
+            request_uid,
+            symbol,
+            leverage,
+        } = call
+        {
+            return (client_id, request_uid, symbol, leverage);
+        }
+    };
+
+    client.account().set_leverage("BTCUSDT", 10).unwrap();
+    let (client_id, request_uid, symbol, leverage) = asked(&orders);
+    assert_eq!((symbol.as_str(), leverage), ("BTCUSDT", 10));
+    core.ev_tx
+        .send(FeedEvent::LeverageSet {
+            client_id,
+            request_uid,
+            symbol,
+            result: Ok(10),
+        })
+        .unwrap();
+    let done = action(&client);
+    assert!(done.success, "{}", done.error_msg);
+    // Read from the snapshot: draining the action's event took the balance event with it.
+    let leverage_of = |client: &MoonClient| {
+        client
+            .snapshot()
+            .expect("snapshot")
+            .markets()
+            .iter()
+            .find(|h| h.with(|m| m.symbol() == "BTCUSDT"))
+            .expect("market")
+            .balance_position()
+            .leverage_x
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), || leverage_of(&client) == 10),
+        "the new figure is not on the balance row: {}",
+        leverage_of(&client)
+    );
+
+    // A read of the account that began before the change arrives after it: the old figure must
+    // not come back onto the rows.
+    core.ev_tx
+        .send(FeedEvent::Account(Some(Account {
+            free: 11.0,
+            equity: 11.0,
+            positions: Vec::new(),
+            leverage: [("BTCUSDT".to_string(), 20)].into(),
+        })))
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            client
+                .snapshot()
+                .is_some_and(|s| s.balances().global().btc_balance_total == 11.0)
+        }),
+        "the stale read did not arrive"
+    );
+    assert_eq!(
+        leverage_of(&client),
+        10,
+        "a stale read put the old leverage back"
+    );
+
+    client.account().set_leverage("BTCUSDT", 500).unwrap();
+    let (client_id, request_uid, symbol, _) = asked(&orders);
+    core.ev_tx
+        .send(FeedEvent::LeverageSet {
+            client_id,
+            request_uid,
+            symbol,
+            result: Err("Leverage 500 is not valid".into()),
+        })
+        .unwrap();
+    let refused = action(&client);
+    assert!(!refused.success);
+    assert!(
+        refused.error_msg.contains("not valid"),
+        "{}",
+        refused.error_msg
+    );
+
+    client.account().set_leverage("NOPEUSDT", 5).unwrap();
+    let unknown = action(&client);
+    assert!(!unknown.success);
+    assert_eq!(unknown.error_msg, "unknown market");
+    client.account().set_leverage("BTCUSDT", 0).unwrap();
+    let zero = action(&client);
+    assert!(!zero.success, "a leverage below 1 is refused by the core");
+    assert!(
+        orders.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a bad request reached the exchange path"
+    );
 }

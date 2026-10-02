@@ -73,6 +73,10 @@ pub struct Account {
     pub equity: f64,
     /// Open positions on this core's markets, one per symbol, by symbol.
     pub positions: Vec<Position>,
+    /// The leverage the account holds on each of this core's markets, flat ones included, as
+    /// `positionRisk` states it. A market the exchange did not state it for is missing, and
+    /// reaches the terminal as unknown rather than as 1×.
+    pub leverage: BTreeMap<String, i32>,
 }
 
 /// A symbol's net open position.
@@ -116,6 +120,12 @@ impl Account {
             .filter(|p| symbols.usdt.contains(&p.symbol))
             .map(|p| p.unrealized)
             .sum();
+        // One value a symbol: in hedge mode both legs carry the symbol's one leverage.
+        let leverage = positions
+            .iter()
+            .filter(|p| symbols.rows.contains(&p.symbol))
+            .filter_map(|p| Some((p.symbol.clone(), p.leverage?)))
+            .collect();
         // Net per symbol. One-way mode gives one row a symbol; hedge mode two,
         // each signed and with its own entry. The wire carries one position a
         // market, so two open legs are netted and have no entry price to
@@ -145,6 +155,7 @@ impl Account {
             free: usdt.available,
             equity: usdt.balance + unrealized,
             positions,
+            leverage,
         })
     }
 
@@ -588,7 +599,38 @@ mod tests {
             amount,
             entry_price: entry,
             unrealized,
+            leverage: None,
         }
+    }
+
+    /// The leverage of every market of the core is kept whether or not it has a position, one
+    /// value a symbol even when hedge mode gives two rows, and a row that does not state it adds
+    /// none; a symbol the core has no market for adds none either.
+    #[test]
+    fn leverage_is_kept_per_market_flat_ones_included() {
+        let symbols = Symbols {
+            rows: ["BTCUSDT", "ETHUSDT", "SOLUSDT"].map(String::from).into(),
+            usdt: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ODDUSDT"]
+                .map(String::from)
+                .into(),
+        };
+        let mut btc = pos("BTCUSDT", 1.0, 100.0, 0.0);
+        btc.leverage = Some(20);
+        let mut eth = pos("ETHUSDT", 0.0, 0.0, 0.0);
+        eth.leverage = Some(7);
+        let sol = pos("SOLUSDT", 0.0, 0.0, 0.0);
+        let mut odd = pos("ODDUSDT", 0.0, 0.0, 0.0);
+        odd.leverage = Some(3);
+        let a = Account::from_rows(
+            Some(&bal("USDT", 10.0, 10.0)),
+            &[btc, eth, sol, odd],
+            &symbols,
+        )
+        .unwrap();
+        assert_eq!(
+            a.leverage.into_iter().collect::<Vec<_>>(),
+            [("BTCUSDT".to_string(), 20), ("ETHUSDT".to_string(), 7)]
+        );
     }
 
     /// The snapshot is withdrawn after a minute of failed reads, not before, and only if there
@@ -748,6 +790,7 @@ mod tests {
             free: 100.0,
             equity: 90.0,
             positions: Vec::new(),
+            leverage: BTreeMap::new(),
         };
         assert_eq!(a.locked(), 0.0);
     }

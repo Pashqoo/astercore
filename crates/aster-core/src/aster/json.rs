@@ -563,6 +563,55 @@ pub struct PositionRisk {
     /// In the symbol's margin asset, at the mark price.
     #[serde(deserialize_with = "dec_f64", rename = "unRealizedProfit")]
     pub unrealized: f64,
+    /// The symbol's leverage on this account (`"leverage": "21"`), whether or not a position is
+    /// open. Lenient where the money fields are strict: a row that does not say, or says
+    /// something that is no whole number above zero, reads as `None` — the terminal then shows
+    /// the leverage as unknown, and the position it sits beside still counts.
+    #[serde(default, deserialize_with = "leverage_of")]
+    pub leverage: Option<i32>,
+}
+
+fn leverage_of<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.and_then(|v| match v {
+        serde_json::Value::String(s) => s.trim().parse::<i32>().ok(),
+        serde_json::Value::Number(n) => n.as_i64().and_then(|n| i32::try_from(n).ok()),
+        _ => None,
+    })
+    .filter(|&l| l > 0))
+}
+
+/// `POST /fapi/v3/leverage`: `{"leverage": 21, "maxNotionalValue": "1000000", "symbol": "BTCUSDT"}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LeverageSet {
+    pub leverage: i32,
+    pub symbol: String,
+}
+
+/// One symbol of `GET /fapi/v3/leverageBracket`: the brackets run from the smallest notional up,
+/// and the first one allows the highest leverage.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SymbolBrackets {
+    pub symbol: String,
+    #[serde(default)]
+    pub brackets: Vec<LeverageBracket>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LeverageBracket {
+    #[serde(rename = "initialLeverage")]
+    pub initial_leverage: i32,
+}
+
+impl SymbolBrackets {
+    /// The highest leverage any bracket allows, `None` when there is none above zero.
+    pub fn max_leverage(&self) -> Option<i32> {
+        self.brackets
+            .iter()
+            .map(|b| b.initial_leverage)
+            .filter(|&l| l > 0)
+            .max()
+    }
 }
 
 /// An order as `POST`, `DELETE` and `GET /fapi/v3/order` answer it (docs:
@@ -1040,6 +1089,40 @@ mod stream_tests {
         .unwrap();
         assert_eq!((p[0].amount, p[0].entry_price), (20.0, 6563.665));
         assert_eq!((p[1].amount, p[1].unrealized), (-10.0, -1156.4671178));
+    }
+
+    #[test]
+    fn leverage_is_read_leniently_from_the_position_rows_and_the_brackets() {
+        let rows: Vec<PositionRisk> = serde_json::from_str(
+            r#"[{"symbol":"A","positionAmt":"1","entryPrice":"1","unRealizedProfit":"0","leverage":"21"},
+                {"symbol":"B","positionAmt":"1","entryPrice":"1","unRealizedProfit":"0","leverage":7},
+                {"symbol":"C","positionAmt":"1","entryPrice":"1","unRealizedProfit":"0"},
+                {"symbol":"D","positionAmt":"1","entryPrice":"1","unRealizedProfit":"0","leverage":"x"},
+                {"symbol":"E","positionAmt":"1","entryPrice":"1","unRealizedProfit":"0","leverage":"0"}]"#,
+        )
+        .unwrap();
+        let got: Vec<Option<i32>> = rows.iter().map(|r| r.leverage).collect();
+        assert_eq!(got, [Some(21), Some(7), None, None, None]);
+
+        let set: LeverageSet = serde_json::from_str(
+            r#"{"leverage":21,"maxNotionalValue":"1000000","symbol":"BTCUSDT"}"#,
+        )
+        .unwrap();
+        assert_eq!((set.leverage, set.symbol.as_str()), (21, "BTCUSDT"));
+
+        let b: Vec<SymbolBrackets> = serde_json::from_str(
+            r#"[{"symbol":"BTCUSDT","brackets":[
+                 {"bracket":2,"initialLeverage":50,"notionalCap":50000,"notionalFloor":10000,"maintMarginRatio":0.01,"cum":0.0},
+                 {"bracket":1,"initialLeverage":125,"notionalCap":10000,"notionalFloor":0,"maintMarginRatio":0.004,"cum":0.0}]},
+                {"symbol":"X","brackets":[]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            b[0].max_leverage(),
+            Some(125),
+            "the highest, whatever the order"
+        );
+        assert_eq!(b[1].max_leverage(), None);
     }
 
     #[test]

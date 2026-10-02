@@ -166,6 +166,14 @@ pub enum FeedEvent {
         request_uid: u64,
         result: Result<Vec<HistoryTrade>, String>,
     },
+    /// The exchange's answer to a `SetLeverage` of a terminal: the leverage it now holds, or why
+    /// not (`trading::Leverager`).
+    LeverageSet {
+        client_id: u64,
+        request_uid: u64,
+        symbol: String,
+        result: Result<i32, String>,
+    },
     /// An outcome of the order worker (`trading.rs`).
     Trading(crate::trading::TradingEvent),
     /// An `ORDER_TRADE_UPDATE` of the account's user-data stream.

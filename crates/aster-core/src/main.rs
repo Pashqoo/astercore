@@ -371,6 +371,23 @@ fn main() -> ExitCode {
                             .map(|p| format!(" {} {}@{}", p.symbol, p.size, p.entry))
                             .collect::<String>()
                     );
+                    // The leverage the account may ask for, per market. Not fatal: without it
+                    // the catalog keeps the instrument's own ceiling (`Market::max_leverage`),
+                    // which never promises more than the exchange allows.
+                    match account_rest
+                        .leverage_brackets(&mut signer, |s| symbols_of_account.rows.contains(s))
+                    {
+                        Ok(rows) => {
+                            let taken = cat.apply_leverage_brackets(&rows);
+                            println!(
+                                "leverage: {taken} of {} markets from the account's brackets",
+                                symbols_of_account.rows.len()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("leverage: brackets: {e} — the instrument's ceiling stands")
+                        }
+                    }
                     Some((account_rest, signer, a))
                 }
                 Err(e) => {

@@ -42,9 +42,10 @@ const ALIAS_1000: &str = "1000";
 
 /// Highest leverage this core will ever claim for a market.
 ///
-/// Only a sanity bound on arithmetic over an exchange-reported percent: the
-/// real figure per market comes from `/fapi/v1/leverageBracket` in M2. Measured
-/// 01.10 the catalog implies 2× to 20× and nothing near this.
+/// Only a sanity bound on arithmetic over an exchange-reported percent
+/// (`Market::max_leverage`'s estimate). The account's own figure per market comes from
+/// `/fapi/v3/leverageBracket` (`Market::bracket_leverage`) and is not cut by it. Measured 01.10
+/// the catalog implies 2× to 20× and nothing near this.
 const MAX_LEVERAGE: i32 = 125;
 
 /// Funding on a market, in the units the EXCHANGE states them.
@@ -237,11 +238,14 @@ pub struct Market {
     pub maint_margin_percent: f64,
     /// Initial margin, percent. The ceiling it implies — `100 /
     /// required_margin_percent`, so 5.0 means 20× — is only an upper bound, not
-    /// this account's leverage: the real figure comes from
-    /// `/fapi/v1/leverageBracket` and `ACCOUNT_CONFIG_UPDATE`, which is why this
-    /// carries the percent rather than a `leverage` field that would read as
-    /// authoritative.
+    /// this account's leverage: the account's own comes from `/fapi/v3/leverageBracket`
+    /// ([`Market::bracket_leverage`]) and `positionRisk`, which is why this carries the percent
+    /// rather than a `leverage` field that would read as authoritative.
     pub required_margin_percent: f64,
+    /// The highest leverage the account may ask for on this market, from the first bracket of
+    /// `/fapi/v3/leverageBracket`. `None` until that read lands (or when it never does), and
+    /// [`Market::max_leverage`] then falls back on the instrument's own ceiling.
+    pub bracket_leverage: Option<i32>,
     pub liquidation_fee: f64,
 
     /// `TRADING` right now. The whole of TInvestCore's trading-schedule gate
@@ -362,20 +366,25 @@ impl Market {
             .map(|_| coin)
     }
 
-    /// Highest leverage the INSTRUMENT allows, from its initial-margin percent.
+    /// Highest leverage the market allows: the account's own, from the first bracket of
+    /// `/fapi/v3/leverageBracket` ([`Market::bracket_leverage`]) when that read landed, else the
+    /// INSTRUMENT's ceiling from its initial-margin percent, below.
     ///
     /// `requiredMarginPercent` 5.0 means 5 % of the notional must be posted, so
     /// 20×. Measured 01.10 over the 596 USDT perpetuals: 33.33 % on 358 (3×),
     /// 5 % on 123 (20×), 50 % on 74 (2×), 20 % on 32, 25 % on 5, 10 % on 4.
     ///
-    /// This is the instrument's ceiling, **not** this account's leverage, which
-    /// needs the signed `/fapi/v1/leverageBracket` call M2 brings. It goes on
+    /// This estimate is the instrument's ceiling, **not** this account's leverage; it stands
+    /// only where the brackets did not arrive. It goes on
     /// the wire because the field there is a maximum (`max_leverage`, which the
     /// terminal shows as the market's cap) and because the alternative is a 0
     /// or a 1 — a statement that this venue has no leverage at all. A missing
     /// or unreadable percent gives 1 for the same reason the sizing rules
     /// refuse rather than guess: 1× cannot over-promise.
     pub fn max_leverage(&self) -> i32 {
+        if let Some(l) = self.bracket_leverage {
+            return l.max(1);
+        }
         let p = self.required_margin_percent;
         if !p.is_finite() || p <= 0.0 {
             return 1;
@@ -1030,6 +1039,25 @@ impl Catalog {
         filled
     }
 
+    /// The account's highest leverage per market, from `/fapi/v3/leverageBracket`
+    /// (`Market::bracket_leverage`). Returns how many markets took a figure.
+    pub fn apply_leverage_brackets(
+        &mut self,
+        rows: &[crate::aster::json::SymbolBrackets],
+    ) -> usize {
+        let mut taken = 0;
+        for r in rows {
+            let Some(max) = r.max_leverage() else {
+                continue;
+            };
+            if let Some(m) = self.markets.iter_mut().find(|m| m.symbol == r.symbol) {
+                m.bracket_leverage = Some(max);
+                taken += 1;
+            }
+        }
+        taken
+    }
+
     /// Merge one `ticker/bookTicker` answer: the top of book per market.
     ///
     /// The answer is the exchange's COMPLETE word on what is quoted, not a
@@ -1448,6 +1476,7 @@ fn market_of(s: &SymbolInfo) -> Market {
         market_take_bound: s.market_take_bound,
         maint_margin_percent: s.maint_margin_percent,
         required_margin_percent: s.required_margin_percent,
+        bracket_leverage: None,
         liquidation_fee: s.liquidation_fee,
         trading: s.status == "TRADING",
         has_sessions: has_sessions(&s.channel),
@@ -1590,6 +1619,7 @@ pub(crate) mod fixtures {
             market_take_bound: 0.02,
             maint_margin_percent: 2.5,
             required_margin_percent: 5.0,
+            bracket_leverage: None,
             liquidation_fee: 0.025,
             trading: true,
             has_sessions: false,
@@ -1675,6 +1705,7 @@ mod tests {
             market_take_bound: 0.02,
             maint_margin_percent: 2.5,
             required_margin_percent: 5.0,
+            bracket_leverage: None,
             liquidation_fee: 0.025,
             trading: true,
             has_sessions: false,
@@ -2153,6 +2184,41 @@ mod tests {
             assert_eq!(m.alias_1000(), None, "{base}");
             assert_eq!(spec_of(&m).k1000, 1, "{base}");
         }
+    }
+
+    #[test]
+    fn the_accounts_brackets_override_the_instruments_ceiling_only_where_they_exist() {
+        use crate::aster::json::{LeverageBracket, SymbolBrackets};
+        let mut cat = Catalog::of(vec![fixtures::market("BTCUSDT", "BTC", 0.1, 0.001)]);
+        assert_eq!(
+            cat.markets()[0].max_leverage(),
+            20,
+            "the margin percent's ceiling"
+        );
+        let rows = [
+            SymbolBrackets {
+                symbol: "BTCUSDT".into(),
+                brackets: vec![LeverageBracket {
+                    initial_leverage: 125,
+                }],
+            },
+            SymbolBrackets {
+                symbol: "NOPEUSDT".into(),
+                brackets: vec![LeverageBracket {
+                    initial_leverage: 50,
+                }],
+            },
+            SymbolBrackets {
+                symbol: "BTCUSDT".into(),
+                brackets: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            cat.apply_leverage_brackets(&rows),
+            1,
+            "one known market took a figure"
+        );
+        assert_eq!(cat.markets()[0].max_leverage(), 125);
     }
 
     #[test]

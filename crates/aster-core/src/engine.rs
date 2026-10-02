@@ -75,6 +75,8 @@ pub const SERVER_VERSION: i32 = 1;
 const EXCHANGE_TYPE_FUTURES: u8 = 0x02;
 /// Largest payload the core will accept from one client, reported in AuthCheck.
 const MAX_PAYLOAD: i32 = 4 * 1024 * 1024;
+/// How long a confirmed leverage change is held over an account read that may predate it.
+const LEVERAGE_HOLD_MS: i64 = 20_000;
 /// What AuthCheck reports as the account: Aster has no account id to report
 /// (`CoreHandler::account_id`).
 ///
@@ -287,6 +289,10 @@ pub struct CoreHandler {
     warmup_done: bool,
     /// `RequestCandlesData` uids held until the warm-up ends (client → uid).
     candles_pending: HashMap<u64, u64>,
+    /// Leverage the exchange confirmed to a `SetLeverage`, by symbol, with the time: a read of the
+    /// account that began before the change reaches the engine after it, and without this would
+    /// put the old figure back on the terminal's rows (`LEVERAGE_HOLD_MS`).
+    leverage_confirmed: HashMap<String, (i32, i64)>,
     health_at: i64,
     load_at: Stamp,
     feed_lost: bool,
@@ -408,6 +414,7 @@ impl CoreHandler {
             candles: Candles5m::default(),
             warmup_done: true,
             candles_pending: HashMap::new(),
+            leverage_confirmed: HashMap::new(),
             health_at: 0,
             load_at: Stamp::now(),
             feed_lost: false,
@@ -950,6 +957,35 @@ impl CoreHandler {
                 self.feed_lost = true;
             }
             FeedEvent::Trading(ev) => self.on_trading(ev),
+            FeedEvent::LeverageSet {
+                client_id,
+                request_uid,
+                symbol,
+                result,
+            } => {
+                let method = EngineMethod::SetLeverage;
+                let resp = match &result {
+                    Ok(leverage) => {
+                        // Told to every terminal at once. A read of the account that began
+                        // before the change is held to it for `LEVERAGE_HOLD_MS`; a later one
+                        // says what the exchange holds, and is what stays.
+                        self.leverage_confirmed
+                            .insert(symbol, (*leverage, now_ms()));
+                        if self.account.is_some() {
+                            self.hold_confirmed_leverage(now_ms());
+                            let payload = self.balance_payload(rand_uid());
+                            for s in sessions.iter_mut() {
+                                s.send_encrypted(BALANCE, &payload, true);
+                            }
+                        }
+                        engine::response_ok(request_uid, method, &[])
+                    }
+                    Err(e) => engine::response_err(request_uid, method, 0, e),
+                };
+                if let Some(s) = sessions.iter_mut().find(|s| s.client_id() == client_id) {
+                    s.send_encrypted(API, &resp, true);
+                }
+            }
             FeedEvent::UserOrder(o) => {
                 self.note_commission(&o);
                 let step = self.catalog.get(&o.symbol).map_or(0.0, |m| m.step_size);
@@ -994,6 +1030,7 @@ impl CoreHandler {
                 self.shots
                     .set_free_balance(account.as_ref().map(|a| a.free));
                 self.account = account;
+                self.hold_confirmed_leverage(now_ms());
                 let payload = self.balance_payload(rand_uid());
                 for s in sessions.iter_mut() {
                     s.send_encrypted(BALANCE, &payload, true);
@@ -1302,6 +1339,35 @@ impl CoreHandler {
             // order model is written against; hedge mode is M5+ (`PLAN.md`).
             // (Startup refuses an account in hedge mode, `main.rs`: the answer is true to it.)
             EngineMethod::QueryHedgeMode => engine::write_hedge_mode(false),
+            // The leverage of one market, on the exchange: answered when the exchange has, with the
+            // outcome only (`FeedEvent::LeverageSet`); the new figure reaches the terminal in the
+            // balance rows it already reads.
+            EngineMethod::SetLeverage => {
+                let Some(leverage) = req
+                    .params
+                    .first_chunk::<4>()
+                    .map(|b| i32::from_le_bytes(*b))
+                    .filter(|&l| l >= 1)
+                else {
+                    return self.reply_err(session, &req, "leverage must be a whole number from 1");
+                };
+                if self.catalog.get(&req.market_name).is_none() {
+                    return self.reply_err(session, &req, "unknown market");
+                }
+                let Some(tx) = &self.trading else {
+                    return self.reply_err(session, &req, "no account: this core only emulates");
+                };
+                let job = TradeCommand::SetLeverage {
+                    client_id: client,
+                    request_uid: req.uid,
+                    symbol: req.market_name.clone(),
+                    leverage,
+                };
+                if tx.send(job).is_err() {
+                    self.reply_err(session, &req, "the order path is gone");
+                }
+                return;
+            }
             // «Cancel ALL orders»: ok at once with no data; the result reaches the terminal as
             // the order images of the cancelled entries.
             EngineMethod::CancelAllOrders => {
@@ -3168,6 +3234,18 @@ impl CoreHandler {
         }
     }
 
+    /// Puts the leverage the exchange confirmed within [`LEVERAGE_HOLD_MS`] over the account's
+    /// own, and forgets the older ones.
+    fn hold_confirmed_leverage(&mut self, now: i64) {
+        self.leverage_confirmed
+            .retain(|_, (_, at)| now - *at < LEVERAGE_HOLD_MS);
+        if let Some(a) = &mut self.account {
+            for (symbol, (leverage, _)) in &self.leverage_confirmed {
+                a.leverage.insert(symbol.clone(), *leverage);
+            }
+        }
+    }
+
     /// `TBalanceFull` of the last account read: free, locked and equity in
     /// USDT, a row per open position. A market missing from the rows is flat —
     /// the client resets every market a full snapshot leaves out.
@@ -3180,16 +3258,32 @@ impl CoreHandler {
         let Some(a) = &self.account else {
             return balance::balance_full(uid, self.balance_epoch, 0.0, 0.0, 0.0, &[]);
         };
-        let items: Vec<balance::BalanceItem> = a
+        // A row per open position, carrying its market's leverage when the exchange stated it,
+        // and a leverage-only row for every other market that has one: the terminal reads the
+        // leverage of the market on its chart from the rows, and a market left out of a full
+        // snapshot is read as flat with the default leverage.
+        let mut items: Vec<balance::BalanceItem> = a
             .positions
             .iter()
             .map(|p| balance::BalanceItem {
                 market: &p.symbol,
                 pos_size: p.size,
                 pos_price: p.entry,
+                leverage: a.leverage.get(&p.symbol).copied().unwrap_or(0),
                 ..balance::BalanceItem::default()
             })
             .collect();
+        items.extend(
+            a.leverage
+                .iter()
+                .filter(|(symbol, _)| !a.positions.iter().any(|p| &p.symbol == *symbol))
+                .map(|(symbol, &leverage)| balance::BalanceItem {
+                    market: symbol,
+                    leverage,
+                    leverage_only: true,
+                    ..balance::BalanceItem::default()
+                }),
+        );
         balance::balance_full(
             uid,
             self.balance_epoch,
