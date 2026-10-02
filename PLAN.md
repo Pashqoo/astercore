@@ -430,11 +430,11 @@ loopback + 54 теста серверной части вендора, `tools/ch
 - [x] `settings.rs:188`, `:31`, `:238` — `derive(Debug)` на структурах с токеном и паролем
   (web.rs:788 для `Request` его намеренно нет). Ручной Debug «set/not set».
   **02.10:** ручной `Debug` для `Telegram`/`Web`/`Edit`, тест `debug_output_hides_the_secrets`; то же для `ListenKey`.
-- [ ] `settings.rs:467` — `.mode(0o600)` только при создании tmp; оставшийся `config.json.tmp` с
+- [x] `settings.rs:467` — `.mode(0o600)` только при создании tmp; оставшийся `config.json.tmp` с
   широкими правами переносит их на `config.json`.
-  **02.10:** старый `.tmp` удаляется перед записью, `sync_all`; теста нет.
-- [ ] `web.rs:476` — `/logout` не за `tagged`.
-  **02.10:** `/logout` за `tagged`; теста нет.
+  **02.10:** старый `.tmp` удаляется перед записью (`sync_all` тестом не наблюдается); тест `a_stale_wide_tmp_does_not_widen_the_saved_file` (без `remove_file` падает: 0o666 уходит в `config.json`).
+- [x] `web.rs:476` — `/logout` не за `tagged`.
+  **02.10:** `/logout` за `tagged`; тест `a_logout_needs_the_pages_header` (без условия падает: 200 вместо 403, сессия теряется).
 - [ ] `web.rs:54`, `:184` — при bind в сеть 8 слотов × 20 с: 8 праздных сокетов → 503.
   **02.10:** таймаут чтения шапки 5 с; теста нет.
 - [ ] `telegram.rs:1087` — PIN из `SystemTime` + LCG, `/dev/urandom` уже читается в web.rs.

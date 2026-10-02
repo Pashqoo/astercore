@@ -901,6 +901,26 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A `config.json.tmp` a crash left with wide rights is not the file the next save renames
+    /// into place: `.mode` applies at creation only.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_wide_tmp_does_not_widen_the_saved_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("stale-tmp");
+        let path = dir.join("config.json");
+        let loaded = load_or_create(&path, &Migration::default()).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, "stale").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o666)).unwrap();
+        loaded.settings.save(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(!tmp.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_file_is_private_when_created_and_when_saved() {

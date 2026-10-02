@@ -977,6 +977,24 @@ mod tests {
         assert_eq!(page.code, 200);
     }
 
+    /// A site the trader has open could post a logout on the page's behalf: without the page's
+    /// header the session stays; with it, it goes.
+    #[test]
+    fn a_logout_needs_the_pages_header() {
+        let (web, _rx) = web("s3cret");
+        let ok = route(&web, &post("/login", r#"{"password":"s3cret"}"#, ""));
+        assert_eq!(ok.code, 200);
+        let sid = web.guard().sessions[0].0.clone();
+        let mut foreign = post("/logout", "", &sid);
+        foreign.tagged = false;
+        assert_eq!(route(&web, &foreign).code, 403);
+        assert_eq!(web.guard().sessions.len(), 1, "the session survived");
+        let out = route(&web, &post("/logout", "", &sid));
+        assert_eq!(out.code, 200);
+        assert_eq!(out.cookie.as_deref().map(|c| c.contains(&sid)), Some(false));
+        assert!(web.guard().sessions.is_empty());
+    }
+
     /// DNS rebinding: a foreign name pointed at the loopback port reaches an open page with its
     /// own `Host`, and is refused; the machine's own names are not.
     #[test]
