@@ -860,10 +860,10 @@ impl CoreHandler {
                     None => log::warn!("order: unreadable report of {} {}", o.symbol, o.id),
                 }
             }
-            // Read once the session is likely subscribed — its handshake
-            // measured 0.83 s: a read made before it leaves a window that
-            // neither the read nor the stream covers. Retries in between fold
-            // into the one read.
+            // Read a moment after the session opened (`UserStreamOpen` comes once its
+            // handshake is through): a read made before the subscription leaves a window that
+            // neither the read nor the stream covers. Retries in between fold into the one
+            // read.
             FeedEvent::UserStreamClosed => self.shots.set_fills_seen(false),
             FeedEvent::UserStreamOpen => {
                 self.shots.set_fills_seen(true);

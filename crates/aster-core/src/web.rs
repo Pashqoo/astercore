@@ -104,6 +104,7 @@ pub fn start(settings: &Settings, control: Sender<ControlCmd>, meter: Option<Arc
             fails: 0,
             blocked_until: 0,
         }),
+        bound: addr.ip().to_string(),
         live: AtomicUsize::new(0),
     });
     if let Err(e) = thread::Builder::new()
@@ -122,6 +123,8 @@ struct Web {
     /// and nothing counted.
     meter: Option<Arc<ApiMeter>>,
     guard: Mutex<Guard>,
+    /// The address the page is bound to, as a `Host` header names it.
+    bound: String,
     /// Connections being served, against [`MAX_CONNS`].
     live: AtomicUsize,
 }
@@ -247,7 +250,31 @@ struct Request {
     /// never given. Without it any page the trader has open in another tab
     /// could POST `/api/panic` at the loopback port, cookie or no cookie.
     tagged: bool,
+    /// The `Host` header, as the browser sent it.
+    host: String,
     body: Vec<u8>,
+}
+
+/// Whether `host` (a `Host` header, port and all) names this machine's loopback or the address
+/// the page is bound to. A page without a password is protected by being loopback only; a name
+/// that merely resolves there (DNS rebinding: the attacker's domain pointed at 127.0.0.1) makes
+/// a foreign page same-origin with it, and the `Host` it sends gives it away.
+fn host_ok(host: &str, bound: &str) -> bool {
+    // No `Host` at all is no rebinding browser (they always send one): HTTP/1.0 tools and curl
+    // without it are the operator's own.
+    if host.trim().is_empty() {
+        return true;
+    }
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split_once(']').map_or(rest, |(ip, _)| ip)
+    } else if host.matches(':').count() > 1 {
+        // A bare IPv6 address: the colons are its own.
+        host
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _)| name)
+    };
+    let name = name.to_ascii_lowercase();
+    matches!(name.as_str(), "localhost" | "127.0.0.1" | "::1") || name == bound
 }
 
 fn read_request(stream: &TcpStream) -> Result<Request, String> {
@@ -261,7 +288,7 @@ fn read_request(stream: &TcpStream) -> Result<Request, String> {
     let method = parts.next().ok_or("no method")?.to_owned();
     let target = parts.next().ok_or("no target")?;
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let (mut len, mut sid, mut tagged) = (0usize, String::new(), false);
+    let (mut len, mut sid, mut tagged, mut host) = (0usize, String::new(), false, String::new());
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -275,6 +302,7 @@ fn read_request(stream: &TcpStream) -> Result<Request, String> {
             }
             "cookie" => sid = cookie(value, "sid"),
             "x-astercore" => tagged = true,
+            "host" => host = value.to_owned(),
             _ => {}
         }
     }
@@ -288,6 +316,7 @@ fn read_request(stream: &TcpStream) -> Result<Request, String> {
         query: query.to_owned(),
         sid,
         tagged,
+        host,
         body,
     })
 }
@@ -469,11 +498,16 @@ struct ScreenAsk {
 
 fn route(web: &Web, req: &Request) -> Response {
     let now = now_ms();
+    // Without a password the page is open to whoever reaches the port, and that is safe only
+    // for requests that name this machine.
+    if web.guard().open() && !host_ok(&req.host, &web.bound) {
+        return Response::plain(403, "unknown host");
+    }
     let authed = web.guard().authed(&req.sid, now);
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => Response::html(if authed { PAGE } else { LOGIN }),
         ("POST", "/login") => login(web, req, now),
-        ("POST", "/logout") => {
+        ("POST", "/logout") if req.tagged => {
             let mut guard = web.guard();
             guard.sessions.retain(|(id, _)| *id != req.sid);
             Response::plain(200, "logged out").with_cookie("")
@@ -859,6 +893,7 @@ mod tests {
                     fails: 0,
                     blocked_until: 0,
                 }),
+                bound: "127.0.0.1".into(),
                 live: AtomicUsize::new(0),
             },
             rx,
@@ -872,6 +907,7 @@ mod tests {
             query: String::new(),
             sid: sid.into(),
             tagged: true,
+            host: "127.0.0.1:3102".into(),
             body: body.as_bytes().to_vec(),
         }
     }
@@ -926,10 +962,43 @@ mod tests {
                 query: String::new(),
                 sid: String::new(),
                 tagged: false,
+                host: "localhost:3102".into(),
                 body: Vec::new(),
             },
         );
         assert_eq!(page.code, 200);
+    }
+
+    /// DNS rebinding: a foreign name pointed at the loopback port reaches an open page with its
+    /// own `Host`, and is refused; the machine's own names are not.
+    #[test]
+    fn an_open_page_answers_only_to_its_own_host() {
+        for ok in [
+            "127.0.0.1:3102",
+            "localhost:3102",
+            "[::1]:3102",
+            "LOCALHOST",
+            "10.0.0.5:80",
+        ] {
+            assert!(host_ok(ok, "10.0.0.5"), "{ok}");
+        }
+        assert!(host_ok("::1", "127.0.0.1") && host_ok("", "127.0.0.1"));
+        for bad in [
+            "evil.example:3102",
+            "127.0.0.1.evil.example",
+            "localhost.evil.example",
+        ] {
+            assert!(!host_ok(bad, "127.0.0.1"), "{bad:?}");
+        }
+        let (open, _rx) = web("");
+        let mut req = post("/api/panic", "", "");
+        req.host = "rebind.example:3102".into();
+        assert_eq!(route(&open, &req).code, 403);
+        // With a password the login is the guard, wherever the page is reached from.
+        let (locked, _rx) = web("s3cret");
+        let mut req = post("/login", "{}", "");
+        req.host = "rebind.example:3102".into();
+        assert_ne!(route(&locked, &req).code, 403);
     }
 
     /// Wrong passwords are throttled; the right one never is. A block that

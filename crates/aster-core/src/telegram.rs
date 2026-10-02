@@ -1083,8 +1083,23 @@ fn updates_of(json: &Value) -> Vec<Update> {
 }
 
 /// Six digits nobody can guess from the outside: the chat that sends them back
-/// gets to stop the core (Ф3), so it is not a counter.
+/// gets to stop the core (Ф3), so it is not a counter. The kernel's randomness where there is
+/// one; a clock mix only where there is none (non-unix), which the PIN's short life and the
+/// chat binding make tolerable — unlike a session id, which has no fallback.
 fn new_pin() -> String {
+    // The kernel's randomness first, as the page's session ids take it; the clock mix below is
+    // the fallback where there is none.
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        let mut bytes = [0u8; 8];
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut bytes))
+            .is_ok()
+        {
+            return format!("{:06}", u64::from_le_bytes(bytes) % 1_000_000);
+        }
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1107,9 +1122,16 @@ fn agent_for(proxy: &str, global: Duration) -> Agent {
         "" => None,
         raw => match Proxy::new(&with_scheme(raw)) {
             Ok(p) => Some(p),
+            // Never direct: the setting says the traffic goes through the operator's proxy,
+            // and the bot token and chat ride on it. A proxy that is not one fails closed — to
+            // a port nothing listens on — so the failure shows in the journal and nothing
+            // leaves the host by another road.
             Err(e) => {
-                log::error!("telegram: proxy {raw:?} is not a proxy url ({e}); going direct");
-                None
+                log::error!(
+                    "telegram: proxy {:?} is not a proxy url ({e}); sending is off",
+                    redact_proxy(raw)
+                );
+                Proxy::new("socks5://127.0.0.1:1").ok()
             }
         },
     };
@@ -1120,6 +1142,36 @@ fn agent_for(proxy: &str, global: Duration) -> Agent {
         .proxy(proxy)
         .build()
         .new_agent()
+}
+
+/// Whether `raw` is a proxy the agent can use (`host:port` is read as SOCKS5): what the page
+/// checks before it saves one.
+pub fn check_proxy(raw: &str) -> Result<(), String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    Proxy::new(&with_scheme(raw)).map(|_| ()).map_err(|e| {
+        format!(
+            "telegram.proxy {:?} is not a proxy url: {e}",
+            redact_proxy(raw)
+        )
+    })
+}
+
+/// A proxy url with the `user:password@` of it taken out: what may be written to the journal
+/// or put in an error message. (The settings view still shows the operator the proxy as saved.)
+fn redact_proxy(raw: &str) -> String {
+    match raw.split_once("://") {
+        Some((scheme, rest)) => match rest.rsplit_once('@') {
+            Some((_, host)) => format!("{scheme}://***@{host}"),
+            None => raw.to_owned(),
+        },
+        None => match raw.rsplit_once('@') {
+            Some((_, host)) => format!("***@{host}"),
+            None => raw.to_owned(),
+        },
+    }
 }
 
 /// `127.0.0.1:1080` is a SOCKS5 proxy — the server's xray, the one the core

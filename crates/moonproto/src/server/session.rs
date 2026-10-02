@@ -122,6 +122,9 @@ pub struct Session {
     rtt_ms: i32,
     last_ping_sent: i64,
     pub(crate) last_recv: i64,
+    /// The last `on_packet` carried a Crypted packet that passed AES-GCM and the replay window:
+    /// the only kind of packet that may move the client's address.
+    pub(crate) fresh_crypted: bool,
     probe: Option<(u16, i64)>,
     total_sent: u64,
     total_recv: u64,
@@ -180,6 +183,7 @@ impl Session {
             rtt_ms: 0,
             last_ping_sent: 0,
             last_recv: now,
+            fresh_crypted: false,
             probe: None,
             total_sent: 0,
             total_recv: 0,
@@ -443,6 +447,7 @@ impl Session {
             cmd = inner;
             data = plain;
             was_crypted = true;
+            self.fresh_crypted = true;
         } else {
             data = payload.to_vec();
         }

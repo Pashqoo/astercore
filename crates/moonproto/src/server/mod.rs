@@ -194,11 +194,15 @@ impl<H: Handler> Server<H> {
                     log::debug!(target: "moonproto::server", "cmd {cmd} from unauthorized client {client_id:#x}");
                     return;
                 }
-                if s.addr != from {
-                    log::debug!(target: "moonproto::server", "client {client_id:#x} moved {} -> {from}", s.addr);
-                }
-                s.addr = from;
+                // The address follows a packet that proved itself — authenticated and not a
+                // replay. A captured datagram sent again from elsewhere has a valid MAC, and
+                // must not take the replies of the session with it.
+                s.fresh_crypted = false;
                 s.on_packet(cmd, &payload, datagram.len(), &mut self.delivered);
+                if s.fresh_crypted && s.addr != from {
+                    log::debug!(target: "moonproto::server", "client {client_id:#x} moved {} -> {from}", s.addr);
+                    s.addr = from;
+                }
                 let delivered = std::mem::take(&mut self.delivered);
                 for d in delivered {
                     match d {

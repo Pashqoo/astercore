@@ -38,7 +38,11 @@ pinned to a tree that was not merged. To recover:
 MSG
   exit 1
 fi
+# The pin is committed only once the vendor check passes: a rev that is not the upstream tree
+# plus our hook must not be recorded as the one in use.
 echo "$REV" > MOONPROTO_REV
-git add MOONPROTO_REV && git commit -qm "moonproto: pin $REV"
 tools/check-vendor.sh
-echo "synced $CUR -> $REV; run: cargo test --workspace"
+git add MOONPROTO_REV && git commit -qm "moonproto: pin $REV"
+echo "synced $CUR -> $REV. NEXT: leak-review of the delta BEFORE the first build or test —"
+echo "  node ~/.claude/pipeline/leak-check.js diff --out <file>, then the leak-review agent."
+echo "  Only then: cargo test --workspace"

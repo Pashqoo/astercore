@@ -22,6 +22,16 @@ Wants=network-online.target
 Type=simple
 # The directory holds aster-core.key (the terminal's key), asterkey (the API
 # wallet, mode 600), data/ and logs/ — see AGENTS.md, «## Secrets».
+# The core runs as its own user, with the filesystem read-only but for its directory
+# (`useradd --system aster`, `chown -R aster:aster /opt/aster-core` — README, step 2): it holds
+# the exchange wallet's key and the terminal's, and needs nothing else on the host.
+User=aster
+Group=aster
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/aster-core
+ProtectHome=true
+PrivateTmp=true
 WorkingDirectory=/opt/aster-core
 ExecStart=/opt/aster-core/aster-core
 Environment=ASTER_API_KEY_FILE=/opt/aster-core/asterkey

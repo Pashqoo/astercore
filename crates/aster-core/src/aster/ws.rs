@@ -150,9 +150,11 @@ impl Beat {
         }
     }
 
+    /// A session opened. Not a frame: the beat stays as the last frame left it, or a gateway
+    /// that accepts the handshake and says nothing would keep the stream «alive» through
+    /// every reconnect, each shorter than the staleness bound.
     fn opened(&self) {
         self.0[2].fetch_add(1, Ordering::Relaxed);
-        self.touch();
     }
 
     /// Sessions opened since the stream was created.
@@ -216,19 +218,27 @@ pub fn run(
         !streams.is_empty() && streams.len() <= MAX_STREAMS,
         "a session carries 1..={MAX_STREAMS} streams"
     );
-    run_at(HOST, url(streams), idle, stop, beat, |text| {
-        match serde_json::from_str::<Envelope>(text) {
-            Ok(env) => on_frame(env.data),
-            // One frame lost, not the session: the next one is a whole
-            // snapshot for every stream this core reads except the tape, and a
-            // frame that does not decode is a format change the journal must
-            // name.
-            Err(e) => log::warn!(
-                "ws: undecodable frame ({e}): {}",
-                text.chars().take(160).collect::<String>()
-            ),
-        }
-    })
+    run_at(
+        HOST,
+        url(streams),
+        idle,
+        stop,
+        beat,
+        || {},
+        |text| {
+            match serde_json::from_str::<Envelope>(text) {
+                Ok(env) => on_frame(env.data),
+                // One frame lost, not the session: the next one is a whole
+                // snapshot for every stream this core reads except the tape, and a
+                // frame that does not decode is a format change the journal must
+                // name.
+                Err(e) => log::warn!(
+                    "ws: undecodable frame ({e}): {}",
+                    text.chars().take(160).collect::<String>()
+                ),
+            }
+        },
+    )
 }
 
 /// [`run`] for any `url` on `host`, every text frame handed on as it came:
@@ -241,15 +251,33 @@ pub fn run_at(
     idle: Duration,
     stop: &AtomicBool,
     beat: &Beat,
+    on_open: impl FnOnce(),
     mut on_text: impl FnMut(&str),
 ) -> Result<(), Error> {
-    let addr = (host, 443)
+    // Every address the name resolves to, in turn: a dual-stack host whose IPv6 does not route
+    // would otherwise fail every session on its first address for good (REST tries them all).
+    let addrs: Vec<_> = (host, 443)
         .to_socket_addrs()
         .map_err(|e| Error::Connect(format!("resolve {host}: {e}")))?
-        .next()
-        .ok_or_else(|| Error::Connect(format!("resolve {host}: no address")))?;
-    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .map_err(|e| Error::Connect(e.to_string()))?;
+        .collect();
+    if addrs.is_empty() {
+        return Err(Error::Connect(format!("resolve {host}: no address")));
+    }
+    let mut last = String::new();
+    let mut connected = None;
+    for addr in &addrs {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
+            Ok(tcp) => {
+                connected = Some(tcp);
+                break;
+            }
+            Err(e) => last = format!("{addr}: {e}"),
+        }
+    }
+    let tcp = connected.ok_or(Error::Connect(last))?;
     // A second handle on the same socket, so the read timeout can be moved
     // from the handshake's bound to the poll period once TLS owns the first.
     let knob = tcp.try_clone().map_err(|e| Error::Connect(e.to_string()))?;
@@ -263,10 +291,15 @@ pub fn run_at(
         tungstenite::client_tls(url, tcp).map_err(|e| Error::Connect(e.to_string()))?;
     set_timeout(READ_POLL)?;
     beat.opened();
+    on_open();
     let deadline = Instant::now() + beat.session(Stamp::now().wall);
 
     let mut heard = Instant::now();
-    let mut pinged = Instant::now();
+    // The first ping goes out at once: its pong is the first sign of life of a session that
+    // opens on a quiet stream, and the beat no longer takes the handshake for one.
+    let mut pinged = Instant::now()
+        .checked_sub(PING_EVERY)
+        .unwrap_or_else(Instant::now);
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
         if heard.elapsed() >= idle {
             return Err(Error::Transport(format!(

@@ -29,9 +29,13 @@ cargo build --release -p aster-core
 Ядро держит всё своё в **рабочем каталоге**: `aster-core.key` (ключ терминала), `data/`
 (настройки, стратегии, отчёты), `logs/` (журнал по дням). Юнит ждёт `/opt/aster-core`:
 
+Служба идёт от отдельного пользователя без прав на остальную систему (`User=aster` в юните):
+
 ```sh
+sudo useradd --system --home-dir /opt/aster-core --shell /usr/sbin/nologin aster
 sudo mkdir -p /opt/aster-core
 sudo install -m 755 target/release/aster-core /opt/aster-core/
+sudo chown -R aster:aster /opt/aster-core
 ```
 
 ### 3. Ключ биржи
@@ -41,7 +45,7 @@ sudo install -m 755 target/release/aster-core /opt/aster-core/
 `key=`, `user:` игнорируются. Права только владельцу:
 
 ```sh
-sudo install -m 600 /dev/null /opt/aster-core/asterkey
+sudo install -m 600 -o aster -g aster /dev/null /opt/aster-core/asterkey
 sudo nano /opt/aster-core/asterkey
 ```
 
@@ -50,12 +54,13 @@ sudo nano /opt/aster-core/asterkey
 
 ### 4. Первый запуск — вручную, ради ключа терминала
 
-Ключ терминала выпускается при первом старте и печатается в stdout. В нём записан адрес, по
-которому терминал будет звонить, поэтому на сервере задайте **внешний IP** хоста:
+Ключ терминала выпускается при первом старте и печатается в stdout — **только на консоль**
+(в канал или в журнал он не попадает). В нём записан адрес, по которому терминал будет звонить,
+поэтому на сервере задайте **внешний IP** хоста:
 
 ```sh
 cd /opt/aster-core
-sudo ASTER_CORE_ADDR=<внешний IP> ASTER_API_KEY_FILE=/opt/aster-core/asterkey ./aster-core
+sudo -u aster ASTER_CORE_ADDR=<внешний IP> ASTER_API_KEY_FILE=/opt/aster-core/asterkey ./aster-core
 ```
 
 Вторая строка вывода — ключ для импорта в MoonTerminal. Дождитесь `serving` в журнале,
@@ -74,9 +79,9 @@ journalctl -u aster-core -f
 Коды выхода и политика рестарта описаны в самом юните: стоп со страницы или `systemctl stop` —
 служба остаётся остановленной, рестарт со страницы или сбой — поднимается снова.
 
-Под systemd stdout уходит в journald, а ядро печатает ключ терминала **на каждом старте** —
-значит, ключ читается из журнала всеми, кому доступен `journalctl` (root, группа `adm`/
-`systemd-journal`). Держите доступ к хосту соответственно.
+Под systemd stdout — journald, поэтому ключ терминала в него **не печатается** (journald хранит
+строки навсегда и показывает группам `adm`/`systemd-journal`). Нужен снова — из каталога ядра:
+`sudo -u aster ./aster-core --print-key` (читает `aster-core.key`, ничего не запускает).
 
 ### 6. Сеть
 

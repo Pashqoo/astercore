@@ -71,6 +71,21 @@ const PING_HEARTBEAT: Duration = Duration::from_secs(10);
 const REPORTS_FILE: &str = "data/reports.jsonl";
 
 fn main() -> ExitCode {
+    // First of all, before the journal, the settings or anything that writes: it only reads the
+    // key file, and run as another user than the service it must leave nothing of its own in
+    // the working directory.
+    if std::env::args().any(|a| a == "--print-key") {
+        return match key_store::load(key_store::DEFAULT_PATH) {
+            Ok(key) => {
+                println!("{}", key.export());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("key: {}: {e}", key_store::DEFAULT_PATH);
+                ExitCode::FAILURE
+            }
+        };
+    }
     stderr_log::init();
     // `data/config.json`: the page, the chat, the journal. A file that exists
     // and does not read is a refusal to start, not an empty start — its
@@ -154,16 +169,28 @@ fn main() -> ExitCode {
             );
         }
     }
-    // The export IS the private key, so it goes to stdout and never to the log
-    // file: this line is read once, off the console, and pasted into the
-    // terminal (`AGENTS.md`, `## Secrets`).
-    println!(
-        "Astercore key {} port {} mode {}\n{}",
-        key.rnd,
-        key.port,
-        key.transport_mode.name(),
-        key.export()
-    );
+    // The export IS the private key, so it goes to a console and nowhere else: not to the log
+    // file, and not to a pipe either — under systemd stdout is the journal, which keeps it for
+    // good and shows it to the groups that read the journal (`AGENTS.md`, `## Secrets`). The
+    // line is read once off the console and pasted into the terminal; `--print-key` (handled first
+    // thing in `main`) prints it again from the key file, for a core that runs as a service.
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        println!(
+            "Astercore key {} port {} mode {}\n{}",
+            key.rnd,
+            key.port,
+            key.transport_mode.name(),
+            key.export()
+        );
+    } else {
+        println!(
+            "Astercore key {} port {} mode {}: not printed, stdout is not a console; \
+             run `aster-core --print-key` in the working directory",
+            key.rnd,
+            key.port,
+            key.transport_mode.name()
+        );
+    }
     log::info!(
         "key {}: terminal dials {}:{} over {}",
         key.rnd,

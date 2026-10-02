@@ -419,9 +419,15 @@ fn coordinator(
         };
         if let Some(cmd) = first {
             take(cmd);
-            // Coalesce a burst of set changes into one reopen.
-            while let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(300)) {
-                take(cmd);
+            // Coalesce a burst of set changes into one reopen — for at most `COALESCE_MAX`
+            // from the first command, or a steady drip of commands would hold the reopen
+            // (and every set change in it) back for as long as it lasts.
+            let until = Instant::now() + COALESCE_MAX;
+            while let Some(left) = until.checked_duration_since(Instant::now()) {
+                match cmd_rx.recv_timeout(left.min(Duration::from_millis(300))) {
+                    Ok(cmd) => take(cmd),
+                    Err(_) => break,
+                }
             }
         }
         if let Some(name) = worker_gone {
@@ -442,6 +448,9 @@ fn coordinator(
         }
     }
 }
+
+/// The longest a burst of commands is gathered before the sets are applied.
+const COALESCE_MAX: Duration = Duration::from_secs(2);
 
 /// A request the worker can no longer serve, answered as refused.
 fn refuse(cmd: FeedCommand, tx: &Sender<FeedEvent>) {
@@ -691,6 +700,9 @@ fn depth_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
         };
         // Every request is answered, even one not fetched: the book that asked
         // waits for exactly one answer and asks again only after one.
+        // The wait for the next minute comes after the answer is sent, not before: the book
+        // that asked would sit frozen as if live for the whole of it.
+        let mut pause = false;
         let result = if !wanted.contains(&symbol) {
             Err("no longer shown".to_string())
         } else if banned_until.is_some_and(|t| Instant::now() < t) {
@@ -698,9 +710,7 @@ fn depth_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
         } else {
             match rest.depth(&symbol, BOOK_LEVELS) {
                 Ok(d) => {
-                    if rest.usage().weight_1m.unwrap_or(0) >= WARMUP_WEIGHT_CEILING {
-                        to_next_minute();
-                    }
+                    pause = rest.usage().weight_1m.unwrap_or(0) >= WARMUP_WEIGHT_CEILING;
                     Ok(book::Snapshot {
                         last_id: d.last_id,
                         bids: rows(&d.bids),
@@ -713,7 +723,7 @@ fn depth_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
                         rest::Error::Api { status: 418, .. } => {
                             banned_until = Some(Instant::now() + BAN_PAUSE);
                         }
-                        rest::Error::Api { status: 429, .. } => to_next_minute(),
+                        rest::Error::Api { status: 429, .. } => pause = true,
                         _ => {}
                     }
                     Err(e.to_string())
@@ -722,6 +732,9 @@ fn depth_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
         };
         if tx.send(FeedEvent::BookSnapshot { symbol, result }).is_err() {
             return;
+        }
+        if pause {
+            to_next_minute();
         }
     }
 }
@@ -767,6 +780,15 @@ fn spawn_warmup(symbols: Vec<String>, tx: Sender<FeedEvent>) {
                             if finish.tx.send(ev).is_err() {
                                 return;
                             }
+                            // Over the minute's weight ceiling: wait it out, after the bars
+                            // are delivered.
+                            // (Not after the last market: nothing is left to wait for, and
+                            // the thread's end is what reports the warm-up done.)
+                            if rest.usage().weight_1m.unwrap_or(0) >= WARMUP_WEIGHT_CEILING
+                                && next.load(Ordering::Relaxed) < symbols.len()
+                            {
+                                to_next_minute();
+                            }
                         }
                         Err(e @ rest::Error::Api { status: 418, .. }) => {
                             if !banned.swap(true, Ordering::Relaxed) {
@@ -790,19 +812,14 @@ fn spawn_warmup(symbols: Vec<String>, tx: Sender<FeedEvent>) {
 /// One market's `klines 5m`, tried [`WARMUP_ATTEMPTS`] times. A rate-limit
 /// refusal (429) waits for the next minute before the next try, any other
 /// failure a moment; a ban (418) is not retried at all. An answer showing the
-/// minute's weight past [`WARMUP_WEIGHT_CEILING`] waits for the next minute
-/// too — read off that answer only, since a failed call leaves the last
-/// figure behind.
+/// minute's weight past [`WARMUP_WEIGHT_CEILING`] makes the CALLER wait for the next
+/// minute, after it has delivered the bars — read off that answer only, since a failed
+/// call leaves the last figure behind.
 fn warm_one(rest: &mut Rest, symbol: &str) -> Result<Vec<Kline>, rest::Error> {
     let mut attempt = 1;
     loop {
         match rest.klines(symbol, "5m", WARMUP_BARS) {
-            Ok(bars) => {
-                if rest.usage().weight_1m.unwrap_or(0) >= WARMUP_WEIGHT_CEILING {
-                    to_next_minute();
-                }
-                return Ok(bars);
-            }
+            Ok(bars) => return Ok(bars),
             Err(e @ rest::Error::Api { status: 418, .. }) => return Err(e),
             Err(e) if attempt >= WARMUP_ATTEMPTS => return Err(e),
             Err(e) => {

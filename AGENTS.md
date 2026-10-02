@@ -76,8 +76,8 @@
 
 Верификация у GUI-ядра не бывает «по коду». Что есть сейчас и чем пользоваться:
 
-1. **`./target/release/aster-core`** — ядро: печатает в stdout ключ (две строки, читать только с
-   консоли), `clock:`, `limits:`, `catalog:`, `wire:` и `account:` по живой бирже, дальше **служит
+1. **`./target/release/aster-core`** — ядро: печатает в stdout ключ (две строки, **только на
+   консоль**: в файл или канал не идёт; снова — `aster-core --print-key` в рабочем каталоге), `clock:`, `limits:`, `catalog:`, `wire:` и `account:` по живой бирже, дальше **служит
    по UDP** до сигнала. `account:` — первое чтение счёта: подписанные `GET /fapi/v3/balance` +
    `/fapi/v3/positionRisk` клиентом сети подписанта со своей сверкой часов (сеть, сокращённые
    адреса подписанта и счёта, поправка часов, USDT free/equity, открытые позиции `символ
@@ -101,7 +101,7 @@
    создаётся `aster-core.key`. Порт из `ASTER_CORE_PORT` (по умолчанию 3101), адрес для нового
    ключа — `ASTER_CORE_ADDR`, уровень журнала — `ASTER_CORE_LOG`.
 2. **Вендорные примеры как терминал.** К живому ядру подключается `MoonClient` того же rev:
-   `KEY=$(sed -n 2p core.out); cargo run --release -p moonproto --example list_markets -- "$KEY"
+   `KEY=$(./aster-core --print-key); cargo run --release -p moonproto --example list_markets -- "$KEY"
    127.0.0.1:3101` (каталог), `--example market_refresh` (ряды цен, `prices updated: N`),
    `--example query_hedge_mode`. Это и есть «терминал дошёл до Ready» без GUI. Маркет-дата (M1):
    `--example trades_stream -- "$KEY" 127.0.0.1:3101 BTCUSDT 15` (лента, `[retained-trade]`),

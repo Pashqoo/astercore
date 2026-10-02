@@ -7,8 +7,12 @@ alwaysApply: false
 # MoonProto: контракт сервера
 
 > **Происхождение.** Файл перенесён из TInvestCore (`.cursor/rules/protocol.mdc`) и остаётся
-> верным, потому что `crates/moonproto/src/server/` в двух репозиториях совпадает побайтово,
-> кроме докстрингов (сверено диффом 01.10). Это контракт **терминала**, брокера в нём нет —
+> верным, потому что `crates/moonproto/src/server/` в двух репозиториях близок текстуально.
+> **Не побайтово:** `diff -r` с TInvestCore (02.10) даёт расхождения в `codec/engine.rs`,
+> `strat.rs`, `trade.rs`, `ui.rs`, `mod.rs`, `session.rs`. Не-астеровские из них — кодек Telegram
+> (строки 36–48) и `CMD_SHUTDOWN` в `codec/ui.rs`, `Session::quiet()`, хвост `StopSettings`,
+> 7-й аргумент `build_snapshot`, и правки ревью 02.10 (`fresh_crypted` в `session.rs`/`mod.rs`):
+> это **долг переноса в TInvestCore**, а не совпадение. Это контракт **терминала**, брокера в нём нет —
 > поэтому переносится почти целиком. Правлено под Aster: идентичность ядра (код 221, `FUTURES`,
 > `USDT`), зашитые нулями поля `Market`, природа снимков стакана.
 

@@ -451,16 +451,9 @@ fn user_stream(network: Network, slot: Arc<Slot>, wake: Sender<Wake>, feed: Send
                         placed = slot.placed.wait(placed).unwrap_or_else(|e| e.into_inner());
                     }
                 };
-                log::info!(
-                    "user: stream open on {} (session {})",
-                    network.name(),
-                    beat.sessions() + 1
-                );
-                // Events between the last session and this one may be lost:
-                // the engine reads the open orders again (`TradeCommand::OpenOrders`).
-                let _ = feed.send(FeedEvent::UserStreamOpen);
                 let opened = Instant::now();
                 let url = format!("wss://{}/ws/{key}", network.ws_host());
+                let was_open = std::cell::Cell::new(false);
                 let res = ws::guarded(|| {
                     ws::run_at(
                         network.ws_host(),
@@ -468,6 +461,19 @@ fn user_stream(network: Network, slot: Arc<Slot>, wake: Sender<Wake>, feed: Send
                         ws::IDLE_LIMIT,
                         &slot.stop,
                         &beat,
+                        // Said once the handshake is through, not before: a refused one would
+                        // otherwise start the open-orders read (weight 40) on every attempt.
+                        || {
+                            log::info!(
+                                "user: stream open on {} (session {})",
+                                network.name(),
+                                beat.sessions()
+                            );
+                            // Events between the last session and this one may be lost: the
+                            // engine reads the open orders again (`TradeCommand::OpenOrders`).
+                            was_open.set(true);
+                            let _ = feed.send(FeedEvent::UserStreamOpen);
+                        },
                         |text| {
                             let event = user_event(text);
                             log_event(&event);
@@ -483,7 +489,13 @@ fn user_stream(network: Network, slot: Arc<Slot>, wake: Sender<Wake>, feed: Send
                     )
                 });
                 slot.lock().take();
-                let _ = feed.send(FeedEvent::UserStreamClosed);
+                // Told even when the handshake was refused (`was_open` false): `Ended` is what
+                // makes the account thread place a NEW listenKey, and a refused one is most
+                // likely an expired one. The backoff below paces the attempts, and with them
+                // this POST and read.
+                if was_open.get() {
+                    let _ = feed.send(FeedEvent::UserStreamClosed);
+                }
                 if wake.send(Wake::Ended).is_err() {
                     return;
                 }

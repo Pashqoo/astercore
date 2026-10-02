@@ -387,6 +387,7 @@ impl Settings {
             next.telegram.chat_id = v;
         }
         if let Some(v) = &edit.telegram_proxy {
+            crate::telegram::check_proxy(v)?;
             next.telegram.proxy = v.trim().to_owned();
         }
         if let Some(v) = &edit.telegram_daily_at {
