@@ -79,6 +79,13 @@ fn clock_suspect(e: &rest::Error) -> bool {
     !matches!(e, rest::Error::Api { code, .. } if *code != CODE_NONCE_EXPIRED)
 }
 
+/// The same for a finished action's refusal code: the exchange's own refusal of the order (-2011
+/// on a filled order, -2019) says nothing about the clock, and measuring it first would cost the
+/// next order a round trip on the critical path.
+fn clock_suspect_code(code: Option<i64>) -> bool {
+    code.is_none() || code == Some(CODE_NONCE_EXPIRED)
+}
+
 /// The exchange refused the call for good: the request was read and turned
 /// down, so it did not and will not take effect. A 5xx, a timeout or a
 /// transport error leaves its fate unknown.
@@ -222,10 +229,7 @@ pub fn start(
                         } else {
                             log::warn!("{op:?} order {order:#x} {leg:?}: {msg}");
                         }
-                        // A refusal of the order itself (-2011 on a filled order, -2019) says
-                        // nothing about the clock: measuring it first would cost the next
-                        // order a round trip on the critical path.
-                        if done.code.is_none() || done.code == Some(CODE_NONCE_EXPIRED) {
+                        if clock_suspect_code(done.code) {
                             clock_due = Instant::now();
                         }
                         let failed = TradingEvent::Failed {
@@ -499,6 +503,16 @@ impl OrderUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_silent_or_nonce_failure_makes_the_clock_suspect() {
+        assert!(clock_suspect_code(None));
+        assert!(clock_suspect_code(Some(CODE_NONCE_EXPIRED)));
+        // -2011 (cancel of a filled order), -2019 (margin), -2022 (reduce-only refused).
+        for code in [-2011, -2019, -2022] {
+            assert!(!clock_suspect_code(Some(code)), "{code}");
+        }
+    }
 
     const GRID: Grid = Grid {
         step: 0.001,

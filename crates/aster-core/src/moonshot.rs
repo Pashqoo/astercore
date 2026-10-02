@@ -4559,6 +4559,14 @@ mod tests {
         let st = strategies(&[("MShotPrice", FieldValue::Double(1.5))], true);
         let p = Params::from_snapshot(&st.list()[0], st.schema());
         assert_eq!((p.price, p.price_min, p.orders_count), (1.5, 0.6, 1));
+        // Dollars, not MoonBot's 1000 of roubles: a strategy nobody tuned must not size a
+        // thousand-dollar entry.
+        assert_eq!(p.order_size, 10.0);
+        // The default lives in the schema, shared by every kind: no kind reads a thousand.
+        assert!(matches!(
+            st.schema().field("OrderSize").and_then(|f| f.default_value.clone()),
+            Some(FieldValue::Double(v)) if v == 10.0
+        ));
         assert_eq!(
             (p.stops.level, p.max_active, p.sell_price),
             (Some(-2.0), 5, 2.0)
@@ -4990,6 +4998,76 @@ mod tests {
         );
         assert!(starts(&run(&st, None, &orders)).is_empty());
         assert_eq!(starts(&run(&with(&[]), None, &orders)).len(), 2);
+    }
+
+    /// The price the startup ticker seeded is not one to enter at: the ladder waits for the
+    /// market's first live trade, then goes.
+    #[test]
+    fn a_seeded_price_holds_the_ladder_until_a_live_trade() {
+        use FieldValue::{Double, Int32, String as Str};
+        let mut model = model();
+        model.at_mut(1).unwrap().price_seeded = true;
+        let (win, sched) = (Windows::default(), None::<f64>);
+        let st = strategies(
+            &[
+                ("CoinsWhiteList", Str("SBER".into())),
+                ("OrderSize", Double(3000.0)),
+                ("MShotPrice", Double(1.0)),
+                ("MShotPriceMin", Double(0.5)),
+                ("MShotAdd15minDelta", Double(0.0)),
+                ("MShotAddHourlyDelta", Double(0.0)),
+                ("OrdersCount", Int32(1)),
+            ],
+            true,
+        );
+        let orders = Orders::new();
+        let mut shot = MoonShot::default();
+        let held = shot.tick(&st, &orders, &model, &win, sched, 1_000_000);
+        assert!(starts(&held).is_empty());
+        model.at_mut(1).unwrap().price_seeded = false;
+        let mut shot = MoonShot::default();
+        assert_eq!(
+            starts(&shot.tick(&st, &orders, &model, &win, sched, 1_001_000)).len(),
+            1
+        );
+    }
+
+    /// The account went unreadable after a balance was known: the entries that check the
+    /// balance wait, instead of running unchecked as when nothing was ever read; the ones that
+    /// do not check go on, and a fresh figure releases the waiting ones.
+    #[test]
+    fn a_lost_balance_holds_the_checked_entries_and_a_fresh_one_frees_them() {
+        use FieldValue::{Bool, Double, Int32, String as Str};
+        let model = model();
+        let (win, sched) = (Windows::default(), None::<f64>);
+        let mut base = vec![
+            ("CoinsWhiteList", Str("SBER".into())),
+            ("OrderSize", Double(3000.0)),
+            ("MShotPrice", Double(1.0)),
+            ("MShotPriceMin", Double(0.5)),
+            ("MShotAdd15minDelta", Double(0.0)),
+            ("MShotAddHourlyDelta", Double(0.0)),
+            ("OrdersCount", Int32(1)),
+        ];
+        let unchecked = strategies(&base, true);
+        base.push(("CheckFreeBalance", Bool(true)));
+        let checked = strategies(&base, true);
+        let orders = Orders::new();
+        let mut shot = MoonShot::default();
+        let mut t = 1_000_000;
+        let mut run = |shot: &mut MoonShot, st: &Strategies| {
+            t += 1_000;
+            shot.tick(st, &orders, &model, &win, sched, t)
+        };
+        shot.set_free_balance(Some(4000.0));
+        assert_eq!(starts(&run(&mut shot, &checked)).len(), 1);
+        shot.set_free_balance(None);
+        let held = run(&mut shot, &checked);
+        assert!(starts(&held).is_empty());
+        assert!(has_log(&held, "the account is unreadable"));
+        assert_eq!(starts(&run(&mut shot, &unchecked)).len(), 1);
+        shot.set_free_balance(Some(4000.0));
+        assert_eq!(starts(&run(&mut shot, &checked)).len(), 1);
     }
 
     /// `PenaltyTime` after a manual order on the market, and

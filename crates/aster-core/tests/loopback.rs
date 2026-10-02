@@ -1518,6 +1518,33 @@ fn shift_grid(
     let _ = client.disconnect();
 }
 
+/// A failed read of the open orders is asked again by the core (10 s), instead of leaving the
+/// restored orders unchecked until the stream reopens.
+#[test]
+fn a_failed_open_orders_read_is_asked_again() {
+    let (core, orders) = FedCore::trading();
+    // The core asks once on its own at start: that one is not the answer to the failure.
+    while orders.recv_timeout(Duration::from_secs(1)).is_ok() {}
+    core.ev_tx
+        .send(FeedEvent::Trading(TradingEvent::OpenOrdersFailed))
+        .unwrap();
+    let sent = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match orders
+            .recv_timeout(left)
+            .expect("the open orders asked again")
+        {
+            TradeCommand::OpenOrders => {
+                assert!(sent.elapsed() >= Duration::from_secs(9), "asked at once");
+                break;
+            }
+            TradeCommand::Exchange { .. } => {}
+        }
+    }
+}
+
 /// «Cancel ALL orders» (Engine API 11): every resting entry of the core is cancelled, the strategies
 /// stop, and the terminal gets its `ok` at once (it used to hear «not implemented»).
 #[test]
