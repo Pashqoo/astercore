@@ -127,6 +127,13 @@ fn pass_due(
         && (woken || (idle >= SHOTS_FAST_MS && strategy_order_live()))
 }
 
+/// Whether the periodic orders snapshot is due: [`ORDERS_SNAPSHOT_EVERY_MS`] after the last, and
+/// at once when the clock reads earlier than the last one (it stepped back: the snapshot is what
+/// heals the terminal's table, it does not wait for the clock to catch up).
+fn snapshot_due(now: i64, last: i64) -> bool {
+    !(0..ORDERS_SNAPSHOT_EVERY_MS).contains(&(now - last))
+}
+
 /// What the strategy pass costs, reported with the `load:` line (`SUMMARY_EVERY_MS`): the number
 /// that told how often it may run (MoonBot checks a MoonShot corridor every 16 ms). The timer
 /// itself ([`pass_due`]) goes by the last pass alone, not by these figures. Timed on
@@ -191,6 +198,15 @@ const EMU_ROUNDS: usize = 8;
 /// After an order turns terminal, the whole snapshot is broadcast this much
 /// later (the terminal drops a finished order only from a snapshot).
 const ORDERS_REFRESH_MS: i64 = 1_000;
+/// While a terminal is connected the whole orders snapshot is broadcast this often, even an empty
+/// one, whatever happens to the orders. 02.10: 22 cancelled or refused entries stayed on the
+/// terminal's table as live for half an hour (the snapshot a second after each terminal image did
+/// not clear them; restarting the terminal did). Why they stayed is NOT established; the client
+/// library asks about an order a snapshot lacks and drops it on `OrderNotFound` (not when its
+/// mirror is terminal but not exact, `state/orders.rs` `apply_gone`), so a periodic snapshot is
+/// the cheap try, not a proven cure. The snapshot is one reliable datagram per session and
+/// the transport drops one over 256 slices (some 700 retained orders), `session.rs` `send_wire`.
+const ORDERS_SNAPSHOT_EVERY_MS: i64 = 10_000;
 
 /// A book the terminal shows, kept from the diff stream (`book.rs`), and the
 /// seq of the last packet sent for it: what `RequestOrderBookFull` answers.
@@ -326,6 +342,9 @@ pub struct CoreHandler {
     profit_at: i64,
     /// When to broadcast the orders snapshot after an order turned terminal.
     orders_refresh_at: i64,
+    /// When the orders snapshot last went out to the sessions, after a terminal image or on the
+    /// period ([`ORDERS_SNAPSHOT_EVERY_MS`]); a session's own pull does not count.
+    orders_snapshot_at: i64,
     /// Strategy loss guards (`TotalLoss`, Sessions), the rules each strategy
     /// counts under, and the `PenaltyTime` marks of the report.
     guards: guards::Guards,
@@ -421,6 +440,7 @@ impl CoreHandler {
             profit: Profit::default(),
             profit_at: 0,
             orders_refresh_at: 0,
+            orders_snapshot_at: now_ms(),
             guards: guards::Guards::default(),
             guard_rules: None,
             penalty_marks: None,
@@ -730,8 +750,11 @@ impl CoreHandler {
         if now - self.profit_at >= PROFIT_PERIOD_MS {
             self.push_profit(now);
         }
-        if self.orders_refresh_at != 0 && now >= self.orders_refresh_at {
+        let refresh = self.orders_refresh_at != 0 && now >= self.orders_refresh_at;
+        // Not built for nobody: a session that connects pulls the snapshot itself.
+        if !sessions.is_empty() && (refresh || snapshot_due(now, self.orders_snapshot_at)) {
             self.orders_refresh_at = 0;
+            self.orders_snapshot_at = now;
             let snapshot = trade::orders_snapshot(0, &self.orders.records(now));
             self.outbox.push((ORDER, snapshot));
         }
@@ -3295,6 +3318,24 @@ fn action_leg(a: &Action) -> Leg {
         | Action::Replace { leg, .. }
         | Action::Query { leg, .. }
         | Action::QueryRequest { leg, .. } => *leg,
+    }
+}
+
+#[cfg(test)]
+mod snapshot_timer_tests {
+    use super::*;
+
+    #[test]
+    fn the_snapshot_is_due_every_period_and_when_the_clock_steps_back() {
+        let last = 1_000_000;
+        assert!(!snapshot_due(last, last));
+        assert!(!snapshot_due(last + ORDERS_SNAPSHOT_EVERY_MS - 1, last));
+        assert!(snapshot_due(last + ORDERS_SNAPSHOT_EVERY_MS, last));
+        assert!(snapshot_due(last - 1, last), "a clock that stepped back");
+        assert!(
+            snapshot_due(1_790_000_000_000, 0),
+            "the first one after start"
+        );
     }
 }
 

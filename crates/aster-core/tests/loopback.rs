@@ -1545,6 +1545,32 @@ fn a_failed_open_orders_read_is_asked_again() {
     }
 }
 
+/// The whole orders snapshot comes on its own, with no order changing. The client's own pull on
+/// connecting is one snapshot; the core's first periodic one comes `ORDERS_SNAPSHOT_EVERY_MS` after
+/// its start, which a client connecting within the first seconds sees inside twelve quiet seconds,
+/// so a second snapshot can only be the periodic one. (That it also clears what the terminal holds
+/// as live is not proven: the 02.10 ghosts are an open question, `PLAN.md`.)
+#[test]
+fn a_quiet_core_still_sends_the_orders_snapshot_now_and_then() {
+    let (core, _orders) = FedCore::trading();
+    let client = core.connect();
+    let mut snapshots = 0;
+    let until = Instant::now() + Duration::from_secs(12);
+    while Instant::now() < until {
+        for e in client.drain_events() {
+            if matches!(e, Event::Order(moonproto::state::OrderEvent::Snapshot)) {
+                snapshots += 1;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        snapshots >= 2,
+        "{snapshots} snapshot(s) in twelve quiet seconds"
+    );
+    let _ = client.disconnect();
+}
+
 /// «Cancel ALL orders» (Engine API 11): every resting entry of the core is cancelled, the strategies
 /// stop, and the terminal gets its `ok` at once (it used to hear «not implemented»).
 #[test]
