@@ -344,8 +344,38 @@ impl Rest {
         )
     }
 
-    /// `GET /fapi/v3/leverageBracket`, signed, weight 1: every symbol's notional brackets, whose
-    /// first one carries the leverage the account may ask for. Rows the core has no use for are
+    /// `POST /fapi/v3/marginType`, signed, weight 1: `symbol`'s margin type, `ISOLATED` or
+    /// `CROSSED`. The exchange refuses it with `-4046` when the type already is that (nothing to
+    /// change), and while the symbol has an open position or order.
+    pub fn set_margin_type(
+        &mut self,
+        signer: &mut Signer,
+        symbol: &str,
+        margin_type: &str,
+    ) -> Result<(), Error> {
+        let ack: serde_json::Value = self.signed_send(
+            Method::Post,
+            signer,
+            "/fapi/v3/marginType",
+            &[("symbol", symbol), ("marginType", margin_type)],
+        )?;
+        // `{"code":200,"msg":"success"}`: a 200 whose body names another code is a refusal.
+        match ack.get("code").and_then(serde_json::Value::as_i64) {
+            Some(code) if code != 200 => Err(Error::Api {
+                status: 200,
+                code,
+                msg: ack
+                    .get("msg")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// `GET /fapi/v3/leverageBracket`, signed, weight 1: every symbol's notional brackets, the
+    /// highest `initialLeverage` of which is the most the account may ask for. Rows the core has no use for are
     /// not decoded, for the reason `balance` gives.
     pub fn leverage_brackets(
         &mut self,

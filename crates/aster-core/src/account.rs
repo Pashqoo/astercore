@@ -600,6 +600,7 @@ mod tests {
             entry_price: entry,
             unrealized,
             leverage: None,
+            margin_type: None,
         }
     }
 

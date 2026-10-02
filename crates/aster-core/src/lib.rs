@@ -29,6 +29,7 @@ pub mod orders;
 pub mod prices;
 pub mod reports;
 pub mod screener;
+pub mod setup;
 pub mod settings;
 pub mod stderr_log;
 pub mod stops;

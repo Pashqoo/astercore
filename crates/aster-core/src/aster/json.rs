@@ -569,6 +569,10 @@ pub struct PositionRisk {
     /// the leverage as unknown, and the position it sits beside still counts.
     #[serde(default, deserialize_with = "leverage_of")]
     pub leverage: Option<i32>,
+    /// The margin type as the row states it — `ISOLATED`/`CROSSED`, in either case on the wire
+    /// (the docs' fixtures use lowercase) — or `None` when it does not.
+    #[serde(default, rename = "marginType")]
+    pub margin_type: Option<String>,
 }
 
 fn leverage_of<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
@@ -589,7 +593,7 @@ pub struct LeverageSet {
 }
 
 /// One symbol of `GET /fapi/v3/leverageBracket`: the brackets run from the smallest notional up,
-/// and the first one allows the highest leverage.
+/// and the highest `initialLeverage` of them is the most the account may ask for.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SymbolBrackets {
     pub symbol: String,

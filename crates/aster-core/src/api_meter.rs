@@ -49,7 +49,7 @@ const ORDER_METHODS: [&str; 2] = ["POST /fapi/v3/order", "DELETE /fapi/v3/order"
 /// first paint — flat at zero is an answer too. A call site added without its
 /// line here is not lost: it appears as its own card the first time it is
 /// counted (see [`ApiMeter::view`]).
-pub const METHODS: [&str; 17] = [
+pub const METHODS: [&str; 18] = [
     "GET /fapi/v1/time",
     "GET /fapi/v1/exchangeInfo",
     "GET /fapi/v1/ticker/24hr",
@@ -66,6 +66,7 @@ pub const METHODS: [&str; 17] = [
     "DELETE /fapi/v3/order",
     "POST /fapi/v3/listenKey",
     "POST /fapi/v3/leverage",
+    "POST /fapi/v3/marginType",
     "GET /fapi/v3/leverageBracket",
 ];
 

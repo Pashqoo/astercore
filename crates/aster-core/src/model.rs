@@ -242,8 +242,8 @@ pub struct Market {
     /// ([`Market::bracket_leverage`]) and `positionRisk`, which is why this carries the percent
     /// rather than a `leverage` field that would read as authoritative.
     pub required_margin_percent: f64,
-    /// The highest leverage the account may ask for on this market, from the first bracket of
-    /// `/fapi/v3/leverageBracket`. `None` until that read lands (or when it never does), and
+    /// The highest leverage the account may ask for on this market, from the brackets of
+    /// `/fapi/v3/leverageBracket` (the highest `initialLeverage`). `None` until that read lands (or when it never does), and
     /// [`Market::max_leverage`] then falls back on the instrument's own ceiling.
     pub bracket_leverage: Option<i32>,
     pub liquidation_fee: f64,
@@ -366,8 +366,8 @@ impl Market {
             .map(|_| coin)
     }
 
-    /// Highest leverage the market allows: the account's own, from the first bracket of
-    /// `/fapi/v3/leverageBracket` ([`Market::bracket_leverage`]) when that read landed, else the
+    /// Highest leverage the market allows: the account's own, from the brackets of
+    /// `/fapi/v3/leverageBracket` (the highest `initialLeverage`) ([`Market::bracket_leverage`]) when that read landed, else the
     /// INSTRUMENT's ceiling from its initial-margin percent, below.
     ///
     /// `requiredMarginPercent` 5.0 means 5 % of the notional must be posted, so
