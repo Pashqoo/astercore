@@ -18,8 +18,8 @@ use ureq::{Agent, Body};
 
 use super::json::{
     kline_row, AggTrade, ApiError, Balance, BookTicker, DepthSnapshot, ExchangeInfo, Kline,
-    LeverageSet, ListenKey, OrderReply, PositionRisk, PremiumIndex, ServerTime, SymbolBrackets,
-    Ticker24h,
+    LeverageSet, ListenKey, OrderReply, PositionRisk, PremiumIndex, RawTradeRow, ServerTime,
+    SymbolBrackets, Ticker24h,
 };
 use super::sign::{Network, Signer};
 use crate::api_meter::{self, Call};
@@ -258,33 +258,36 @@ impl Rest {
         self.get("/fapi/v1/depth", &[("symbol", symbol), ("limit", &limit)])
     }
 
-    /// `GET /fapi/v1/aggTrades`: the newest `limit` aggregate trades, or
-    /// `limit` of them from an id onwards, oldest first either way.
+    /// The raw fills of `symbol`, oldest first, public: the newest `limit` of them
+    /// (`GET /fapi/v3/trades`, weight 1) or `limit` from a trade id onwards
+    /// (`GET /fapi/v3/historicalTrades`, weight 20 by the docs), at most 1000 rows.
     ///
-    /// Measured 01.10: weight **20** per call whatever the form, at most 1000
-    /// rows; BTCUSDT's last hour was ~1800 rows. Aggregate ids are consecutive
-    /// per symbol, which is what lets a caller page BACK from the newest page
-    /// (`fromId = oldest - limit`) and so always hold the newest trades first.
-    pub fn agg_trades(
+    /// Measured 02.10 on UAIUSDT: `historicalTrades` takes no key on the v3 path (the v1 path asks
+    /// for one, `-2014`) and pages by `fromId`; `/fapi/v1/trades` ignores `fromId` and always
+    /// answers the newest page. Trade ids are consecutive per symbol, which is what lets a caller
+    /// page BACK from the newest page (`fromId = oldest - limit`) and so always hold the newest
+    /// trades first. The raw tape holds every fill; `aggTrades`, which this replaced for the
+    /// history, merged the fills of one taker order (11-37 % fewer rows on liquid markets).
+    pub fn raw_trades(
         &mut self,
         symbol: &str,
-        from: AggFrom,
+        from: TradesFrom,
         limit: u32,
     ) -> Result<Vec<AggTrade>, Error> {
         let limit = limit.to_string();
-        match from {
-            AggFrom::Latest => self.get(
-                "/fapi/v1/aggTrades",
-                &[("symbol", symbol), ("limit", &limit)],
-            ),
-            AggFrom::Id(id) => {
+        let rows: Vec<RawTradeRow> = match from {
+            TradesFrom::Latest => {
+                self.get("/fapi/v3/trades", &[("symbol", symbol), ("limit", &limit)])
+            }
+            TradesFrom::Id(id) => {
                 let id = id.to_string();
                 self.get(
-                    "/fapi/v1/aggTrades",
+                    "/fapi/v3/historicalTrades",
                     &[("symbol", symbol), ("fromId", &id), ("limit", &limit)],
                 )
             }
-        }
+        }?;
+        Ok(rows.into_iter().map(AggTrade::from).collect())
     }
 
     /// `GET /fapi/v3/balance`, signed, weight 5: the row of `asset`, or
@@ -720,12 +723,12 @@ impl OrderRef<'_> {
     }
 }
 
-/// Where an [`Rest::agg_trades`] page starts.
+/// Where a [`Rest::raw_trades`] page starts.
 #[derive(Debug, Clone, Copy)]
-pub enum AggFrom {
+pub enum TradesFrom {
     /// The newest page.
     Latest,
-    /// From this aggregate id onwards.
+    /// From this trade id onwards.
     Id(i64),
 }
 

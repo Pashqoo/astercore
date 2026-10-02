@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use moonproto::server::codec::market_data::{delphi_days, Candle, HistoryTrade};
 
 use crate::aster::json::{AggTrade, Dec, Kline, PremiumIndex, StreamData, StreamEvent};
-use crate::aster::rest::{self, AggFrom, Rest};
+use crate::aster::rest::{self, Rest, TradesFrom};
 use crate::aster::ws::{self, Beat, MAX_STREAMS};
 use crate::book;
 use crate::load::Load;
@@ -58,7 +58,9 @@ const CARD_BARS: u32 = 1500;
 /// `RequestMarketHistory`: the last hour of the tape.
 const HISTORY_SPAN_MS: i64 = 3_600_000;
 const HISTORY_PAGE: u32 = 1000;
-/// Weight 20 each (measured), so the busiest hour costs at most 100.
+/// The newest page weighs 1 and each older one 20 (docs; `historicalTrades`), so the busiest hour
+/// costs at most 81. A market busier than 5000 fills an hour gets the newest five pages: the
+/// hour then starts late, which the journal says (`last_hour`).
 const HISTORY_PAGES: usize = 5;
 /// How long a subscription nobody wants any more stays open (`subs::Plan`).
 /// TInvestCore's value, kept: the terminal switching between two charts
@@ -677,9 +679,19 @@ fn candle_of(k: &Kline) -> Candle {
     }
 }
 
+/// A ban (418) of the history call: every call made under it extends it, so for this long the
+/// worker answers each request with a refusal instead of making the call (the terminal asks
+/// again), as the books' worker does.
+const HISTORY_BAN_PAUSE: Duration = Duration::from_secs(300);
+const BANNED: &str = "banned (418): history and card calls paused";
+
 fn unary_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
     let mut rest = Rest::new();
+    let mut banned_until: Option<Instant> = None;
     while let Ok(cmd) = rx.recv() {
+        let banned = banned_until.is_some_and(|t| Instant::now() < t);
+        // Wait for the rest of the minute before the next call.
+        let mut pause = false;
         let ev = match cmd {
             FeedCommand::Candles {
                 symbol,
@@ -689,17 +701,42 @@ fn unary_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
             } => FeedEvent::CandlesReply {
                 client_id,
                 request_uid,
-                result: card_candles(&mut rest, &symbol, minutes),
+                result: if banned {
+                    Err(BANNED.to_string())
+                } else {
+                    card_candles(&mut rest, &symbol, minutes)
+                },
             },
             FeedCommand::History {
                 symbol,
                 client_id,
                 request_uid,
-            } => FeedEvent::HistoryReply {
-                client_id,
-                request_uid,
-                result: last_hour(&mut rest, &symbol, rest::now_ms()).map_err(|e| e.to_string()),
-            },
+            } => {
+                let result = if banned {
+                    Err(rest::Error::Transport(BANNED.into()))
+                } else {
+                    last_hour(&mut rest, &symbol, rest::now_ms())
+                };
+                // The history is the worker's heaviest call (up to 81 weight); the minute's
+                // budget is shared with the order path, so a limit or a nearly spent minute is
+                // waited out after the answer is sent, as the books' worker does. The weight is
+                // read only from an answer: a failed call leaves the figure of an earlier one.
+                match &result {
+                    Err(rest::Error::Api { status: 418, .. }) => {
+                        banned_until = Some(Instant::now() + HISTORY_BAN_PAUSE);
+                    }
+                    Err(rest::Error::Api { status: 429, .. }) => pause = true,
+                    Ok(_) => {
+                        pause = rest.usage().weight_1m.unwrap_or(0) >= WARMUP_WEIGHT_CEILING;
+                    }
+                    Err(_) => {}
+                }
+                FeedEvent::HistoryReply {
+                    client_id,
+                    request_uid,
+                    result: result.map_err(|e| e.to_string()),
+                }
+            }
             FeedCommand::SetBooks(_)
             | FeedCommand::SetCandles(_)
             | FeedCommand::BookSnapshot(_) => continue,
@@ -708,6 +745,9 @@ fn unary_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
             return;
         }
         thread::sleep(UNARY_PACE);
+        if pause {
+            to_next_minute();
+        }
     }
 }
 
@@ -929,37 +969,58 @@ fn card_candles(rest: &mut Rest, symbol: &str, minutes: i64) -> Result<Vec<Candl
 /// Paged BACK from the newest page, never forward from the hour's start:
 /// a forward walk that hit the page cap would hold the oldest minutes and
 /// lose the newest, which are the ones a chart is opened to see. A failure
-/// after the first page keeps what is in hand.
+/// after the first page keeps what is in hand, except the exchange's limit (418/429), which
+/// is returned as the error it is.
 pub(crate) fn last_hour(
     rest: &mut Rest,
     symbol: &str,
     now: i64,
 ) -> Result<Vec<HistoryTrade>, rest::Error> {
     let start = now - HISTORY_SPAN_MS;
-    let mut rows = rest.agg_trades(symbol, AggFrom::Latest, HISTORY_PAGE)?;
+    let mut rows = rest.raw_trades(symbol, TradesFrom::Latest, HISTORY_PAGE)?;
+    // The market's own first trade was reached: nothing older exists, so a short hour is whole.
+    let mut from_the_start = false;
     for _ in 1..HISTORY_PAGES {
         let Some(first) = rows.first() else {
             break;
         };
-        if first.time_ms < start || first.id <= 0 {
+        // A row without a time (it decodes as 0) says nothing about the hour: only a real stamp
+        // older than the hour start ends the paging.
+        if (first.time_ms > 0 && first.time_ms < start) || first.id <= 0 {
             break;
         }
         let first_id = first.id;
         let from = (first_id - i64::from(HISTORY_PAGE)).max(0);
-        match rest.agg_trades(symbol, AggFrom::Id(from), HISTORY_PAGE) {
+        match rest.raw_trades(symbol, TradesFrom::Id(from), HISTORY_PAGE) {
             Ok(mut older) => {
                 older.retain(|t| t.id < first_id);
                 if older.is_empty() {
+                    from_the_start = true;
                     break;
                 }
                 older.append(&mut rows);
                 rows = older;
             }
+            // A limit is the exchange's word to everyone on this IP, the order path included: it
+            // goes up (the worker waits, the terminal asks again) rather than being cached by
+            // the terminal as a complete hour that is short.
+            Err(
+                e @ rest::Error::Api {
+                    status: 418 | 429, ..
+                },
+            ) => return Err(e),
             Err(e) => {
                 log::warn!("history {symbol}: {e}; keeping {} trades", rows.len());
                 break;
             }
         }
+    }
+    if !from_the_start && rows.first().is_some_and(|t| t.time_ms > start) {
+        log::info!(
+            "history {symbol}: {} trades, the hour's start not reached ({} s short)",
+            rows.len(),
+            (rows[0].time_ms - start) / 1000
+        );
     }
     Ok(history_rows(&rows, start))
 }

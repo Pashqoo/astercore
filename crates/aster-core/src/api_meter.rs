@@ -49,14 +49,15 @@ const ORDER_METHODS: [&str; 2] = ["POST /fapi/v3/order", "DELETE /fapi/v3/order"
 /// first paint — flat at zero is an answer too. A call site added without its
 /// line here is not lost: it appears as its own card the first time it is
 /// counted (see [`ApiMeter::view`]).
-pub const METHODS: [&str; 18] = [
+pub const METHODS: [&str; 19] = [
     "GET /fapi/v1/time",
     "GET /fapi/v1/exchangeInfo",
     "GET /fapi/v1/ticker/24hr",
     "GET /fapi/v1/ticker/bookTicker",
     "GET /fapi/v1/premiumIndex",
     "GET /fapi/v1/klines",
-    "GET /fapi/v1/aggTrades",
+    "GET /fapi/v3/trades",
+    "GET /fapi/v3/historicalTrades",
     "GET /fapi/v1/depth",
     "GET /fapi/v3/balance",
     "GET /fapi/v3/positionRisk",
@@ -715,7 +716,7 @@ mod tests {
             TariffGroup {
                 methods: vec![
                     "GET /fapi/v1/klines".into(),
-                    "GET /fapi/v1/aggTrades".into(),
+                    "GET /fapi/v3/historicalTrades".into(),
                 ],
                 per_minute: 600,
                 per_second: None,
@@ -823,10 +824,10 @@ mod tests {
         let m = ApiMeter::detached();
         m.set_tariff(tariff());
         let v = m.view(T0);
-        let md = group(&v, "GET aggTrades + GET klines");
+        let md = group(&v, "GET klines + GET historicalTrades");
         assert_eq!(md.per_minute, Some(600));
         assert_eq!(md.per_second, None);
-        assert_eq!(md.methods, ["GET aggTrades", "GET klines"]);
+        assert_eq!(md.methods, ["GET klines", "GET historicalTrades"]);
         let post = group(&v, "POST order");
         assert_eq!(post.per_minute, Some(900));
         assert_eq!(post.per_second, Some(15));
@@ -838,9 +839,13 @@ mod tests {
         let m = ApiMeter::detached();
         m.set_tariff(tariff());
         m.note("GET /fapi/v1/klines", T0, Call::Ok { rtt_ms: 10 });
-        m.note("GET /fapi/v1/aggTrades", T0, Call::Err { rtt_ms: 10 });
+        m.note(
+            "GET /fapi/v3/historicalTrades",
+            T0,
+            Call::Err { rtt_ms: 10 },
+        );
         let v = m.view(T0);
-        let g = group(&v, "GET aggTrades + GET klines");
+        let g = group(&v, "GET klines + GET historicalTrades");
         let last = (SPAN_MIN - 1) as usize;
         assert_eq!(g.calls[last], 2);
         assert_eq!(g.errors[last], 1);
@@ -881,7 +886,7 @@ mod tests {
                 "weight / 1 min",
                 "new orders / 1 min",
                 "new orders / 10 s",
-                "GET aggTrades + GET klines",
+                "GET klines + GET historicalTrades",
                 "POST order"
             ],
             "sorted, and first"

@@ -129,16 +129,9 @@ impl Tape {
     /// it; where it was not — evicted, or the market subscribed into the
     /// middle of the sweep — the gateway keeps it and the ring adds only what
     /// comes after. At worst that leaves undrawn a print of that one
-    /// millisecond only the ring heard; nothing is ever drawn twice (but for
-    /// the aggregates below), the two sides of the cut being disjoint.
-    ///
-    /// One exception to "nothing is ever drawn twice", since 02.10: the history is `aggTrades`
-    /// (merged fills) and the ring holds raw fills. An aggregate is stamped `T`, but 4-19 % of
-    /// the multi-fill ones (measured 02.10 on BTC, ETH, SOL) have fills in a later millisecond.
-    /// An aggregate kept whole on the history side whose fills spill past the cut has those fills
-    /// counted again from the ring. That is every such aggregate stamped within the few
-    /// milliseconds before the cut — usually one, more when several taker orders landed there —
-    /// at the seam of a deal's picture and nowhere else.
+    /// millisecond only the ring heard; nothing is ever drawn twice, the
+    /// two sides of the cut being disjoint. Both sides are raw fills (the history has been since
+    /// 02.10, `feed::last_hour`), so a print is a print on either side of the seam.
     ///
     /// What the reach cannot see: a stream gap that ends inside the seam's
     /// own millisecond, and a dealer print, which the gateway's reply carries

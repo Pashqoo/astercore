@@ -647,18 +647,21 @@ pub struct OrderReply {
     pub update_ms: i64,
 }
 
-/// One trade as the core reads it: an aggregated trade of `GET /fapi/v1/aggTrades` (the last-hour
-/// history), or a raw fill of `<symbol>@trade` (the live tape, [`StreamEvent::Trade`]).
+/// One trade as the core reads it: a raw fill of `<symbol>@trade` (the live tape,
+/// [`StreamEvent::Trade`]) or of `GET /fapi/v3/trades` (the last-hour history, via
+/// [`RawTradeRow`]).
 ///
-/// Measured 01.10 the `aggTrade` stream and the REST rows carry the same fields under the same names; the
-/// stream adds `e`, `E` and `s`, which is why `symbol` defaults — the REST
-/// answer is per symbol and does not repeat it.
+/// Measured 01.10 the `aggTrade` stream and the `aggTrades` rows (which the core no longer reads)
+/// carried the same fields under the same names, and the stream added `e`, `E` and `s`, which is
+/// why `symbol` defaults. The raw rows of `trades` name theirs differently (`RawTradeRow`); the
+/// `trade` frame of the stream is read as it is, with `a` absent.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AggTrade {
     #[serde(default, rename = "s")]
     pub symbol: String,
-    /// Aggregate trade id, the paging key of the REST call. A live `trade` frame has no `a` (its
-    /// id is `t`, which the core does not read): 0 there, so nothing may key on it for live prints.
+    /// The trade id, the paging key of `historicalTrades` (set from [`RawTradeRow`]). A live `trade`
+    /// frame has no `a` (its id is `t`, which the core does not read): 0 there, so nothing may key
+    /// on it for live prints.
     #[serde(default, rename = "a")]
     pub id: i64,
     #[serde(default, deserialize_with = "str_f64", rename = "p")]
@@ -673,6 +676,37 @@ pub struct AggTrade {
     /// tape is signed by: MoonBot's negative quantity is a sell.
     #[serde(default, rename = "m")]
     pub buyer_is_maker: bool,
+}
+
+/// One row of `GET /fapi/v3/trades` and `/fapi/v3/historicalTrades`, the raw fills:
+/// `{"id","price","qty","quoteQty","time","isBuyerMaker"}`. Read as an [`AggTrade`] (`id` is the
+/// trade id, the paging key of `historicalTrades`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawTradeRow {
+    /// Without an id (0) the paging back stops: a row that cannot be paged from fails nothing.
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default, deserialize_with = "str_f64")]
+    pub price: f64,
+    #[serde(default, deserialize_with = "str_f64")]
+    pub qty: f64,
+    #[serde(default)]
+    pub time: i64,
+    #[serde(default, rename = "isBuyerMaker")]
+    pub buyer_is_maker: bool,
+}
+
+impl From<RawTradeRow> for AggTrade {
+    fn from(r: RawTradeRow) -> Self {
+        Self {
+            symbol: String::new(),
+            id: r.id,
+            price: r.price,
+            qty: r.qty,
+            time_ms: r.time,
+            buyer_is_maker: r.buyer_is_maker,
+        }
+    }
 }
 
 impl AggTrade {
@@ -1134,6 +1168,22 @@ mod stream_tests {
             "the highest, whatever the order"
         );
         assert_eq!(b[1].max_leverage(), None);
+    }
+
+    #[test]
+    fn raw_trade_rows_read_as_prints_signed_by_the_aggressor() {
+        let rows: Vec<RawTradeRow> = serde_json::from_str(
+            r#"[{"id":1017104,"price":"0.2887000","qty":"346","quoteQty":"99.89","time":1790937178650,"isBuyerMaker":true},
+                {"id":1017105,"price":"0.2888000","qty":"20","quoteQty":"5.77","time":1790937181000,"isBuyerMaker":false}]"#,
+        )
+        .unwrap();
+        let t: Vec<AggTrade> = rows.into_iter().map(AggTrade::from).collect();
+        assert_eq!(
+            (t[0].id, t[0].price, t[0].time_ms, t[0].signed_qty()),
+            (1017104, 0.2887, 1790937178650, -346.0),
+            "the buyer the maker: a sell"
+        );
+        assert_eq!(t[1].signed_qty(), 20.0);
     }
 
     #[test]
