@@ -1480,7 +1480,12 @@ impl CoreHandler {
             let temporary: Vec<(String, i64)> = temporary
                 .into_iter()
                 .filter(|(_, days)| days.is_finite() && *days > 0.0)
-                .map(|(sym, days)| (sym, received_at + (days * 86_400_000.0) as i64))
+                // Capped at a century and added saturating: a typed «1e300 days» must not wrap
+                // the sum into the past (and the row with it out of the list).
+                .map(|(sym, days)| {
+                    let ms = (days.min(36_500.0) * 86_400_000.0) as i64;
+                    (sym, received_at.saturating_add(ms))
+                })
                 .collect();
             let list = (permanent.into_iter().collect::<HashSet<_>>(), temporary);
             let symbols =

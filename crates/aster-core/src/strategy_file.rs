@@ -104,7 +104,7 @@ pub(crate) fn text(v: &FieldValue) -> String {
 /// Strategies and every folder seen (including empty ones); malformed
 /// strategies are skipped with a log line.
 pub fn parse(text: &str, schema: &StrategySchema) -> (Vec<StrategySnapshot>, Vec<String>) {
-    let mut strategies = Vec::new();
+    let mut strategies: Vec<StrategySnapshot> = Vec::new();
     let mut folders: Vec<String> = Vec::new();
     let mut stack: Vec<String> = Vec::new();
     let mut fields: Option<Vec<(String, String)>> = None;
@@ -123,6 +123,14 @@ pub fn parse(text: &str, schema: &StrategySchema) -> (Vec<StrategySnapshot>, Vec
         } else if marker == END_STRATEGY {
             if let Some(pairs) = fields.take() {
                 match strategy(&pairs, &stack.join("/"), schema) {
+                    // One id is one strategy: a second block with the same `FIntID` (a file
+                    // pasted together by hand) would be listed and unreachable by id.
+                    Some(s) if strategies.iter().any(|t| t.strategy_id == s.strategy_id) => {
+                        log::warn!(
+                            "strategies file: a second strategy with id {} skipped",
+                            s.strategy_id
+                        )
+                    }
                     Some(s) => strategies.push(s),
                     None => log::warn!("strategies file: skipped a malformed strategy"),
                 }

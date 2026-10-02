@@ -37,6 +37,8 @@ use moonproto::server::codec::market_data::Candle;
 const TIMEFRAMES: [i64; 6] = [1, 5, 30, 60, 240, 1440];
 
 const API: &str = "https://api.telegram.org";
+/// The longest `retry_after` that is waited out whole; a larger one is an error on the other end.
+const RETRY_AFTER_MAX_S: u64 = 300;
 /// Wrong PINs before a new one is drawn.
 const PIN_TRIES: u32 = 10;
 /// `/chart` pictures being made at once; more are refused, not queued — each
@@ -45,16 +47,29 @@ const CHARTS_AT_ONCE: usize = 2;
 static CHARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Where the Bot API lives, for a verification run against a stub of it
 /// (`ASTER_TELEGRAM_API=http://127.0.0.1:8099`); unset means Telegram. The
-/// variable is read once per agent, from the same environment `.env` fills —
+/// variable is read once per process, at the first request, from the same environment `.env` fills —
 /// whoever can write that file owns the core already.
 const API_VAR: &str = "ASTER_TELEGRAM_API";
 
+/// Read once, at the first request, and said in the journal when it is not Telegram: a stub left
+/// in the environment of a production core would otherwise take the bot token to a local port
+/// with no line anywhere to show it.
 fn api_base() -> String {
-    std::env::var(API_VAR)
-        .ok()
-        .map(|v| v.trim().trim_end_matches('/').to_owned())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| API.to_owned())
+    static BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        let base = std::env::var(API_VAR)
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_owned())
+            .filter(|v| !v.is_empty());
+        match base {
+            Some(base) => {
+                log::warn!("telegram: {API_VAR} is set, the bot API is {base} and not Telegram");
+                base
+            }
+            None => API.to_owned(),
+        }
+    })
+    .clone()
 }
 /// One message a second: a burst of alarms must not spend the chat's budget
 /// (Telegram's own is 20 a minute) and arrive as a `429` besides.
@@ -437,7 +452,7 @@ impl Sending {
         match sent {
             Ok(()) => true,
             Err(Fail::RetryAfter(s)) => {
-                self.next_send = now + Duration::from_secs(s.clamp(1, 60));
+                self.next_send = now + Duration::from_secs(s.clamp(1, RETRY_AFTER_MAX_S));
                 self.queue.push_front(item);
                 false
             }
@@ -606,8 +621,8 @@ fn answer(resp: ureq::http::Response<ureq::Body>, token: &str) -> Result<(), Fai
     let why = json
         .get("description")
         .and_then(Value::as_str)
-        .unwrap_or(&body)
-        .to_owned();
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::aster::rest::shorten(&body));
     let why = hide(token, &format!("HTTP {status}: {why}"));
     // 5xx is the service, not the message: worth the same retries as a
     // dropped connection.
@@ -646,6 +661,8 @@ fn poll_loop(
     // Wrong PINs against the current one: past PIN_TRIES a new PIN is drawn,
     // so guessing a million values is not a matter of patience.
     let mut pin_misses = 0_u32;
+    // The last refusal put in the journal: the same one again is waited out without a line.
+    let mut refused_said: Option<String> = None;
     // Strangers already named in the journal, so one does not flood it.
     let mut strangers: std::collections::HashSet<i64> = std::collections::HashSet::new();
     loop {
@@ -697,11 +714,24 @@ fn poll_loop(
                     );
                     continue;
                 }
-                Err(e) => {
-                    let e = match e {
-                        Fail::RetryAfter(s) => format!("retry after {s} s"),
-                        Fail::Refused(e) | Fail::Transport(e) => e,
-                    };
+                Err(Fail::RetryAfter(s)) => {
+                    log::warn!("telegram: getUpdates (backlog): retry after {s} s");
+                    wait_out(
+                        rx,
+                        Duration::from_secs(s.min(RETRY_AFTER_MAX_S)),
+                        &mut settings,
+                    );
+                    continue;
+                }
+                Err(Fail::Refused(e)) => {
+                    if refused_said.as_deref() != Some(e.as_str()) {
+                        log::warn!("telegram: getUpdates (backlog): {e}");
+                        refused_said = Some(e);
+                    }
+                    wait_out(rx, REFUSED_WAIT, &mut settings);
+                    continue;
+                }
+                Err(Fail::Transport(e)) => {
                     log::warn!("telegram: getUpdates (backlog): {e}");
                     idle(rx, IDLE, &mut settings);
                     continue;
@@ -710,13 +740,28 @@ fn poll_loop(
         }
         let started = Instant::now();
         let updates = match get_updates(&agent, &token, offset) {
-            Ok(updates) => updates,
+            Ok(updates) => {
+                refused_said = None;
+                updates
+            }
             Err(Fail::RetryAfter(s)) => {
                 // A 409 arrives here too: another core is polling this token.
-                idle(rx, Duration::from_secs(s), &mut settings);
+                wait_out(
+                    rx,
+                    Duration::from_secs(s.min(RETRY_AFTER_MAX_S)),
+                    &mut settings,
+                );
                 continue;
             }
-            Err(Fail::Refused(e) | Fail::Transport(e)) => {
+            Err(Fail::Refused(e)) => {
+                if refused_said.as_deref() != Some(e.as_str()) {
+                    log::warn!("telegram: getUpdates: {e}");
+                    refused_said = Some(e);
+                }
+                wait_out(rx, REFUSED_WAIT, &mut settings);
+                continue;
+            }
+            Err(Fail::Transport(e)) => {
                 log::warn!("telegram: getUpdates: {e}");
                 idle(rx, IDLE, &mut settings);
                 continue;
@@ -1036,6 +1081,32 @@ fn idle(rx: &Receiver<Settings>, wait: Duration, settings: &mut Settings) {
     }
 }
 
+/// Wait out `wait` — a time Telegram named, or a pause after a refusal — taking the settings
+/// that arrive meanwhile but not leaving the wait for them, unless they change the token or the
+/// proxy (another bot, another road: the wait was about the old one).
+fn wait_out(rx: &Receiver<Settings>, wait: Duration, settings: &mut Settings) {
+    let until = Instant::now() + wait;
+    let (token, proxy) = (
+        settings.telegram.token.clone(),
+        settings.telegram.proxy.clone(),
+    );
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(left) {
+            Ok(next) => {
+                *settings = next;
+                if settings.telegram.token != token || settings.telegram.proxy != proxy {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// The wait after Telegram refused a poll outright (a rejected token): not the 5 s of a dropped
+/// connection, which would make a journal line every five seconds for as long as it lasts.
+const REFUSED_WAIT: Duration = Duration::from_secs(60);
+
 fn get_updates(agent: &Agent, token: &str, offset: i64) -> Result<Vec<Update>, Fail> {
     get_updates_waiting(agent, token, offset, POLL_S)
 }
@@ -1069,7 +1140,7 @@ fn get_updates_waiting(
         .pointer("/parameters/retry_after")
         .and_then(Value::as_u64)
     {
-        return Err(Fail::RetryAfter(after.clamp(1, 300)));
+        return Err(Fail::RetryAfter(after.clamp(1, RETRY_AFTER_MAX_S)));
     }
     if status == 409 {
         log::warn!(
@@ -1082,7 +1153,8 @@ fn get_updates_waiting(
         let why = json
             .get("description")
             .and_then(Value::as_str)
-            .unwrap_or(&body);
+            .map(str::to_owned)
+            .unwrap_or_else(|| crate::aster::rest::shorten(&body));
         return Err(Fail::Refused(hide(token, &format!("HTTP {status}: {why}"))));
     }
     Ok(updates_of(&json))
@@ -1116,8 +1188,8 @@ fn updates_of(json: &Value) -> Vec<Update> {
 
 /// Six digits nobody can guess from the outside: the chat that sends them back
 /// gets to stop the core (Ф3), so it is not a counter. The kernel's randomness where there is
-/// one; a clock mix only where there is none (non-unix), which the PIN's short life and the
-/// chat binding make tolerable — unlike a session id, which has no fallback.
+/// one; a clock mix only where there is none (non-unix, or `/dev/urandom` unreadable), which the
+/// PIN's short life and the chat binding make tolerable — unlike a session id, which has none.
 fn new_pin() -> String {
     // The kernel's randomness first, as the page's session ids take it; the clock mix below is
     // the fallback where there is none.
@@ -1608,6 +1680,41 @@ fn duration(secs: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A wait Telegram asked for is not cut short by settings that change nothing it was about,
+    /// and is left at once for a new token.
+    #[test]
+    fn a_named_wait_is_kept_unless_the_bot_changes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut settings = Settings::default();
+        settings.telegram.token = "1:a".into();
+
+        let same = settings.clone();
+        let sender = tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            let _ = sender.send(same);
+        });
+        let t = Instant::now();
+        wait_out(&rx, Duration::from_millis(300), &mut settings);
+        assert!(
+            t.elapsed() >= Duration::from_millis(280),
+            "{:?}",
+            t.elapsed()
+        );
+
+        let mut other = settings.clone();
+        other.telegram.token = "2:b".into();
+        let sender = tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            let _ = sender.send(other);
+        });
+        let t = Instant::now();
+        wait_out(&rx, Duration::from_secs(5), &mut settings);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert_eq!(settings.telegram.token, "2:b");
+    }
+
     /// Pairing by PIN: a right one (spaces around it allowed) pairs and clears the count; a
     /// wrong one is counted, reported on the first and every tenth, and the tenth draws a new
     /// PIN — and a count carried over a right guess would not start from zero.

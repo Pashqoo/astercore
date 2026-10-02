@@ -3988,7 +3988,12 @@ fn seconds(v: f64) -> f64 {
 }
 
 fn secs_ms(s: f64) -> i64 {
-    (s * 1000.0) as i64
+    // Capped at ten years: a setting is text a person typed, `as i64` saturates, and the sums
+    // this feeds (`now + …`) must not wrap.
+    if s.is_nan() {
+        return 0;
+    }
+    (s.min(315_360_000.0) * 1000.0) as i64
 }
 
 /// The strategy's own name, or `#id` when it has none — the terminal's own

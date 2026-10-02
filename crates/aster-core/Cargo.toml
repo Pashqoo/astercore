@@ -18,7 +18,9 @@ serde_json = "1"
 ureq = { version = "3", features = ["json", "socks-proxy"] }
 # WebSocket for the market streams, synchronous for the same reason as `ureq`:
 # one thread per stream and no runtime (`PLAN.md`, "Транспорт"). Built on the
-# rustls already in the tree for `ureq`, with the same webpki roots.
+# rustls already in the tree for `ureq`. The webpki roots are NOT the same crate version:
+# `ureq` carries `webpki-roots` 1.x and tungstenite 0.30 asks for 0.26 (both in Cargo.lock);
+# the root list is the same data, the two copies are the price of the two crates' pins.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 # Aster v3 signing: EIP-712 over secp256k1 with Keccak-256 (`aster/sign.rs`).
 # `k256` 0.13 sits on the same `digest` 0.10 as the `sha3` already in the tree,

@@ -1,4 +1,5 @@
 /target
+/target-head/
 _target/
 
 # Credentials and key material. Named widely on purpose: `*.key` alone did not

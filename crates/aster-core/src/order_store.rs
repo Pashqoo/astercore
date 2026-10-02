@@ -72,6 +72,9 @@ pub struct OrderStore {
     saved_at: i64,
     /// The last write failed: logged once until one succeeds.
     failing: bool,
+    /// `last` is on disk for sure (the write that made it was forced, with an fsync): a later
+    /// forced save of the same text still owes the fsync if this is false.
+    synced: bool,
 }
 
 impl OrderStore {
@@ -109,6 +112,7 @@ impl OrderStore {
             last: String::new(),
             saved_at: 0,
             failing: false,
+            synced: false,
         };
         (store, saved)
     }
@@ -146,6 +150,17 @@ impl OrderStore {
             }
         };
         if text == self.last {
+            // The same snapshot as the last write, which a once-a-second save left unsynced:
+            // a forced save (the one before an order request) still has to make it durable.
+            if force && !self.synced {
+                match fs::File::open(&self.path).and_then(|f| f.sync_all()) {
+                    Ok(()) => self.synced = true,
+                    Err(e) => {
+                        log::warn!("orders: {}: sync: {e}", self.path.display());
+                        return false;
+                    }
+                }
+            }
             return true;
         }
         let tmp = self.path.with_extension("json.tmp");
@@ -153,11 +168,26 @@ impl OrderStore {
             .path
             .parent()
             .map_or(Ok(()), fs::create_dir_all)
-            .and_then(|()| fs::write(&tmp, &text))
+            .and_then(|()| {
+                use std::io::Write;
+                let mut f = fs::File::create(&tmp)?;
+                f.write_all(text.as_bytes())?;
+                // On disk before the rename makes it the file, so a crash leaves the old one or
+                // the whole new one, never an empty name — but only for a FORCED save, the one
+                // before an order request, whose key must survive a crash. The once-a-second
+                // ones skip the fsync (it would stall the trading thread every second) and
+                // accept that a power loss may cost them: the next forced save repeats the
+                // text and syncs it (`synced`).
+                if force {
+                    f.sync_all()?;
+                }
+                Ok(())
+            })
             .and_then(|()| fs::rename(&tmp, &self.path));
         match written {
             Ok(()) => {
                 self.last = text;
+                self.synced = force;
                 self.failing = false;
                 true
             }

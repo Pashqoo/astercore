@@ -819,11 +819,27 @@ impl Strategies {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if !self.backed_up.replace(true) && path.exists() {
-            let mut prev = path.as_os_str().to_owned();
-            prev.push(".prev");
-            if let Err(e) = std::fs::copy(path, PathBuf::from(prev)) {
-                log::warn!("strategies: backup of {}: {e}", path.display());
+        if !self.backed_up.get() && path.exists() {
+            let with = |suffix: &str| {
+                let mut o = path.as_os_str().to_owned();
+                o.push(suffix);
+                PathBuf::from(o)
+            };
+            let (prev, older, fresh) = (with(".prev"), with(".prev2"), with(".prev.new"));
+            // Copied beside first and moved into place: a copy that fails partway must not
+            // become `.prev`. Two generations cover one restart after a lossy run — no more.
+            match std::fs::copy(path, &fresh) {
+                Ok(_) => {
+                    let _ = std::fs::rename(&prev, &older);
+                    match std::fs::rename(&fresh, &prev) {
+                        Ok(()) => self.backed_up.set(true),
+                        Err(e) => log::warn!("strategies: backup of {}: {e}", path.display()),
+                    }
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&fresh);
+                    log::warn!("strategies: backup of {}: {e}", path.display());
+                }
             }
         }
         let mut tmp = path.as_os_str().to_owned();
@@ -852,15 +868,16 @@ fn within(path: &str, folder: &str) -> bool {
 
 /// Registers `path` and its parents once (first spelling wins).
 fn add_folder(folders: &mut Vec<String>, path: &str) {
-    let mut end = 0;
-    for seg in path.split('/') {
-        if seg.is_empty() {
-            continue;
+    // The prefix is built from the segments, not cut out of `path` by their lengths: a leading
+    // or doubled `/` shifts every such index, and one into a multi-byte character panics.
+    let mut prefix = String::new();
+    for seg in path.split('/').filter(|seg| !seg.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('/');
         }
-        end = end + seg.len() + usize::from(end > 0);
-        let prefix = &path[..end];
-        if !folders.iter().any(|f| f.eq_ignore_ascii_case(prefix)) {
-            folders.push(prefix.to_string());
+        prefix.push_str(seg);
+        if !folders.iter().any(|f| f.eq_ignore_ascii_case(&prefix)) {
+            folders.push(prefix.clone());
         }
     }
 }
@@ -962,6 +979,22 @@ mod tests {
         assert!(st.partial_payload(1, &[1]).is_some());
     }
 
+    /// A file pasted together by hand can hold one strategy id twice: it is listed once.
+    #[test]
+    fn a_strategy_id_twice_in_the_file_is_listed_once() {
+        let dir = std::env::temp_dir().join(format!("aster-dupid-{}", std::process::id()));
+        let file = dir.join("strategies.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut st = Strategies::new(Some(file.clone()), 1_000);
+        let a = shot(7, 3, 5_000, "A", 250.0);
+        st.apply_snapshot(&snap(&st, &[a], true, 2_000, 2_000));
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, format!("{text}{text}")).unwrap();
+        let again = Strategies::new(Some(file.clone()), 9_000);
+        assert_eq!(again.list().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn persists_and_reloads() {
         let dir = std::env::temp_dir().join(format!("aster-strat-{}", std::process::id()));
@@ -988,6 +1021,19 @@ mod tests {
             assert!(again.folders().iter().any(|x| x == f), "folder {f}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Folder paths with a leading or doubled `/`, or with multi-byte names, register the right
+    /// parents and do not panic.
+    #[test]
+    fn add_folder_registers_the_parents_of_any_spelling() {
+        let mut folders = Vec::new();
+        add_folder(&mut folders, "/Тест//Вложенная/");
+        assert_eq!(folders, ["Тест", "Тест/Вложенная"]);
+        // ASCII case folds (the first spelling wins); other alphabets compare as written.
+        add_folder(&mut folders, "a/B");
+        add_folder(&mut folders, "A/b/c");
+        assert_eq!(folders, ["Тест", "Тест/Вложенная", "a", "a/B", "A/b/c"]);
     }
 
     /// A file that cannot be read (here: not UTF-8) is not the empty list: the first change from

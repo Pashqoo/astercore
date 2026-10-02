@@ -59,7 +59,7 @@ pub enum StartMode {
     Off,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Telegram {
     /// Bot token from @BotFather; empty = the reports are off.
@@ -109,13 +109,70 @@ pub struct Shots {
     pub send_negative: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Web {
     /// `host:port`. Anything but loopback needs a password: the page stops
     /// and starts the trading and holds the bot token.
     pub bind: String,
     pub password: String,
+}
+
+/// «set» / «not set» for a secret in a `Debug`: a settings struct ends up in `{:?}` of a log line
+/// or a panic message sooner or later, and the bot token and the page password must not.
+fn secret(value: &str) -> &'static str {
+    if value.is_empty() {
+        "not set"
+    } else {
+        "set"
+    }
+}
+
+impl std::fmt::Debug for Telegram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Telegram")
+            .field("token", &secret(&self.token))
+            .field("chat_id", &self.chat_id)
+            // A proxy url may carry `user:password@`.
+            .field("proxy", &secret(&self.proxy))
+            .field("daily_at", &self.daily_at)
+            .field("events", &self.events)
+            .field("shots", &self.shots)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Web {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Web")
+            .field("bind", &self.bind)
+            .field("password", &secret(&self.password))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Edit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Edit")
+            .field("log_level", &self.log_level)
+            .field("log_keep_days", &self.log_keep_days)
+            .field("start_strategies", &self.start_strategies)
+            .field(
+                "telegram_token",
+                &self.telegram_token.as_deref().map(secret),
+            )
+            .field("telegram_chat_id", &self.telegram_chat_id)
+            .field(
+                "telegram_proxy",
+                &self.telegram_proxy.as_deref().map(secret),
+            )
+            .field("telegram_daily_at", &self.telegram_daily_at)
+            .field("telegram_events", &self.telegram_events)
+            .field("telegram_shots", &self.telegram_shots)
+            .field("web_bind", &self.web_bind)
+            .field("web_password", &self.web_password.as_deref().map(secret))
+            .finish()
+    }
 }
 
 impl Default for Settings {
@@ -185,7 +242,7 @@ impl Default for Web {
 /// blank them both. The owner of the settings — the trading loop — merges the
 /// patch into its own copy and saves that, which is also why a long-running
 /// form cannot revert a field somebody else changed meanwhile.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Edit {
     pub log_level: Option<String>,
@@ -466,6 +523,10 @@ impl Settings {
             fs::create_dir_all(dir)?;
         }
         let tmp = path.with_extension("json.tmp");
+        // A `.tmp` left by a crash may carry wider rights than 600 (`.mode` applies at creation
+        // only), and the rename would hand them to `config.json`: it is removed first, so the
+        // new one is created, and with the right mode.
+        let _ = fs::remove_file(&tmp);
         write_private(&tmp, &text)?;
         fs::rename(&tmp, path)
     }
@@ -494,12 +555,17 @@ fn write_private(path: &Path, contents: &str) -> io::Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(path)?;
-    file.write_all(contents.as_bytes())
+    file.write_all(contents.as_bytes())?;
+    // The token and the password: on disk before the rename that makes this the config.
+    file.sync_all()
 }
 
 #[cfg(not(unix))]
 fn write_private(path: &Path, contents: &str) -> io::Result<()> {
-    fs::write(path, contents)
+    use std::io::Write;
+    let mut file = fs::File::create(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
 }
 
 /// Tighten a file an older core, an editor or a copy left readable. Reported,
@@ -536,6 +602,26 @@ fn tighten(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
+    /// The bot token, the page password and a proxy url with credentials never reach a `{:?}`.
+    #[test]
+    fn debug_output_hides_the_secrets() {
+        let mut s = Settings::default();
+        s.telegram.token = "123456:SECRET-TOKEN".into();
+        s.telegram.proxy = "socks5://user:hunter2@host:1080".into();
+        s.web.password = "page-password".into();
+        let edit = Edit {
+            telegram_token: Some("123456:SECRET-TOKEN".into()),
+            web_password: Some("page-password".into()),
+            ..Edit::default()
+        };
+        for text in [format!("{s:?}"), format!("{edit:?}")] {
+            for secret in ["SECRET-TOKEN", "hunter2", "page-password"] {
+                assert!(!text.contains(secret), "{secret} in {text}");
+            }
+        }
+        assert!(format!("{s:?}").contains("token: \"set\""));
+    }
+
     use super::*;
 
     fn scratch(name: &str) -> std::path::PathBuf {

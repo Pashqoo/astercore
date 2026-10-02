@@ -301,15 +301,21 @@ loopback + 54 теста серверной части вендора, `tools/ch
 ### Мелкие
 
 Персистентность:
-- [ ] `reports.rs:326` — `File::open` с не-NotFound ошибкой → epoch 0, `rewrite()` стирает историю.
+- [x] `reports.rs:326` — `File::open` с не-NotFound ошибкой → epoch 0, `rewrite()` стирает историю.
+  **02.10:** ошибка чтения — `unreadable`, ничего не пишется; не-UTF-8 строка пропускается, перед первой перезаписью копия `.bak` (нет копии — нет перезаписи); тесты `an_unreadable_history_is_not_overwritten`, `a_line_that_is_not_text_costs_only_itself`. Остаётся: в режиме `unreadable` rec_id идут с 1 в памяти, эпоха выдумана.
 - [ ] `reports.rs:530` — `writeln!` на `File` = два сискола; падение между ними склеивает строки.
-- [ ] `reports.rs:335` — уплотнение `reports.jsonl` только при открытии, рост без предела.
+  **02.10:** одна запись `write_all`, теста нет.
+- [x] `reports.rs:335` — уплотнение `reports.jsonl` только при открытии, рост без предела.
+  **02.10:** уплотнение и во время работы (`lines > 2*rows+64`, повтор после неудачи не раньше чем через rows+64 обновлений); fsync на потоке торговли раз в rows+64 обновлений — принято.
 - [ ] `reports.rs:187` — вид удалённой стратегии в новой строке всегда MoonShot; `penalty_marks` не
   узнает Manual. Хранить вид в `CoreOrder`.
 - [ ] `order_store.rs:150` — temp+rename без `sync_all`.
-- [ ] `strategy_file.rs:148` — два блока с одним `FIntID` оба в списке, второй — сирота.
-- [ ] `strategies.rs:798` — `add_folder` считает индекс арифметикой длин: ведущий/двойной `/` даёт
+  **02.10:** fsync только на форсированном сохранении (перед ордером); теста нет.
+- [x] `strategy_file.rs:148` — два блока с одним `FIntID` оба в списке, второй — сирота.
+  **02.10:** тест `a_strategy_id_twice_in_the_file_is_listed_once`; вторая копия теряется при следующем сохранении, остаётся `.prev`/`.prev2`.
+- [x] `strategies.rs:798` — `add_folder` считает индекс арифметикой длин: ведущий/двойной `/` даёт
   сдвиг, с кириллицей может попасть внутрь символа и запаниковать в потоке движка.
+  **02.10:** тест `add_folder_registers_the_parents_of_any_spelling`.
 
 Ордера:
 - [ ] `orders.rs:1774` + `engine.rs:1579` — ClosePosition фильтрует `emulator == emu_mode()`: при
@@ -348,28 +354,43 @@ loopback + 54 теста серверной части вендора, `tools/ch
   `ws::MAX_STREAMS` = 200, `POOL_WIDE` = 300.
 
 Процесс:
-- [ ] `main.rs:441` — `install_signals()` после `Server::bind`: SIGTERM на старте → 143, не 0.
+- [x] `main.rs:441` — `install_signals()` после `Server::bind`: SIGTERM на старте → 143, не 0.
+  **02.10:** сознательно: стоп во время старта должен убить процесс; для systemd SIGTERM — штатная остановка (комментарий в `main.rs`).
 - [ ] `main.rs:512` — поток `api-meter` без catch_unwind/`is_finished`: паника тихо убивает heartbeat.
+  **02.10:** проход под `catch_unwind`, поток живёт; теста нет.
 - [ ] `stderr_log.rs:68` — `eprintln!` в потоке цикла паникует на EPIPE; файл небуферизован под
   глобальным Mutex. `let _ = writeln!(stderr.lock())`, файл через BufWriter/поток.
+  **02.10:** `write_all` без паники на EPIPE и в `open_day`/`remove_stale`; файл по-прежнему без буфера под мьютексом; теста нет.
 - [ ] `engine.rs:1411` — `(days * 86_400_000.0) as i64` при большом `days` переполняет сумму.
-- [ ] `aster/rest.rs:573` — не-JSON тело отказа (HTML 502) целиком в журнал и Telegram. Обрезать.
-- [ ] `trading.rs:200` — при транспортной ошибке в `Ping` стратегий уходит 30 с вместо реального rtt.
-- [ ] `api_meter.rs:72` + `main.rs:103` — комментарий о чтении `rateLimits`, лимиты 2400/1200/300
+  **02.10:** срок чёрного списка ограничен веком, `saturating_add`; теста нет. Тот же класс — `secs_ms` в `moonshot.rs` (потолок 10 лет).
+- [x] `aster/rest.rs:573` — не-JSON тело отказа (HTML 502) целиком в журнал и Telegram. Обрезать.
+  **02.10:** тест `a_body_that_is_not_json_is_cut_to_one_short_line`; то же для тел Telegram.
+- [x] `trading.rs:200` — при транспортной ошибке в `Ping` стратегий уходит 30 с вместо реального rtt.
+  **02.10:** задумано: документ `TradingEvent::Ping` — «вызов, не ответивший, читается как таймаут вызова».
+- [x] `api_meter.rs:72` + `main.rs:103` — комментарий о чтении `rateLimits`, лимиты 2400/1200/300
   захардкожены.
+  **02.10:** комментарии приведены к коду: лимиты записаны, не читаются.
 
 Обвес:
-- [ ] `settings.rs:188`, `:31`, `:238` — `derive(Debug)` на структурах с токеном и паролем
+- [x] `settings.rs:188`, `:31`, `:238` — `derive(Debug)` на структурах с токеном и паролем
   (web.rs:788 для `Request` его намеренно нет). Ручной Debug «set/not set».
+  **02.10:** ручной `Debug` для `Telegram`/`Web`/`Edit`, тест `debug_output_hides_the_secrets`; то же для `ListenKey`.
 - [ ] `settings.rs:467` — `.mode(0o600)` только при создании tmp; оставшийся `config.json.tmp` с
   широкими правами переносит их на `config.json`.
+  **02.10:** старый `.tmp` удаляется перед записью, `sync_all`; теста нет.
 - [ ] `web.rs:476` — `/logout` не за `tagged`.
+  **02.10:** `/logout` за `tagged`; теста нет.
 - [ ] `web.rs:54`, `:184` — при bind в сеть 8 слотов × 20 с: 8 праздных сокетов → 503.
+  **02.10:** таймаут чтения шапки 5 с; теста нет.
 - [ ] `telegram.rs:1087` — PIN из `SystemTime` + LCG, `/dev/urandom` уже читается в web.rs.
-- [ ] `telegram.rs:700` — RetryAfter в бэклоге ждёт 5 с вместо 30/retry_after.
+  **02.10:** PIN из `/dev/urandom`.
+- [x] `telegram.rs:700` — RetryAfter в бэклоге ждёт 5 с вместо 30/retry_after.
+  **02.10:** `wait_out` (до 300 с, не обрывается настройками без смены бота), тест `a_named_wait_is_kept_unless_the_bot_changes`.
 - [ ] `telegram.rs:719` — отвергнутый токен: `warn` каждые 5 с бессрочно.
+  **02.10:** `REFUSED_WAIT` 60 с и одна строка на сообщение; Transport и 409 по-прежнему пишутся каждый раз.
 - [ ] `telegram.rs:46` — `api_base()` читает окружение на каждом запросе; заглушка
   `ASTER_TELEGRAM_API` в боевом бинаре без строки в журнале.
+  **02.10:** `api_base` читается один раз, строка в журнале при подмене.
 
 Вендорный сервер:
 - [ ] `moonproto/src/server/mod.rs:229` — повтор перехваченного Hello (timestamp не проверяется)
@@ -384,11 +405,13 @@ loopback + 54 теста серверной части вендора, `tools/ch
 - [ ] `tests/fixtures/phantom_30042_entry.json`, `unac_lost_replace.json` — снимки TInvestCore
   (MOEX-id, код 30042); в loopback `EXCHANGE_INFO` нет не-USDT котировки и пустого `contractType`.
 - [ ] `main.rs:450` — выбор кода выхода по `feeds.dead()`/`halt.code()` проверен только руками.
-- [ ] `Cargo.toml:21` — «те же webpki roots» неверно: `webpki-roots` 0.26.11 и 1.0.9 в Cargo.lock.
+- [x] `Cargo.toml:21` — «те же webpki roots» неверно: `webpki-roots` 0.26.11 и 1.0.9 в Cargo.lock.
+  **02.10:** комментарий исправлен.
 - [ ] Cargo.lock — дубли rand/base64/digest/getrandom/syn (ureq 3.4 + tungstenite 0.30 против пинов
   moonproto); лечится только бампом upstream.
 - [ ] `Idea.md` — рабочая заметка в публичном репо, ссылка из `aster.mdc:33`.
-- [ ] `target-head/` только в `.git/info/exclude`, не в `.gitignore`.
+- [x] `target-head/` только в `.git/info/exclude`, не в `.gitignore`.
+  **02.10:** в `.gitignore`.
 
 **Проверено и в порядке** (не перепроверять): сшивка стакана по правилам Binance Futures и
 `Px(u64)`; границы 5m-свечей; подписки без утечек, снятие у ушедшего клиента через 60 с; nonce

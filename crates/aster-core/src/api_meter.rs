@@ -68,7 +68,10 @@ pub const METHODS: [&str; 15] = [
 ];
 
 /// The exchange's own figures of what this IP has spent, from the answers'
-/// headers, as cards: the name, the header behind it, and its limit.
+/// headers, as cards: the name, the header behind it, and its limit. The limits are written
+/// here as `exchangeInfo.rateLimits` gave them on 01.10 (2400 weight, 1200 orders a minute, 300
+/// a 10 s window), not read at start: a change on the exchange's side shows as a card that
+/// disagrees with the header, and is changed here.
 const GAUGES: [(&str, &str, i64); 3] = [
     ("weight / 1 min", "x-mbx-used-weight-1m", 2400),
     ("new orders / 1 min", "x-mbx-order-count-1m", 1200),

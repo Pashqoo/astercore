@@ -52,6 +52,9 @@ const IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// and there are only [`MAX_CONNS`] of them between the operator and the Stop
 /// button.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
+/// The headers of a request are a few hundred bytes a browser sends at once: a connection that
+/// has not finished them in this long is holding one of the [`MAX_CONNS`] slots for nothing.
+const HEAD_DEADLINE: Duration = Duration::from_secs(5);
 /// What one request may be at most.
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 64 * 1024;
@@ -280,7 +283,12 @@ fn host_ok(host: &str, bound: &str) -> bool {
 fn read_request(stream: &TcpStream) -> Result<Request, String> {
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let mut reader = BufReader::new(stream);
-    let head = read_head(&mut reader, deadline)?;
+    // A read blocks up to its socket timeout, and the head deadline is looked at only between
+    // reads: the timeout of the head is the head deadline, the body's is the usual one.
+    let _ = stream.set_read_timeout(Some(HEAD_DEADLINE));
+    let head = read_head(&mut reader, Instant::now() + HEAD_DEADLINE);
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let head = head?;
     let head = String::from_utf8_lossy(&head);
     let mut lines = head.lines();
     let first = lines.next().ok_or("no request line")?;
@@ -844,7 +852,7 @@ mod tests {
     }
 
     /// A socket timeout bounds one read; this bounds the request. Driven with
-    /// a deadline that is already up, because the real one is 20 s.
+    /// a deadline that is already up, because the real one is 5 s (`HEAD_DEADLINE`).
     #[test]
     fn a_request_that_outstays_its_deadline_is_dropped() {
         let err = on_stream("GET / HTTP/1.1\r\nX-Pad: no newline here", |stream| {

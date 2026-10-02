@@ -309,6 +309,14 @@ pub struct Reports {
     by_order: HashMap<u64, i64>,
     /// Row lines in the file (to decide on compaction).
     lines: usize,
+    /// The file exists and could not be read: what is in memory is not what is on disk, and
+    /// nothing is written over it (the history it holds is the trader's).
+    unreadable: bool,
+    /// The file was read but not whole (a line that was not UTF-8 or not a row): a copy is
+    /// kept before the first rewrite drops it.
+    damaged: bool,
+    /// After a failed rewrite: no new attempt until the line count passes this.
+    retry_above: usize,
 }
 
 impl Reports {
@@ -321,12 +329,21 @@ impl Reports {
             rows: BTreeMap::new(),
             by_order: HashMap::new(),
             lines: 0,
+            unreadable: false,
+            damaged: false,
+            retry_above: 0,
         };
         if let Some(path) = r.path.clone() {
             match File::open(&path) {
                 Ok(file) => r.load(BufReader::new(file)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log::warn!("reports: {}: {e}", path.display()),
+                Err(e) => {
+                    log::error!(
+                        "reports: {}: {e}; the history is left as it is and nothing is written to it",
+                        path.display()
+                    );
+                    r.unreadable = true;
+                }
             }
         }
         if r.epoch == 0 {
@@ -339,7 +356,25 @@ impl Reports {
     }
 
     fn load(&mut self, reader: impl BufRead) {
-        let mut lines = reader.lines().map_while(Result::ok).enumerate().peekable();
+        // A line that is not UTF-8 is skipped (the lines after it are good); any other read
+        // error ends the load and leaves the file alone (`unreadable`).
+        let mut texts = Vec::new();
+        for line in reader.lines() {
+            match line {
+                Ok(text) => texts.push(text),
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    log::warn!("reports: line {} is not text, skipped", texts.len() + 1);
+                    self.damaged = true;
+                    texts.push(String::new());
+                }
+                Err(e) => {
+                    log::error!("reports: read stopped at line {}: {e}", texts.len() + 1);
+                    self.unreadable = true;
+                    break;
+                }
+            }
+        }
+        let mut lines = texts.into_iter().enumerate().peekable();
         let header = lines
             .peek()
             .and_then(|(_, h)| serde_json::from_str::<Header>(h).ok());
@@ -350,7 +385,10 @@ impl Reports {
             }
             // The rows (the first line too) are kept; a new epoch makes
             // replicas start over.
-            _ => log::warn!("reports: bad header, rows kept under a new epoch"),
+            _ => {
+                log::warn!("reports: bad header, rows kept under a new epoch");
+                self.damaged = true;
+            }
         }
         for (n, line) in lines {
             if line.trim().is_empty() {
@@ -362,7 +400,10 @@ impl Reports {
                     self.by_order.insert(row.task_id, row.rec_id);
                     self.rows.insert(row.rec_id, row);
                 }
-                _ => log::warn!("reports: line {} skipped", n + 1),
+                _ => {
+                    log::warn!("reports: line {} skipped", n + 1);
+                    self.damaged = true;
+                }
             }
         }
     }
@@ -522,18 +563,26 @@ impl Reports {
     }
 
     fn store(&mut self, row: Row) {
-        if let Some(path) = &self.path {
-            let line = serde_json::to_string(&row).expect("row serializes");
+        if let Some(path) = self.path.clone().filter(|_| !self.unreadable) {
+            // One `write`: a line written in two (`writeln!` on a `File`) can be cut between
+            // them, and the next line then glues onto the first.
+            let mut line = serde_json::to_string(&row).expect("row serializes");
+            line.push('\n');
             let appended = OpenOptions::new()
                 .append(true)
-                .open(path)
-                .and_then(|mut f| writeln!(f, "{line}"));
+                .open(&path)
+                .and_then(|mut f| f.write_all(line.as_bytes()));
             match appended {
                 Ok(()) => self.lines += 1,
                 Err(e) => log::warn!("reports: {}: {e}", path.display()),
             }
         }
         self.rows.insert(row.rec_id, row);
+        // The file keeps every update of a row; past twice the rows it is written afresh, or it
+        // grows without bound while the core runs.
+        if self.lines > 2 * self.rows.len() + 64 && self.lines > self.retry_above {
+            self.rewrite();
+        }
     }
 
     /// Write the header and the current rows to a temp file, then rename.
@@ -541,6 +590,26 @@ impl Reports {
         let Some(path) = &self.path else {
             return;
         };
+        if self.unreadable {
+            return;
+        }
+        if self.damaged && path.exists() {
+            let mut bak = path.as_os_str().to_owned();
+            bak.push(".bak");
+            match fs::copy(path, PathBuf::from(&bak)) {
+                Ok(_) => self.damaged = false,
+                // No copy, no rewrite: the rewrite would drop the lines that could not be
+                // read, and the copy is all that would be left of them.
+                Err(e) => {
+                    log::error!(
+                        "reports: backup of {} failed ({e}); the file is left as it is",
+                        path.display()
+                    );
+                    self.retry_above = self.lines + self.rows.len() + 64;
+                    return;
+                }
+            }
+        }
         let mut text = serde_json::to_string(&Header { epoch: self.epoch }).expect("header");
         text.push('\n');
         for row in self.rows.values() {
@@ -551,11 +620,23 @@ impl Reports {
         let written = path
             .parent()
             .map_or(Ok(()), fs::create_dir_all)
-            .and_then(|()| fs::write(&tmp, text))
+            .and_then(|()| {
+                let mut f = File::create(&tmp)?;
+                f.write_all(text.as_bytes())?;
+                f.sync_all()
+            })
             .and_then(|()| fs::rename(&tmp, path));
         match written {
-            Ok(()) => self.lines = self.rows.len(),
-            Err(e) => log::warn!("reports: {}: {e}", path.display()),
+            Ok(()) => {
+                self.lines = self.rows.len();
+                self.retry_above = 0;
+            }
+            Err(e) => {
+                log::warn!("reports: {}: {e}", path.display());
+                // Not again on the very next row: after as many more updates as the file has
+                // rows, or a full disk would cost a full serialisation per update.
+                self.retry_above = self.lines + self.rows.len() + 64;
+            }
         }
     }
 }
@@ -796,6 +877,61 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 2);
         let _ = fs::remove_file(path);
+    }
+
+    /// A line that is not UTF-8 costs that line, not the history after it; the file as it was is
+    /// kept beside, since the rewrite drops what it could not read.
+    #[test]
+    fn a_line_that_is_not_text_costs_only_itself() {
+        let path = temp("nonutf8");
+        let buy = leg(1.0, 10.0, 1000);
+        let none = LegState::default();
+        {
+            let mut r = Reports::open(Some(path.clone()), 5_000);
+            r.record(&deal(1, &buy, &none, false), 1000);
+            r.record(&deal(2, &buy, &none, false), 1000);
+            r.record(&deal(3, &buy, &none, false), 1000);
+        }
+        let mut bytes = fs::read(&path).unwrap();
+        let first_row = bytes.iter().position(|b| *b == b'\n').unwrap() + 1;
+        bytes.splice(first_row..first_row, b"\xff\xfe broken\n".iter().copied());
+        fs::write(&path, &bytes).unwrap();
+        let mut r = Reports::open(Some(path.clone()), 6_000);
+        assert_eq!(r.max_rec_id(), 3, "the rows after the broken line are kept");
+        assert_eq!(fs::read(&path).unwrap(), bytes, "reading rewrote nothing");
+        // The first rewrite (here the compaction after many updates) drops the broken line —
+        // after the file has been copied.
+        for i in 2..150 {
+            let more = leg(f64::from(i), 10.0, 1000);
+            r.record(&deal(1, &more, &none, false), 2000);
+        }
+        let mut bak = path.as_os_str().to_owned();
+        bak.push(".bak");
+        let bak = PathBuf::from(bak);
+        assert!(
+            fs::read(&bak).unwrap().starts_with(&bytes),
+            "the file as found (and what was appended to it) is kept"
+        );
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(bak);
+    }
+
+    /// A history that cannot be read is not replaced by an empty one: nothing is written.
+    #[test]
+    fn an_unreadable_history_is_not_overwritten() {
+        let dir = temp("unreadable");
+        let _ = fs::remove_dir_all(&dir);
+        // A directory where the file should be: opening it for reading fails with something
+        // other than NotFound.
+        fs::create_dir_all(&dir).unwrap();
+        let buy = leg(1.0, 10.0, 1000);
+        let none = LegState::default();
+        let mut r = Reports::open(Some(dir.clone()), 5_000);
+        assert!(r.epoch() >= 2, "a working epoch in memory");
+        r.record(&deal(1, &buy, &none, false), 1000);
+        assert_eq!(r.max_rec_id(), 1, "the deal is still booked in memory");
+        assert!(dir.is_dir(), "and nothing replaced what was there");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

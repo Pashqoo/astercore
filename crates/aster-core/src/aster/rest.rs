@@ -534,14 +534,14 @@ impl Rest {
                 now_ms(),
                 [figures.weight_1m, figures.orders_1m, figures.orders_10s],
             );
+        }
+        if matches!(status, 418 | 429) {
             // 429 (over a limit) and 418 (banned for ignoring one) name how
             // long to wait. Said here, once, for every caller; the waiting is
             // each caller's own (`feed.rs` pauses its REST worker and its
             // warm-up on these codes). Not a gate on the whole process: an
             // exit or a cancel must still go out while a warm-up is told to
             // wait — the order calls have their own budget (`ORDERS`).
-        }
-        if matches!(status, 418 | 429) {
             // At most one line a few seconds: a burst of refusals is one
             // event, and the journal is read by a person.
             static SAID_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -607,9 +607,23 @@ impl Rest {
         Err(Error::Api {
             status,
             code: err.code,
-            msg: if err.msg.is_empty() { text } else { err.msg },
+            // Not the exchange's JSON (a gateway's HTML 502), or a message of unknown length:
+            // this text goes to the journal and to Telegram, so it is cut.
+            msg: shorten(if err.msg.is_empty() { &text } else { &err.msg }),
         })
     }
+}
+
+/// The first 200 characters of a text, one line: a body that is not the exchange's JSON (a
+/// gateway's HTML), or a JSON message of unknown length — it is going to a journal and a chat.
+pub(crate) fn shorten(text: &str) -> String {
+    const MAX: usize = 200;
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX {
+        return flat;
+    }
+    let cut: String = flat.chars().take(MAX).collect();
+    format!("{cut}… ({} bytes)", text.len())
 }
 
 impl Default for Rest {
@@ -669,6 +683,20 @@ pub fn now_us() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gateway's HTML page in place of the exchange's JSON is cut to one short line before it
+    /// goes to the journal and to Telegram.
+    #[test]
+    fn a_body_that_is_not_json_is_cut_to_one_short_line() {
+        let html = format!(
+            "<html>\n<body>\n{}\n</body></html>",
+            "502 Bad Gateway ".repeat(100)
+        );
+        let line = shorten(&html);
+        assert!(!line.contains('\n') && line.chars().count() < 260, "{line}");
+        assert!(line.starts_with("<html> <body> 502 Bad Gateway"));
+        assert_eq!(shorten("  short \n body "), "short body");
+    }
 
     /// The engine finds an exchange code in the text of the error the worker made: the writer
     /// and the readers share `code_marker`, so a change of the format cannot part them.

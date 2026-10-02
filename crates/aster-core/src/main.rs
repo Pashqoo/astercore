@@ -479,7 +479,9 @@ fn main() -> ExitCode {
     );
     // The signal handlers go up here, not earlier: until the loop below runs
     // nobody would notice the flag, and a `systemctl stop` during the start
-    // would be swallowed instead of killing the process.
+    // would be swallowed instead of killing the process. That death by SIGTERM is exit 143
+    // to a shell; to systemd it is a clean stop (`SIGTERM` is among the signals a unit
+    // does not count as a failure), so `Restart=on-failure` leaves it stopped, as for 0.
     control::install_signals();
     {
         let (handler, _) = server.split();
@@ -557,17 +559,26 @@ fn start_meter(meter: Arc<ApiMeter>) {
             let mut rest = Rest::new();
             let (mut next_save, mut next_ping) = (Instant::now() + METER_SAVE, Instant::now());
             loop {
-                if Instant::now() >= next_ping {
-                    // The answer is thrown away: the round trip is what was
-                    // asked for, and the call has counted itself.
-                    let _ = rest.server_time();
-                    // From the answer, not from the deadline: a beat that
-                    // waited for a dead gateway must not be followed by a
-                    // burst catching up on it.
+                // A panic in one pass is said and the thread goes on: it is telemetry, and
+                // a heartbeat that died silently would leave the link line frozen for good.
+                let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if Instant::now() >= next_ping {
+                        // The answer is thrown away: the round trip is what was
+                        // asked for, and the call has counted itself.
+                        let _ = rest.server_time();
+                        // From the answer, not from the deadline: a beat that
+                        // waited for a dead gateway must not be followed by a
+                        // burst catching up on it.
+                        next_ping = Instant::now() + PING_HEARTBEAT;
+                    }
+                    if Instant::now() >= next_save {
+                        meter.save();
+                        next_save = Instant::now() + METER_SAVE;
+                    }
+                }));
+                if pass.is_err() {
+                    log::error!("api meter: a pass panicked; going on");
                     next_ping = Instant::now() + PING_HEARTBEAT;
-                }
-                if Instant::now() >= next_save {
-                    meter.save();
                     next_save = Instant::now() + METER_SAVE;
                 }
                 std::thread::sleep(Duration::from_secs(1));

@@ -82,11 +82,22 @@ impl Log for StderrLog {
             record.target(),
             record.args()
         );
-        eprintln!("{line}");
+        // Not `eprintln!`: it panics when stderr is closed (a journal pipe that went away), and
+        // the logging path is the last place a panic may come from.
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr().lock(),
+            format!("{line}\n").as_bytes(),
+        );
         append(ms, &line);
     }
 
     fn flush(&self) {}
+}
+
+/// A line to stderr that cannot panic (`eprintln!` does when stderr is closed): the logging path
+/// has nowhere else to report its own trouble.
+fn say(text: &str) {
+    let _ = writeln!(std::io::stderr(), "{text}");
 }
 
 fn append(ms: i64, line: &str) {
@@ -102,8 +113,20 @@ fn append(ms: i64, line: &str) {
     let Some(day_file) = guard.as_mut() else {
         return;
     };
-    if let Some(Err(e)) = day_file.file.as_mut().map(|f| writeln!(f, "{line}")) {
-        eprintln!("log file: {e}; file logging paused until the next Moscow day");
+    // One `write`, line and newline together: two (what `writeln!` does on a `File`) can part
+    // and let another process's line fall between them.
+    let mut bytes = String::with_capacity(line.len() + 1);
+    bytes.push_str(line);
+    bytes.push('\n');
+    if let Some(Err(e)) = day_file
+        .file
+        .as_mut()
+        .map(|f| f.write_all(bytes.as_bytes()))
+    {
+        let _ = writeln!(
+            std::io::stderr(),
+            "log file: {e}; file logging paused until the next Moscow day"
+        );
         day_file.file = None;
     }
 }
@@ -117,7 +140,7 @@ fn open_day(ms: i64) -> Option<File> {
     let path = format!("{LOG_DIR}/{}.log", msk_date(ms));
     fs::create_dir_all(LOG_DIR)
         .and_then(|()| OpenOptions::new().create(true).append(true).open(&path))
-        .map_err(|e| eprintln!("log file {path}: {e}"))
+        .map_err(|e| say(&format!("log file {path}: {e}")))
         .ok()
 }
 
@@ -139,7 +162,7 @@ fn remove_stale(now_ms: i64) {
     for name in entries.filter_map(|e| e.ok()?.file_name().into_string().ok()) {
         if is_stale(&name, now_ms) {
             if let Err(e) = fs::remove_file(format!("{LOG_DIR}/{name}")) {
-                eprintln!("log file {LOG_DIR}/{name}: {e}");
+                say(&format!("log file {LOG_DIR}/{name}: {e}"));
             }
         }
     }
