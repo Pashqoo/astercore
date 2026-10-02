@@ -884,6 +884,36 @@ mod tests {
         );
     }
 
+    /// The ninth connection while eight are held is turned away with a 503 at once, not queued
+    /// behind them: the operator's Stop button is one of the requests that must get through to
+    /// an answer.
+    #[test]
+    fn the_ninth_connection_gets_a_503() {
+        let (web, _rx) = web("");
+        let web = Arc::new(web);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = Arc::clone(&web);
+        thread::spawn(move || accept_loop(&listener, &served));
+        // Silent: each holds its slot until the head deadline.
+        let held: Vec<TcpStream> = (0..MAX_CONNS)
+            .map(|_| TcpStream::connect(addr).unwrap())
+            .collect();
+        let until = Instant::now() + Duration::from_secs(3);
+        while web.live.load(Ordering::Relaxed) < MAX_CONNS && Instant::now() < until {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(web.live.load(Ordering::Relaxed), MAX_CONNS, "slots taken");
+        let mut ninth = TcpStream::connect(addr).unwrap();
+        ninth
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut answer = String::new();
+        let _ = ninth.read_to_string(&mut answer);
+        assert!(answer.starts_with("HTTP/1.1 503"), "{answer:?}");
+        drop(held);
+    }
+
     #[test]
     fn a_cookie_is_read_by_name_only() {
         assert_eq!(cookie("sid=a1; other=b2", "sid"), "a1");
