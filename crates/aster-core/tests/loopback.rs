@@ -1430,6 +1430,43 @@ fn move_all_moves_every_resting_entry_to_the_price() {
     let _ = client.disconnect();
 }
 
+/// «Cancel ALL orders» (Engine API 11): every resting entry of the core is cancelled, the strategies
+/// stop, and the terminal gets its `ok` at once (it used to hear «not implemented»).
+#[test]
+fn cancel_all_orders_cancels_every_resting_entry() {
+    let (core, orders) = FedCore::trading();
+    let client = core.connect();
+    for (i, id) in ["921", "922"].into_iter().enumerate() {
+        let key = post_entry(&client, &orders);
+        core.ev_tx
+            .send(report(&key, id, ExecStatus::New, 1, 0))
+            .unwrap();
+        let n = i + 1;
+        assert!(wait_until(Duration::from_secs(5), || {
+            let _ = client.drain_events();
+            client.snapshot().is_some_and(|s| {
+                s.orders()
+                    .iter()
+                    .filter(|o| o.status == moonproto::OrderWorkerStatus::BuySet)
+                    .count()
+                    >= n
+            })
+        }));
+    }
+    client.account().cancel_all_orders().expect("sent");
+    let mut cancelled = Vec::new();
+    for _ in 0..2 {
+        match next_action(&orders) {
+            Action::Cancel { exchange_id, .. } => cancelled.push(exchange_id),
+            other => panic!("{other:?}"),
+        }
+    }
+    cancelled.sort();
+    assert_eq!(cancelled, ["921", "922"]);
+    assert!(log_line(&client, "Cancel ALL orders"));
+    let _ = client.disconnect();
+}
+
 /// `-4141` on an entry: the next entry on that market is refused by the core,
 /// before the exchange.
 #[test]
