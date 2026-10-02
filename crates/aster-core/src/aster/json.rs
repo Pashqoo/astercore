@@ -23,6 +23,88 @@
 use serde::de::Deserializer;
 use serde::Deserialize;
 
+/// An integer field read the way `str_f64` reads a decimal: `null`, a string, a float or garbage
+/// is not worth the whole document (a 767-row `!markPrice@arr` frame every 3 s). A number is
+/// taken (a float truncated), a numeric string parsed, anything else is 0.
+///
+/// ONLY for a field where 0 is the same as «absent» (a funding time, a count, a limit, a trading
+/// mode). Never for an identifier, a time that orders data, or a precision: a 0 there is a
+/// plausible value that would be acted on (an order id "0", a depth link, a bar dated 1970), and
+/// failing the frame is the safer answer. Those fields stay strict `#[serde(default)]`.
+fn tolerant_i64<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+    struct Tolerant;
+
+    impl<'de> serde::de::Visitor<'de> for Tolerant {
+        type Value = i64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an integer, a numeric string, or null")
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<i64, E> {
+            Ok(v)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<i64, E> {
+            Ok(i64::try_from(v).unwrap_or(i64::MAX))
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<i64, E> {
+            Ok(if v.is_finite() { v as i64 } else { 0 })
+        }
+
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<i64, E> {
+            let s = s.trim();
+            Ok(s.parse::<i64>()
+                .ok()
+                .or_else(|| {
+                    s.parse::<f64>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .map(|v| v as i64)
+                })
+                .unwrap_or(0))
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<i64, E> {
+            Ok(0)
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<i64, E> {
+            Ok(0)
+        }
+
+        // `[]` and `{}` where a number belongs: consumed whole (the document goes on from the
+        // right place) and read as 0.
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<i64, A::Error> {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(0)
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<i64, A::Error> {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(0)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<i64, E> {
+            Ok(0)
+        }
+    }
+
+    d.deserialize_any(Tolerant)
+}
+
+fn int_i64<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+    tolerant_i64(d)
+}
+
+fn int_i32<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+    tolerant_i64(d).map(|v| i32::try_from(v).unwrap_or(0))
+}
+
 /// Deserialize one of Aster's decimal strings into `f64`.
 ///
 /// An empty string is `0.0`: the exchange uses `""` for "not applicable" on
@@ -119,7 +201,7 @@ impl std::fmt::Debug for ListenKey {
 /// table in `PLAN.md` is keyed on these numbers.
 #[derive(Debug, Default, Deserialize)]
 pub struct ApiError {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "int_i64")]
     pub code: i64,
     #[serde(default)]
     pub msg: String,
@@ -149,12 +231,12 @@ pub struct RateLimit {
     pub kind: String,
     #[serde(default)]
     pub interval: String,
-    #[serde(default, rename = "intervalNum")]
+    #[serde(default, deserialize_with = "int_i64", rename = "intervalNum")]
     pub interval_num: i64,
     /// A zero means the gateway did not state the ceiling, never "no budget":
     /// the meter that reads this must treat it as unknown. Defaulted because a
     /// malformed row here would otherwise cost the whole 613-symbol catalog.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "int_i64")]
     pub limit: i64,
 }
 
@@ -182,7 +264,7 @@ pub struct SymbolInfo {
     /// are the `SETTLING` ones.
     #[serde(default, rename = "deliveryDate")]
     pub delivery_date_ms: i64,
-    #[serde(default, rename = "onboardDate")]
+    #[serde(default, deserialize_with = "int_i64", rename = "onboardDate")]
     pub onboard_date_ms: i64,
     /// Human display name; empty for most crypto, filled for stock perps.
     #[serde(default)]
@@ -207,7 +289,7 @@ pub struct SymbolInfo {
     /// So `model::Market::has_sessions` is derived from `channel` instead, and
     /// what this field means is to be measured across a full day before
     /// anything is gated on it (`PLAN.md`).
-    #[serde(default, rename = "tradingMode")]
+    #[serde(default, deserialize_with = "int_i32", rename = "tradingMode")]
     pub trading_mode: i32,
     #[serde(default, rename = "orderTypes")]
     pub order_types: Vec<String>,
@@ -291,7 +373,7 @@ pub enum Filter {
     /// Plain orders per symbol; 200 on every symbol measured.
     #[serde(rename = "MAX_NUM_ORDERS")]
     MaxNumOrders {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "int_i64")]
         limit: i64,
     },
     /// Conditional (STOP/TAKE_PROFIT/TRAILING) orders per symbol; **10**. The
@@ -299,7 +381,7 @@ pub enum Filter {
     /// so it does not meet this ceiling — recorded so nobody "improves" it.
     #[serde(rename = "MAX_NUM_ALGO_ORDERS")]
     MaxNumAlgoOrders {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "int_i64")]
         limit: i64,
     },
     /// A filter type this build does not know. Must not fail the catalog.
@@ -340,7 +422,7 @@ pub struct PremiumIndex {
     /// funding is charged on a shared schedule, not per symbol. A zero is still
     /// treated as "no funding": it is what a venue without funding would send,
     /// and the terminal's own absence test is this field.
-    #[serde(default, rename = "nextFundingTime")]
+    #[serde(default, deserialize_with = "int_i64", rename = "nextFundingTime")]
     pub next_funding_time_ms: i64,
     /// The exchange's mark price — what `PERCENT_PRICE`, the margin and the
     /// liquidation price are all computed against, and therefore the price the
@@ -388,7 +470,7 @@ pub struct Ticker24h {
     pub volume: f64,
     #[serde(default, deserialize_with = "str_f64", rename = "priceChangePercent")]
     pub price_change_percent: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "int_i64")]
     pub count: i64,
 }
 
@@ -630,7 +712,7 @@ pub struct MarkPriceUpdate {
     pub mark_price: f64,
     #[serde(default, deserialize_with = "str_f64", rename = "r")]
     pub funding_rate: f64,
-    #[serde(default, rename = "T")]
+    #[serde(default, deserialize_with = "int_i64", rename = "T")]
     pub next_funding_time_ms: i64,
 }
 
@@ -978,5 +1060,67 @@ mod stream_tests {
         )
         .unwrap();
         assert_eq!((bare[0].amount, bare[0].entry_price), (-2.0, 1.5));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An integer where 0 means «absent» that arrives as `null`, a string, a float, a bool,
+    /// `[]` or `{}` costs that field, not the document: one odd row of a 767-row frame must not
+    /// blank the funding of the rest.
+    #[test]
+    fn odd_integers_cost_the_field_not_the_document() {
+        let rows: Vec<PremiumIndex> = serde_json::from_str(
+            r#"[{"symbol":"A","lastFundingRate":"0.0001","nextFundingTime":null},
+                {"symbol":"B","lastFundingRate":"0.0002","nextFundingTime":"1790000000000"},
+                {"symbol":"C","lastFundingRate":"0.0003","nextFundingTime":1.79e12},
+                {"symbol":"D","lastFundingRate":"0.0004","nextFundingTime":true},
+                {"symbol":"E","lastFundingRate":"0.0005","nextFundingTime":1790000000000},
+                {"symbol":"F","lastFundingRate":"0.0006","nextFundingTime":[1,2]},
+                {"symbol":"G","lastFundingRate":"0.0007","nextFundingTime":{"x":1}},
+                {"symbol":"H","lastFundingRate":"0.0008","nextFundingTime":"abc"}]"#,
+        )
+        .expect("the document decodes");
+        let times: Vec<i64> = rows.iter().map(|r| r.next_funding_time_ms).collect();
+        assert_eq!(
+            times,
+            [
+                0,
+                1_790_000_000_000,
+                1_790_000_000_000,
+                0,
+                1_790_000_000_000,
+                0,
+                0,
+                0
+            ]
+        );
+        let marks: Vec<MarkPriceUpdate> = serde_json::from_str(
+            r#"[{"s":"A","p":"1","r":"0","T":"abc"},{"s":"B","p":"2","r":"0","T":-5}]"#,
+        )
+        .expect("the frame decodes");
+        assert_eq!(
+            marks
+                .iter()
+                .map(|m| m.next_funding_time_ms)
+                .collect::<Vec<_>>(),
+            [0, -5]
+        );
+    }
+
+    /// An identifier, a time that orders data, a precision stay strict: a garbled one fails the
+    /// frame instead of being read as trade 0, a bar of 1970 or a price with no decimals.
+    #[test]
+    fn identifiers_and_times_stay_strict() {
+        let trade = |a: &str, t: &str| {
+            serde_json::from_str::<AggTrade>(&format!(
+                r#"{{"s":"X","a":{a},"p":"1","q":"1","T":{t},"m":false}}"#
+            ))
+        };
+        assert!(trade("7", "1790000000000").is_ok());
+        assert!(trade(r#""oops""#, "1790000000000").is_err());
+        assert!(trade("7", "null").is_err());
     }
 }

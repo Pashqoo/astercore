@@ -41,6 +41,14 @@ impl Wire {
     }
 }
 
+/// How far a handshake packet's clock may be from the server's: ten minutes, in Delphi days.
+const HELLO_SKEW_DAYS: f64 = 10.0 / 1440.0;
+
+/// Whether a handshake packet stamped `stamp` (Delphi days) was made about `now`.
+fn hello_is_fresh(stamp: f64, now: f64) -> bool {
+    stamp.is_finite() && (stamp - now).abs() <= HELLO_SKEW_DAYS
+}
+
 /// Application callbacks. Sessions passed in are authorized.
 pub trait Handler {
     /// Transport authorized (`Fine` sent) for the first time in this session.
@@ -67,7 +75,15 @@ pub struct Server<H: Handler> {
 
 impl<H: Handler> Server<H> {
     pub fn bind(key: &ServerKey, handler: H) -> io::Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", key.port))?;
+        // A key that tells the terminal to dial loopback is for a terminal on this machine: the
+        // socket then listens on loopback only, not on every interface. Any other advertised
+        // address may be a NAT'd external one that is not on an interface here, so those keep
+        // listening on all of them.
+        let host = match key.address {
+            Some(ip) if ip.is_loopback() => ip.to_string(),
+            _ => "0.0.0.0".to_owned(),
+        };
+        let socket = UdpSocket::bind((host.as_str(), key.port))?;
         socket.set_read_timeout(Some(RECV_TIMEOUT))?;
         Ok(Self {
             socket,
@@ -220,7 +236,31 @@ impl<H: Handler> Server<H> {
 
     fn decode_hello(&self, client_id: u64, cmd: Command, payload: &[u8]) -> Option<Hello> {
         let aad = handshake_aad(client_id, cmd.to_byte());
-        Hello::from_bytes(&crypto::decrypt(&self.master_key, payload, &aad)?)
+        let hello = Hello::from_bytes(&crypto::decrypt(&self.master_key, payload, &aad)?)?;
+        // A handshake packet carries its sender's clock (NTP-corrected on the client). A copy
+        // captured earlier than ten minutes ago is refused: without this check a Hello from last
+        // week would reset a live session of the same client id. (A copy replayed INSIDE the
+        // window still works — the window narrows the replay, it does not close it.)
+        let now = session::delphi_now();
+        if !hello_is_fresh(hello.timestamp, now) {
+            // Said at `warn`, at most once a minute: it is also what a terminal with a wrong
+            // clock looks like — it retries for ever, and nothing else would say why.
+            static SAID_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let wall = (now * 86_400.0) as i64;
+            let last = SAID_AT.load(std::sync::atomic::Ordering::Relaxed);
+            if wall.abs_diff(last) >= 60 {
+                SAID_AT.store(wall, std::sync::atomic::Ordering::Relaxed);
+                log::warn!(
+                    target: "moonproto::server",
+                    "{cmd:?} from {client_id:#x} refused: its clock differs from this one by \
+                     {:.1} min (the limit is {:.0}) — a replayed packet, or a clock that is wrong",
+                    (hello.timestamp - now).abs() * 1440.0,
+                    HELLO_SKEW_DAYS * 1440.0
+                );
+            }
+            return None;
+        }
+        Some(hello)
     }
 
     fn on_hello(&mut self, client_id: u64, payload: &[u8], from: SocketAddr) {

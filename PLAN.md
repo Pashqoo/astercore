@@ -362,10 +362,12 @@ loopback + 54 теста серверной части вендора, `tools/ch
   **02.10:** `plausible_stamp` требует время > 0; тест.
 - [x] `feed.rs:515` — сессия, молчавшая 75 с и закрытая по idle, «здорова» и сбрасывает бэкофф.
   **02.10:** `healthy_session` требует кадр данных (`Beat::touch_data`; pong не считается). Пользовательский поток `account.rs` намеренно без этого условия — тихий счёт кадров не шлёт.
-- [ ] `aster/json.rs:336`, `:626` (и `:99`, `:526`, `:555`, `:590`) — целые с `serde(default)` без
+- [x] `aster/json.rs:336`, `:626` (и `:99`, `:526`, `:555`, `:590`) — целые с `serde(default)` без
   толерантного десериализатора: `null`/строка валит весь `!markPrice@arr` каждые 3 с.
-- [ ] `screener.rs:49` — комментарий про `feed::MAX_INSTRUMENTS`, которого нет; чанк —
+  **02.10:** толерантный разбор целых (`null`, строка, число с точкой, `[]`, `{}` → 0) только там, где 0 = «нет»: время фандинга, счётчик 24 ч, лимиты, режим торговли, дата листинга; идентификаторы, времена данных и точность остаются строгими — тихий 0 там хуже отказа кадра (тесты `odd_integers_cost_the_field_not_the_document`, `identifiers_and_times_stay_strict`). Не тронуты: `serverTime` (часы), `last_id` снимка стакана.
+- [x] `screener.rs:49` — комментарий про `feed::MAX_INSTRUMENTS`, которого нет; чанк —
   `ws::MAX_STREAMS` = 200, `POOL_WIDE` = 300.
+  **02.10:** комментарий исправлен (`ws::MAX_STREAMS` = 200, `POOL_WIDE` = 300).
 
 Процесс:
 - [x] `main.rs:441` — `install_signals()` после `Server::bind`: SIGTERM на старте → 143, не 0.
@@ -409,21 +411,29 @@ loopback + 54 теста серверной части вендора, `tools/ch
 Вендорный сервер:
 - [ ] `moonproto/src/server/mod.rs:229` — повтор перехваченного Hello (timestamp не проверяется)
   выбивает авторизованную сессию.
+  **02.10:** Hello/HelloAgain старше ±10 мин по часам отправителя отбрасываются (`hello_is_fresh`, тест; причина в журнале на `warn` раз в минуту — так же выглядит терминал с неверными часами). Повтор внутри окна и повтор ImFriend/HelloAgain, переносящие адрес, остаются.
 - [ ] `moonproto/src/server/session.rs:313` — `n_blocks > 256` тихо теряет payload, `send_wire`
   возвращает true, reliable-сообщение не в `pending_high`.
-- [ ] `moonproto/src/server/session.rs:594` — `on_probe_ack` без сверки probe_id: клиент поднимает
+  **02.10:** потеря сообщения >256 срезов теперь `error` в журнале; вызывающий по-прежнему не узнаёт, теста нет.
+- [x] `moonproto/src/server/session.rs:594` — `on_probe_ack` без сверки probe_id: клиент поднимает
   pmtu до 65535, `send_to` падает по размеру.
-- [ ] `moonproto/src/server/mod.rs:70` — bind всегда `0.0.0.0`, даже с ключом на 127.0.0.1.
+  **02.10:** ack зонда принимается только за выставленный зонд и только на размер этого зонда; тест `a_probe_ack_cannot_raise_the_mtu_past_the_probe`. Ping с давним `initial_time` (rtt) не тронут.
+- [x] `moonproto/src/server/mod.rs:70` — bind всегда `0.0.0.0`, даже с ключом на 127.0.0.1.
+  **02.10:** ключ с адресом loopback — сокет на loopback; остальные (в т.ч. без адреса) на всех интерфейсах; тест `the_socket_follows_the_address_the_key_advertises`.
 
 Гигиена:
 - [ ] `tests/fixtures/phantom_30042_entry.json`, `unac_lost_replace.json` — снимки TInvestCore
   (MOEX-id, код 30042); в loopback `EXCHANGE_INFO` нет не-USDT котировки и пустого `contractType`.
+  **02.10:** не сделано: loopback-каталог остаётся только USDT/PERPETUAL; не-USDT котировка и пустой `contractType` покрыты юнитом в `model.rs` (XUSD1, MBLUSDT).
 - [ ] `main.rs:450` — выбор кода выхода по `feeds.dead()`/`halt.code()` проверен только руками.
+  **02.10:** не сделано: выбор кода выхода остаётся в цикле `main`, проверка — руками по AGENTS.md (канал наблюдения №8).
 - [x] `Cargo.toml:21` — «те же webpki roots» неверно: `webpki-roots` 0.26.11 и 1.0.9 в Cargo.lock.
   **02.10:** комментарий исправлен.
-- [ ] Cargo.lock — дубли rand/base64/digest/getrandom/syn (ureq 3.4 + tungstenite 0.30 против пинов
+- [x] Cargo.lock — дубли rand/base64/digest/getrandom/syn (ureq 3.4 + tungstenite 0.30 против пинов
   moonproto); лечится только бампом upstream.
+  **02.10:** лечится только бампом upstream; решение — ждать.
 - [ ] `Idea.md` — рабочая заметка в публичном репо, ссылка из `aster.mdc:33`.
+  **02.10:** решение трейдера (рабочая заметка в публичном репо) — не трогал.
 - [x] `target-head/` только в `.git/info/exclude`, не в `.gitignore`.
   **02.10:** в `.gitignore`.
 

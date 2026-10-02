@@ -45,9 +45,9 @@ pub const REFRESH_DEFAULT_S: i32 = 61;
 /// out.
 const KEEP_BAND: usize = 5;
 
-/// A pool past this is worth a line of its own: it is one market-data stream
-/// chunk (`feed::MAX_INSTRUMENTS`), and with the volume bounds gone from the
-/// screener nothing but `DynWL_Count` keeps a class pool below it.
+/// A pool past this is worth a line of its own: it is wider than a market-data trade stream
+/// chunk (`ws::MAX_STREAMS`, 200), so its markets would not share one session, and with the
+/// volume bounds gone from the screener nothing but `DynWL_Count` keeps a class pool below it.
 pub const POOL_WIDE: usize = 300;
 
 /// A sort key of MoonBot's dynamic lists. The Binance-only keys (`MaxOrder`,

@@ -326,7 +326,14 @@ impl Session {
         let block = self.pmtu as usize - SERVER_HDR_SIZE - SLICE_HEADER_SIZE;
         let n_blocks = (data.len() + 1).div_ceil(block).max(1);
         if n_blocks > 256 {
-            log::warn!(target: "moonproto::server", "payload {} too large to slice", data.len());
+            // Returns `true` ("handled") on purpose: nothing was queued, so a reliable message
+            // must not be kept in the High queue to be resent. But the loss is loud.
+            log::error!(
+                target: "moonproto::server",
+                "client {:#x}: command {cmd} with {} bytes needs {n_blocks} slices, over the 256 a datagram can carry: NOT SENT",
+                self.client_id,
+                data.len()
+            );
             return true;
         }
         let datagram_num = self.send_datagram_num;
@@ -528,6 +535,15 @@ impl Session {
             return;
         }
         let received = u16::from_le_bytes([payload[3], payload[4]]);
+        // Only the ack of the probe that is out, by its size: one nobody asked for, or the late
+        // ack of an earlier, larger probe, changes nothing (and does not clear the probe that
+        // IS out, or the probing would restart from the top).
+        let Some((sent, _)) = self.probe else {
+            return;
+        };
+        if received != sent {
+            return;
+        }
         if received > self.pmtu {
             self.pmtu = received;
         }
@@ -891,6 +907,32 @@ mod tests {
         );
         assert_eq!(delivered.len(), 1);
         assert!(!s.fresh_crypted);
+    }
+
+    /// An ack of the MTU probe counts only for the probe that is out and only for its own size
+    /// (the client echoes the tested size back; anything else is stale or made up).
+    #[test]
+    fn a_probe_ack_cannot_raise_the_mtu_past_the_probe() {
+        let ack = |size: u16| {
+            let mut p = vec![0u8, 0, 0];
+            p.extend_from_slice(&size.to_le_bytes());
+            p
+        };
+        let mut s = session();
+        let base = s.pmtu;
+        // No probe out: an ack for one is ignored.
+        s.on_probe_ack(&ack(base + 400));
+        assert_eq!(s.pmtu, base);
+        // A probe of base+200 is out: a bigger claim, or the late ack of another size, is not
+        // taken and does not end the probe; the ack of its own size is.
+        s.probe = Some((base + 200, 0));
+        s.on_probe_ack(&ack(60_000));
+        s.on_probe_ack(&ack(base + 100));
+        assert_eq!(s.pmtu, base);
+        assert!(s.probe.is_some(), "still waiting for its own ack");
+        s.on_probe_ack(&ack(base + 200));
+        assert_eq!(s.pmtu, base + 200);
+        assert!(s.probe.is_none(), "the probe is answered");
     }
 
     #[test]

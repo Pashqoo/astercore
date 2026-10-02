@@ -189,6 +189,42 @@ fn client_reaches_connected_v2_dns() {
     client_reaches_connected(TransportMode::V2);
 }
 
+/// A key that tells the terminal to dial loopback binds loopback only; one without an address, or
+/// with a (possibly NAT'd) external one, listens on every interface.
+#[test]
+fn the_socket_follows_the_address_the_key_advertises() {
+    struct Quiet;
+    impl Handler for Quiet {
+        fn on_connected(&mut self, _s: &mut Session) {}
+        fn on_command(&mut self, _s: &mut Session, _cmd: u8, _payload: &[u8]) {}
+        fn on_closed(&mut self, _client_id: u64) {}
+    }
+    let local = ServerKey::generate(Some("127.0.0.1".parse().unwrap()), 0, TransportMode::V0);
+    let server = Server::bind(&local, Quiet).expect("bind");
+    assert!(server.local_addr().unwrap().ip().is_loopback());
+    let open = ServerKey::generate(None, 0, TransportMode::V0);
+    let server = Server::bind(&open, Quiet).expect("bind");
+    assert!(server.local_addr().unwrap().ip().is_unspecified());
+    let external = ServerKey::generate(Some("203.0.113.7".parse().unwrap()), 0, TransportMode::V0);
+    let server = Server::bind(&external, Quiet).expect("bind");
+    assert!(server.local_addr().unwrap().ip().is_unspecified());
+}
+
+/// A handshake packet is believed only about now: a copy of last week's Hello does not reset a
+/// live session.
+#[test]
+fn a_stale_or_unreadable_handshake_clock_is_refused() {
+    use super::{hello_is_fresh, HELLO_SKEW_DAYS};
+    let now = 46_000.5;
+    assert!(hello_is_fresh(now, now));
+    assert!(hello_is_fresh(now + HELLO_SKEW_DAYS * 0.9, now));
+    assert!(hello_is_fresh(now - HELLO_SKEW_DAYS * 0.9, now));
+    assert!(!hello_is_fresh(now - 7.0, now), "last week's");
+    assert!(!hello_is_fresh(now + 7.0, now));
+    assert!(!hello_is_fresh(0.0, now), "an unset clock");
+    assert!(!hello_is_fresh(f64::NAN, now));
+}
+
 /// A client silent for more than `SESSION_IDLE_MS` is dropped by the server's own timer, and
 /// the handler hears of it.
 #[test]
