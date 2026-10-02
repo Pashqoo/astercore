@@ -862,6 +862,28 @@ mod tests {
         assert!(err.contains("deadline"), "{err}");
     }
 
+    /// A connection that sends nothing holds one of the eight slots: the head is waited for
+    /// `HEAD_DEADLINE` (5 s), not the body's 15 — over the network eight idle sockets would
+    /// otherwise turn the page away for as long as they lasted. Real time, so the test takes 5 s.
+    #[test]
+    fn a_silent_connection_is_dropped_at_the_head_deadline() {
+        let began = Instant::now();
+        let err = on_stream("", |stream| {
+            // As `serve` leaves the socket before `read_request` narrows it for the head.
+            let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+            read_request(stream).err().expect("dropped")
+        });
+        let took = began.elapsed();
+        assert!(
+            took >= HEAD_DEADLINE - Duration::from_secs(1),
+            "{took:?}: {err}"
+        );
+        assert!(
+            took < IO_TIMEOUT - Duration::from_secs(3),
+            "{took:?}: {err}"
+        );
+    }
+
     #[test]
     fn a_cookie_is_read_by_name_only() {
         assert_eq!(cookie("sid=a1; other=b2", "sid"), "a1");

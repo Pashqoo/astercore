@@ -436,7 +436,7 @@ loopback + 54 теста серверной части вендора, `tools/ch
 - [x] `web.rs:476` — `/logout` не за `tagged`.
   **02.10:** `/logout` за `tagged`; тест `a_logout_needs_the_pages_header` (без условия падает: 200 вместо 403, сессия теряется).
 - [ ] `web.rs:54`, `:184` — при bind в сеть 8 слотов × 20 с: 8 праздных сокетов → 503.
-  **02.10:** таймаут чтения шапки 5 с; теста нет.
+  **02.10:** таймаут чтения шапки 5 с; тест `a_silent_connection_is_dropped_at_the_head_deadline` (без `set_read_timeout(HEAD_DEADLINE)` падает: 15 с вместо 5; тест идёт 5 с). Покрыта только молчащая шапка; не покрыты: застрявшее тело (слот держится до `REQUEST_DEADLINE` 20 с), шапка по байту, ветка 503 при `MAX_CONNS` — чекбокс снимать после них.
 - [ ] `telegram.rs:1087` — PIN из `SystemTime` + LCG, `/dev/urandom` уже читается в web.rs.
   **02.10:** PIN из `/dev/urandom`.
 - [x] `telegram.rs:700` — RetryAfter в бэклоге ждёт 5 с вместо 30/retry_after.
