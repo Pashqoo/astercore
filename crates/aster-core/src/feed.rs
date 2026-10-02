@@ -182,6 +182,9 @@ pub enum FeedEvent {
     /// once reads have failed for `account::STALE_AFTER` (`account.rs`). Not
     /// market data, but it reaches the sessions by the same road.
     Account(Option<crate::account::Account>),
+    /// A good read that equals the last one sent: nothing for the terminal, but a second look
+    /// for `Orders::reconcile` and a fresh free balance for the entries' budget.
+    AccountRead(crate::account::Account),
     /// One market's `klines 5m`, oldest first, the last one still in progress.
     Warmup { symbol: String, bars: Vec<Kline> },
     /// Every market of the warm-up was asked, whatever it answered: the

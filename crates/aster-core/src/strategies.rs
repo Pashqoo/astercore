@@ -292,7 +292,10 @@ fn schema_fields() -> Vec<SchemaField> {
         ),
         f("MaxActiveOrders", Int32(5), ui::EDIT, None),
         f("MaxMarkets", Int32(5), ui::EDIT, None),
-        f("OrderSize", Double(1000.0), ui::EDIT, None),
+        // USDT per entry. MoonBot's 1000 is in the quote of the venue it was written for (roubles
+        // on MOEX); here it would be a thousand dollars on a strategy nobody has tuned yet. Aster's
+        // `MIN_NOTIONAL` is 5 USDT.
+        f("OrderSize", Double(10.0), ui::EDIT, None),
         f("AutoCancelBuy", Double(90.0), ui::EDIT, None),
         f("CancelBuyAfterSell", Bool(false), ui::CHECKBOX, None),
         // MoonBot's exposure limits; 0 / off = no limit (MoonBot's own
@@ -604,6 +607,11 @@ impl Strategies {
             path.display()
         );
         this
+    }
+
+    /// The strategy file could not be read at start: the empty list is not the trader's.
+    pub fn unreadable(&self) -> bool {
+        self.unreadable
     }
 
     pub fn schema_blob(&self) -> &[u8] {

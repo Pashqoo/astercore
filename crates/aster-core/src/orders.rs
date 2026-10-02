@@ -809,7 +809,20 @@ pub struct Orders {
     /// `LEFT_CAP`: past it the oldest goes (`left_order`).
     left: HashSet<String>,
     left_order: VecDeque<String>,
+    /// Orders the last `reconcile` found missing from the account: one read is not enough to
+    /// close a position (a lagging or short answer looks the same), the second in a row is.
+    gone_once: HashMap<u64, i64>,
+    /// Exchange ids whose `Query` answered «not found» once: the second answer, after
+    /// `REQUERY_MS`, closes the leg; one alone does not (a read can lag behind the matching).
+    query_missed: HashMap<String, i64>,
+    /// Second reads due: (at ms, order, leg, exchange id).
+    requery: Vec<(i64, u64, Leg, String)>,
 }
+
+/// How long a first «not found» of a numeric `Query` is remembered.
+const QUERY_MISS_MEMORY_MS: i64 = 60_000;
+/// The wait before a numeric `Query` that found nothing is asked again.
+const REQUERY_MS: i64 = 2_000;
 
 /// Ids remembered as left to the account, at most.
 const LEFT_CAP: usize = 4096;
@@ -1314,7 +1327,7 @@ impl Orders {
         // and so whether the order waits for a rise or for a fall. Without a
         // price there is no side to wait for: the order is refused, not armed
         // in a guessed direction.
-        if market.last() <= 0.0 {
+        if !market.live_price() {
             let reason = format!(
                 "{}: no price yet, a pending order needs one to tell the trigger's side",
                 s.market
@@ -1393,7 +1406,7 @@ impl Orders {
                 if !m.fresh() {
                     return false;
                 }
-                let last = m.last();
+                let last = if m.live_price() { m.last() } else { 0.0 };
                 last > 0.0
                     && if o.pending_up {
                         last >= o.pending
@@ -1990,6 +2003,28 @@ impl Orders {
         fx
     }
 
+    /// A position whose strategy is gone takes the strategy's last bot stop as its own stop
+    /// (`Orders::watch` fires on that one, never on the picture). A stop the trader set stays.
+    pub fn adopt_bot_stop(&mut self, id: u64) -> Effects {
+        let Some(o) = self.map.get(&id) else {
+            return Effects::default();
+        };
+        let (price, spread) = o.bot_stop;
+        if o.stop_price > 0.0 || price <= 0.0 {
+            return Effects::default();
+        }
+        let mut fx = self.set_stops(id, true, true, price, spread);
+        // The stop is the order's own now; the trader may turn it off, and nothing re-arms it.
+        fx.extend(self.set_bot_stop(id, 0.0, 0.0));
+        if let Some(o) = self.map.get(&id) {
+            fx.logs.push(format!(
+                "{}: the strategy is gone, its stop {price} now guards the position",
+                o.market
+            ));
+        }
+        fx
+    }
+
     /// Why the exit is (re)placed, for the image and the trade report: set by
     /// whoever moves it before the move itself (a strategy's PriceDown or
     /// stop, a manual stop, panic, close position). The next exit generation
@@ -2047,6 +2082,23 @@ impl Orders {
                 }
             }
         }
+        let (due, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.requery)
+            .into_iter()
+            .partition(|(at, ..)| now_ms >= *at);
+        self.requery = wait;
+        for (_, id, leg, exchange_id) in due {
+            if self
+                .map
+                .get(&id)
+                .is_some_and(|o| !status::is_terminal(o.status))
+            {
+                fx.actions.push(Action::Query {
+                    order: id,
+                    leg,
+                    exchange_id,
+                });
+            }
+        }
         // Miss counts of requests no longer being reconciled.
         if !self.request_misses.is_empty() {
             let asked: HashSet<&str> = self
@@ -2079,8 +2131,16 @@ impl Orders {
                 continue;
             }
             let sells = o.sells(Leg::Sell);
-            let side = if sells { m.bid } else { m.ask }.unwrap_or(0.0);
-            let px = if side > 0.0 { side } else { m.last() };
+            let side = m.quote(sells, now_ms);
+            // A stop is decided by the live book, else by a trade of this run: the startup
+            // ticker's price is neither.
+            let px = if side > 0.0 {
+                side
+            } else if m.live_price() {
+                m.last()
+            } else {
+                0.0
+            };
             // The trailing follows the live book only: a stale `last` would
             // ratchet its best price.
             let hit = o.stop_price > 0.0
@@ -2190,7 +2250,10 @@ impl Orders {
         let at_market = o.market_exit && !o.emulator;
         let spread = o.panic_spread();
         // For a MARKET exit, the price it is shown at until it fills.
-        let Some(price) = m.marketable(sells, spread).map(|p| m.within_limits(p)) else {
+        let Some(price) = m
+            .marketable_at(sells, spread, now_ms)
+            .map(|p| m.within_limits(p))
+        else {
             if !armed {
                 fx.logs
                     .push(format!("{}: no price to sell at yet", o.market));
@@ -2663,11 +2726,30 @@ impl Orders {
                 }
             }
         }
+        // First seen missing at one read, closed when a read at least `POSITION_GRACE_MS`
+        // later still lacks it: reads a couple of seconds apart (the stream wakes them) can
+        // share one lagging answer.
+        let first: HashMap<u64, i64> = gone
+            .iter()
+            .map(|(id, _, _)| (*id, self.gone_once.get(id).copied().unwrap_or(now_ms)))
+            .collect();
+        let confirmed: Vec<_> = gone
+            .into_iter()
+            .filter(|(id, _, _)| now_ms - first[id] >= POSITION_GRACE_MS)
+            .collect();
+        self.gone_once = first;
         let mut fx = Effects::default();
-        for (id, avail, need) in gone {
+        for (id, avail, need) in confirmed {
             fx.extend(self.close_outside(id, model, avail, need, now_ms));
+            self.gone_once.remove(&id);
         }
         fx
+    }
+
+    /// What the last reads saw missing is forgotten (the account became unknown): the next
+    /// sighting is a first one.
+    pub fn forget_gone(&mut self) {
+        self.gone_once.clear();
     }
 
     /// The position of `id` is gone from the account: book its exit as filled
@@ -2686,7 +2768,7 @@ impl Orders {
         };
         let market = model.get(&o.uid);
         let quote = market.map_or(0.0, |m| {
-            let side = if o.sells(Leg::Sell) { m.bid } else { m.ask }.unwrap_or(0.0);
+            let side = m.quote(o.sells(Leg::Sell), now_ms);
             if side > 0.0 {
                 side
             } else {
@@ -2706,7 +2788,7 @@ impl Orders {
                 mean_price: mean,
                 quantity: units,
                 filled: units,
-                notional: units * price,
+                notional: spent,
                 spent,
                 create_ms: now_ms,
                 open_ms: now_ms,
@@ -2889,6 +2971,24 @@ impl Orders {
                             key,
                         });
                     }
+                    return fx;
+                }
+                if self.query_missed.len() > 256 {
+                    self.query_missed.clear();
+                }
+                // A first miss counts for a minute; one older than that is forgotten (the
+                // order was found or finished meanwhile) and this one is a first again.
+                let again = self
+                    .query_missed
+                    .remove(request)
+                    .is_some_and(|at| now_ms - at < QUERY_MISS_MEMORY_MS);
+                if !again {
+                    self.query_missed.insert(request.to_owned(), now_ms);
+                    self.requery
+                        .push((now_ms + REQUERY_MS, id, leg, request.to_owned()));
+                    fx.logs.push(format!(
+                        "{market}: order {request} not found once, asking again"
+                    ));
                     return fx;
                 }
                 let u = OrderUpdate {
@@ -3215,11 +3315,13 @@ mod tests {
             tags: vec![Tag::Crypto],
             quote_volume_24h: None,
             last_price: Some(300.0),
+            price_seeded: false,
             bid: None,
             ask: None,
             mark_price: None,
             funding: None,
             feed_fresh: true,
+            book_ms: 0,
         }])
     }
 
@@ -3307,6 +3409,38 @@ mod tests {
         let o = orders.get(id).unwrap();
         assert_eq!((o.status, o.pending), (status::BUY_FAIL, 0.0));
         assert_eq!(o.buy.state.close_ms, 40);
+    }
+
+    /// The stop a deleted strategy had drawn becomes the order's own, and a stop is decided by a
+    /// live quote: an old one is left for the last trade.
+    #[test]
+    fn an_orphans_bot_stop_fires_and_an_old_quote_does_not_decide() {
+        let mut model = sber_model();
+        let sber = model.get("u-sber").unwrap().clone();
+        let mut orders = Orders::new();
+        let fx = orders.start(1, &start(7000.0, 310.0, 0.0), &sber, 1);
+        let key = post_key(&fx);
+        orders.apply(&update(&key, "9001", ExecStatus::Filled, 2, 2, 309.5), 20);
+        orders.set_bot_stop(1, 295.0, 0.5);
+        // Only a stop the order does not have yet is taken, and only once.
+        assert!(!orders.adopt_bot_stop(1).logs.is_empty());
+        assert!(orders.adopt_bot_stop(1).logs.is_empty());
+        assert_eq!(orders.get(1).unwrap().bot_stop(), (0.0, 0.0));
+        {
+            let m = model.get_mut("u-sber").unwrap();
+            m.bid = Some(294.0);
+            m.book_ms = 1_000;
+        }
+        // The book is a minute old: the last trade (300) decides, and it holds.
+        assert!(orders.watch(&model, 61_000).logs.is_empty());
+        // A fresh quote under the stop fires it.
+        model.get_mut("u-sber").unwrap().book_ms = 60_500;
+        let fx = orders.watch(&model, 61_000);
+        assert!(
+            fx.logs.iter().any(|l| l.contains("StopLoss activated")),
+            "{:?}",
+            fx.logs
+        );
     }
 
     #[test]
@@ -3784,11 +3918,15 @@ mod tests {
         );
         // The exchange no longer knows the order: the leg closes with its fills.
         let gone = "api 400/-2013: Order does not exist.";
+        // One «not found» is a second read, not a verdict.
+        let fx = boot.fail(b_id, Leg::Sell, Op::Query, gone, 3);
+        assert!(fx.changed.is_empty());
         let fx = boot.fail(b_id, Leg::Sell, Op::Query, gone, 3);
         assert_eq!(fx.changed, [b_id]);
         assert!(fx.actions.is_empty());
         let b = boot.get(b_id).unwrap();
         assert_eq!((b.status, b.record().sell.filled), (status::BUY_DONE, 10.0));
+        boot.fail(a_id, Leg::Buy, Op::Query, gone, 3);
         boot.fail(a_id, Leg::Buy, Op::Query, gone, 3);
         assert_eq!(boot.get(a_id).unwrap().status, status::BUY_CANCEL);
         assert!(boot.missing_from(&[]).is_empty());
@@ -4585,7 +4723,9 @@ mod tests {
         let held: HashMap<String, f64> = [("u-sber".to_string(), 10.0)].into();
         // Within the grace after a fill nothing is decided.
         assert_eq!(orders.reconcile(&held, &model, 5_000), Effects::default());
-        let fx = orders.reconcile(&held, &model, 30_000);
+        // One read that lacks the units decides nothing; the second in a row does.
+        assert_eq!(orders.reconcile(&held, &model, 29_000), Effects::default());
+        let fx = orders.reconcile(&held, &model, 39_000);
         assert_eq!(fx.changed, [ids[1]]);
         assert!(fx.logs[0].contains("holds 10 of 20"), "{:?}", fx.logs);
         let rec = orders.get(ids[1]).unwrap().record();
@@ -4600,7 +4740,7 @@ mod tests {
         );
         // The live exit is left to its own report; a matching account is quiet.
         assert_eq!(orders.get(ids[2]).unwrap().status, status::SELL_SET);
-        assert_eq!(orders.reconcile(&held, &model, 31_000), Effects::default());
+        assert_eq!(orders.reconcile(&held, &model, 41_000), Effects::default());
     }
 
     #[test]
@@ -5127,7 +5267,9 @@ mod tests {
         assert!(os.reconcile(&held, &m, 30_000).changed.is_empty());
         assert_eq!(os.get(id).unwrap().status, status::BUY_DONE);
         // The rest leaves the account: closed outside, a manual sell.
-        os.reconcile(&HashMap::new(), &m, 31_000);
+        assert!(os.reconcile(&HashMap::new(), &m, 31_000).changed.is_empty());
+        assert_eq!(os.get(id).unwrap().status, status::BUY_DONE);
+        os.reconcile(&HashMap::new(), &m, 41_000);
         let rec = os.get(id).unwrap().record();
         assert_eq!(
             (rec.status, rec.sell_reason),
@@ -6092,10 +6234,13 @@ mod tests {
         assert_eq!(orders.get(id).unwrap().status, status::BUY_DONE);
         assert!(orders.get(id).unwrap().record().emulator);
         // The account holds nothing: a real order would be closed outside the core.
-        assert!(orders
-            .reconcile(&HashMap::new(), &model, 60_000)
-            .changed
-            .is_empty());
+        // Twice, a grace apart: the confirmation a real order would get.
+        for at in [60_000, 71_000] {
+            assert!(orders
+                .reconcile(&HashMap::new(), &model, at)
+                .changed
+                .is_empty());
+        }
         assert!(orders.missing_from(&[]).is_empty());
         // ClosePosition closes the orders of the terminal's mode only.
         assert!(orders

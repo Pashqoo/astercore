@@ -181,6 +181,11 @@ impl From<rest::Error> for ReadError {
 pub fn read(rest: &mut Rest, signer: &mut Signer, symbols: &Symbols) -> Result<Account, ReadError> {
     let usdt = rest.balance(signer, QUOTE)?;
     let positions = rest.position_risk(signer, |s| symbols.usdt.contains(s))?;
+    // The answer carries a row per symbol, flat ones included: none at all is a short answer, not
+    // a flat account, and a flat account would close every position the core keeps.
+    if positions.is_empty() {
+        return Err(ReadError::Shape("positionRisk: no rows".into()));
+    }
     Account::from_rows(usdt.as_ref(), &positions, symbols).map_err(ReadError::Shape)
 }
 
@@ -281,7 +286,14 @@ pub fn start(
                                     since.elapsed().as_secs()
                                 );
                             }
-                            (last.as_ref() != Some(&now)).then_some(Some(now))
+                            if last.as_ref() == Some(&now) {
+                                if tx.send(FeedEvent::AccountRead(now)).is_err() {
+                                    return;
+                                }
+                                None
+                            } else {
+                                Some(Some(now))
+                            }
                         }
                         Err(e) => {
                             log::warn!("account: {e}");

@@ -288,6 +288,12 @@ impl Track {
     }
 }
 
+/// Whether `series` holds anything a chart could draw (the check `deal_png` opens with), so a
+/// caller that draws elsewhere can still answer «nothing to say» at once.
+pub fn drawable(series: &Series) -> bool {
+    !Track::of(series).is_empty()
+}
+
 /// The chart of `deal` over `series`, or `None` when there is nothing to
 /// draw (nothing at all, or every price identical — a picture of one flat
 /// line tells the trader less than the text already did).
@@ -733,10 +739,9 @@ fn bar_volume(canvas: &mut Canvas, plot: &Plot, bars: &[Candle], period: i64, to
 /// a guard, not a policy: `y_scale` builds the frame around every price this
 /// module was handed, so nothing real reaches it.
 ///
-/// A busy hour is tens of thousands of prints, and this runs inside the
-/// trading loop, where every millisecond is one the core is not trading — so
-/// the cross is rasterised once and stamped, not worked out again for each
-/// print. Every print is still drawn, repeats included: a hundred trades at
+/// A busy hour is tens of thousands of prints, and the picture is drawn on the
+/// worker `engine_ops` keeps for it — still, the cross is rasterised once and
+/// stamped, not worked out again for each print. Every print is still drawn, repeats included: a hundred trades at
 /// one price stack into the solid column that says so, and skipping the
 /// repeats would have drawn that column as a single cross.
 fn crosses(canvas: &mut Canvas, plot: &Plot, ticks: &[HistoryTrade]) {

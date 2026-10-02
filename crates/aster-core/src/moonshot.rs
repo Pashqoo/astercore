@@ -55,7 +55,8 @@ pub fn rate_limited(msg: &str) -> bool {
 }
 const CANCEL_RETRY_MS: i64 = 5_000;
 /// After a restart, entries restored on a market wait this long for its
-/// first trade; a market still without one (halted, feed lost) withdraws them.
+/// first live trade of this run (`Market::live_price`; the startup ticker's price is not one);
+/// a market still without one (halted, feed lost) withdraws them.
 const RESTORE_PRICE_WAIT_MS: i64 = 5 * 60_000;
 /// A fired stop's exit follows the book at most this often.
 const STOP_CHASE_MS: i64 = 2_000;
@@ -109,6 +110,11 @@ pub enum Cmd {
         order: u64,
         price: f64,
         spread: f64,
+    },
+    /// A deleted strategy's position takes its last bot stop as the order's own stop, which
+    /// `Orders::watch` fires on (`Orders::adopt_bot_stop`).
+    AdoptStop {
+        order: u64,
     },
     /// Detect fact for the terminal (row + chart mark).
     Detect {
@@ -545,12 +551,9 @@ impl Params {
 
     /// USDT budget of ladder tier `i`: `OrderSize` grown by `OrderSizeStep` % a tier.
     fn tier_size(&self, i: usize) -> f64 {
-        let size = self.order_size * (1.0 + i as f64 * self.size_step / 100.0);
-        if size > 0.0 {
-            size
-        } else {
-            self.order_size
-        }
+        // A step that shrinks the tiers can take the size to zero: that tier has no budget
+        // (`entry_size` gives no order for it), and it is not the biggest one.
+        (self.order_size * (1.0 + i as f64 * self.size_step / 100.0)).max(0.0)
     }
 
     /// The sides it enters: its own direction.
@@ -1053,8 +1056,18 @@ impl MoonShot {
 
     /// Free USDT on the account (`CheckFreeBalance`, `MinFreeBalance`);
     /// `None` until the account is read.
+    ///
+    /// `None` after a figure was known means the account went unreadable (the reader withdraws
+    /// its snapshot after a minute of refusals): the last figure stays for the sums, and the
+    /// entries that check the balance wait for a fresh one instead of running unchecked.
     pub fn set_free_balance(&mut self, usdt: Option<f64>) {
-        self.funds.budget = usdt;
+        match usdt {
+            Some(_) => {
+                self.funds.budget = usdt;
+                self.funds.lost = false;
+            }
+            None => self.funds.lost = self.funds.budget.is_some(),
+        }
     }
 
     /// The Filters tab on the market: the first check it fails, and
@@ -1381,7 +1394,7 @@ impl MoonShot {
             if active && p.kind == Kind::Drops {
                 for &idx in &rt.universe {
                     match model.at(idx) {
-                        Some(m) if m.live() && m.last() > 0.0 => {
+                        Some(m) if m.live() && m.live_price() => {
                             self.tapes.sample(idx, now, m.last())
                         }
                         _ => self.tapes.reset(idx),
@@ -1401,7 +1414,7 @@ impl MoonShot {
             if active && p.kind == Kind::Strike {
                 for &idx in &rt.universe {
                     match model.at(idx) {
-                        Some(m) if m.live() && m.last() > 0.0 => {
+                        Some(m) if m.live() && m.live_price() => {
                             // A side the book does not give falls back to the
                             // last trade, as the anchor does: the long's
                             // reference is the bid, the short's the ask.
@@ -1500,7 +1513,7 @@ impl MoonShot {
                     Some(Gate::MarketSlots)
                 } else if !m.live() {
                     Some(Gate::NotTrading)
-                } else if !(m.last() > 0.0 || now < self.price_wait_until) {
+                } else if !(m.live_price() || now < self.price_wait_until) {
                     Some(Gate::NoPrice)
                 } else if self.bvsv_holds(&p, idx, now) {
                     Some(Gate::BvSv)
@@ -1563,7 +1576,24 @@ impl MoonShot {
             .flat_map(|markets| markets.values().flatten().copied())
             .filter(|o| (o.status == status::BUY_SET || o.is_pending()) && !o.hand)
             .collect();
-        self.cancel_entries(&entries, now, &mut cmds);
+        // An unreadable strategy file leaves the list empty: that is not a deletion of every
+        // strategy, and nothing is cancelled or adopted on its account.
+        if !st.unreadable() {
+            self.cancel_entries(&entries, now, &mut cmds);
+        }
+        // Their positions are nobody's but the core's watch: the stop the strategy had drawn
+        // is made a real one, or it would stay a picture that never fires.
+        for (&sid, markets) in &by_strat {
+            // An unreadable strategy file leaves the list empty: that is not a deletion.
+            if listed(sid) || st.unreadable() {
+                continue;
+            }
+            for o in markets.values().flatten() {
+                if o.holds_position() && !o.hand && o.bot_stop().0 > 0.0 {
+                    cmds.push(Cmd::AdoptStop { order: o.id });
+                }
+            }
+        }
         cmds
     }
 
@@ -2020,7 +2050,7 @@ impl MoonShot {
         // No trade yet since the start: the ladder waits with what it has
         // (entries restored from the previous run stay put, see
         // `RESTORE_PRICE_WAIT_MS`); withdrawals above and below need no price.
-        let priced = m.last() > 0.0;
+        let priced = m.live_price();
         if commits.is_empty() {
             if !priced {
                 return;
@@ -2497,7 +2527,7 @@ impl MoonShot {
         now: i64,
         cmds: &mut Vec<Cmd>,
     ) -> bool {
-        if m.last() <= 0.0 {
+        if !m.live_price() {
             return false;
         }
         for o in entries {
@@ -2564,7 +2594,7 @@ impl MoonShot {
             }
             self.signals.remove(&key);
             // The gates may have closed meanwhile: the signal is spent.
-            if m.last() > 0.0 && *slots > 0 && !busy && self.enters(p, m, idx, sig.short, now) {
+            if m.live_price() && *slots > 0 && !busy && self.enters(p, m, idx, sig.short, now) {
                 self.strike_orders(s, p, m, sig, slots, cmds);
             }
             return;
@@ -3672,6 +3702,8 @@ impl WorkWindow {
 #[derive(Debug, Default)]
 struct Funds {
     budget: Option<f64>,
+    /// The balance was known and is not any more.
+    lost: bool,
     /// The core-wide emulator mode.
     emulator: bool,
     /// Strategy × market told it is short of money (logged once).
@@ -3686,6 +3718,11 @@ impl Funds {
 
     fn refusal(&self, p: &Params, m: &Market, size: f64) -> Option<String> {
         let free = self.budget.filter(|_| self.applies(p, m))?;
+        if self.lost
+            && (p.check_free_balance || (p.kind != Kind::MoonShot && p.min_free_balance > 0.0))
+        {
+            return Some("the account is unreadable: the free balance is unknown".into());
+        }
         if p.kind != Kind::MoonShot && p.min_free_balance > 0.0 && free < p.min_free_balance {
             return Some(format!(
                 "free balance {free:.2} USDT < MinFreeBalance {}",
@@ -4135,6 +4172,7 @@ mod tests {
                     price,
                     spread,
                 } => orders.set_bot_stop(*order, *price, *spread),
+                Cmd::AdoptStop { order } => orders.adopt_bot_stop(*order),
                 _ => continue,
             };
             for a in fx.actions {
@@ -6226,7 +6264,7 @@ mod tests {
         assert!(moves(&cmds).is_empty(), "no SellPrice exit on top");
     }
 
-    /// BTZ6 21.09: one contract (~7100 USDT) against the default OrderSize of
+    /// BTZ6 21.09: one contract (~7100 USDT) against an OrderSize of
     /// 1000 went out as one lot, seven budgets. A lot is rounded up to only
     /// within `LOT_OVER_BUDGET` of the budget; a dearer one skips the entry.
     #[test]

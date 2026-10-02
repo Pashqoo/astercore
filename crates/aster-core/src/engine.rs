@@ -85,6 +85,8 @@ pub const ACCOUNT_PLACEHOLDER: &str = "aster";
 const API: u8 = Command::API.to_byte();
 /// How long after a user-data session opens the open orders are read.
 const OPEN_ORDERS_AFTER_MS: i64 = 3_000;
+/// The wait before a failed read of the account's open orders is made again.
+const OPEN_ORDERS_RETRY_MS: i64 = 10_000;
 /// How often stops, trailing, pending triggers and panic exits are judged
 /// (`Orders::watch`), as TInvestCore did.
 const WATCH_EVERY_MS: i64 = 1_000;
@@ -208,6 +210,9 @@ pub struct CoreHandler {
     /// order is refused before it is made.
     trading: Option<Sender<TradeCommand>>,
     order_store: Option<OrderStore>,
+    /// Why the previous run's orders could not be restored (`order_store::Saved::lost`), until
+    /// the account has been compared with the empty list.
+    orders_lost: Option<String>,
     /// Exchange work of the last effects, sent by `pump` after one snapshot
     /// of the whole batch (`flush_actions`), with the market it is on.
     pending_actions: Vec<(Action, String)>,
@@ -322,6 +327,7 @@ impl CoreHandler {
             orders: Orders::starting_at(now_ms() as u64),
             trading: None,
             order_store: None,
+            orders_lost: None,
             pending_actions: Vec::new(),
             outbox: Vec::new(),
             watch_at: 0,
@@ -372,6 +378,29 @@ impl CoreHandler {
     /// Start from the account `main` read at startup, so the first terminal
     /// is answered with it rather than with an empty wallet for a period.
     pub fn with_account(mut self, account: Account) -> Self {
+        // Orders that could not be restored leave their positions without stops and exits:
+        // the account's open positions are the ones nobody manages now.
+        if let Some(why) = self.orders_lost.take() {
+            let open: Vec<String> = account
+                .positions
+                .iter()
+                .map(|p| format!("{} {}", p.symbol, p.size))
+                .collect();
+            let text = if open.is_empty() {
+                format!("orders not restored ({why}); the account holds no positions")
+            } else {
+                format!(
+                    "orders not restored ({why}); the account HOLDS {} with no stop or exit in the core",
+                    open.join(", ")
+                )
+            };
+            if open.is_empty() {
+                log::warn!("{text}");
+            } else {
+                log::error!("{text}");
+            }
+            self.tg(crate::telegram::Kind::Alarm, format!("⛔ {text}"));
+        }
         self.account = Some(account);
         self
     }
@@ -382,6 +411,7 @@ impl CoreHandler {
     /// account keeps them too — its strategies run in the emulator, and a
     /// restart must not forget them.
     pub fn with_orders(mut self, store: OrderStore, saved: order_store::Saved) -> Self {
+        self.orders_lost = saved.lost.clone();
         let restored = self.orders.restore(saved.orders);
         self.orders.restore_left(saved.left);
         let (refreshed, missing) = self.orders.respec(|uid| self.catalog.get(uid));
@@ -841,14 +871,25 @@ impl CoreHandler {
                     self.open_orders_due = Some(now_ms() + OPEN_ORDERS_AFTER_MS);
                 }
             }
+            FeedEvent::AccountRead(a) => {
+                // The same account again: not worth a terminal packet, but a position that is
+                // still missing is now seen twice, and the budget starts from the exchange's
+                // figure again.
+                let now = now_ms();
+                let fx = self.orders.reconcile(&Self::held(&a), &self.catalog, now);
+                self.effects(fx, now);
+                self.shots.set_free_balance(Some(a.free));
+            }
             FeedEvent::Account(account) => {
                 // Positions that left the account outside the core close
                 // their orders (`Orders::reconcile`). An unknown account
-                // closes nothing.
+                // closes nothing, and forgets what it had seen missing.
                 if let Some(a) = &account {
                     let now = now_ms();
                     let fx = self.orders.reconcile(&Self::held(a), &self.catalog, now);
                     self.effects(fx, now);
+                } else {
+                    self.orders.forget_gone();
                 }
                 // A fresh read resets the free-money budget of the entries.
                 self.shots
@@ -1160,7 +1201,14 @@ impl CoreHandler {
             EngineMethod::CheckBinanceTags => Vec::new(),
             // One-way positions (`positionSide: BOTH`), which is the mode M2's
             // order model is written against; hedge mode is M5+ (`PLAN.md`).
+            // (Startup refuses an account in hedge mode, `main.rs`: the answer is true to it.)
             EngineMethod::QueryHedgeMode => engine::write_hedge_mode(false),
+            // «Cancel ALL orders»: ok at once with no data; the result reaches the terminal as
+            // the order images of the cancelled entries.
+            EngineMethod::CancelAllOrders => {
+                self.cancel_all_orders(now_ms());
+                Vec::new()
+            }
             // The EIP-712 API wallet does not expire (`PLAN.md` §10.1).
             EngineMethod::CheckAPIExpirationTime => engine::write_no_api_expiration(),
             // Futures wallet only: no spot/margin wallets to transfer between.
@@ -1348,6 +1396,30 @@ impl CoreHandler {
         );
         self.outbox
             .push((STRAT, strat::runtime_state(rand_uid(), start)));
+    }
+
+    /// `CancelAllOrders`: the strategies stop (or they would lay the ladders again within a
+    /// second) and every live entry, hand ones and pending ones too, is cancelled. Exits stay;
+    /// an entry that partly filled gets its exit as with any cancel (`trading.mdc`).
+    fn cancel_all_orders(&mut self, now: i64) {
+        let stopped = self.stop_strategies();
+        self.market_stopped = false;
+        let ids: Vec<u64> = self
+            .orders
+            .iter()
+            .filter(|o| o.status == trade::status::BUY_SET || o.is_pending())
+            .map(|o| o.id)
+            .collect();
+        let mut fx = Effects::default();
+        for &id in &ids {
+            fx.extend(self.orders.cancel_buy(id, now));
+        }
+        fx.logs.push(format!(
+            "Cancel ALL orders: {}{} entries cancelled",
+            if stopped { "strategies stopped, " } else { "" },
+            ids.len()
+        ));
+        self.effects(fx, now);
     }
 
     /// Stop the running strategies, the terminals' flag following (their pass
@@ -2128,6 +2200,10 @@ impl CoreHandler {
                 self.shots_due = true;
                 fx
             }
+            TradingEvent::OpenOrdersFailed => {
+                self.open_orders_due = Some(now + OPEN_ORDERS_RETRY_MS);
+                return;
+            }
             TradingEvent::OpenOrders(list) => {
                 let open: Vec<String> = list.iter().map(|u| u.exchange_id.clone()).collect();
                 for u in &list {
@@ -2489,6 +2565,7 @@ impl CoreHandler {
                     price,
                     spread,
                 } => self.orders.set_bot_stop(order, price, spread),
+                Cmd::AdoptStop { order } => self.orders.adopt_bot_stop(order),
                 Cmd::Detect {
                     market,
                     strategy_id,

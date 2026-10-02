@@ -33,6 +33,8 @@ pub const QUOTE_CODE: BaseCurrency = BaseCurrency::USDT;
 
 /// A perpetual whose `deliveryDate` is this is vanilla — the value is a
 /// sentinel for "never" (year 2101), not a date. 577 of 596 carry it.
+/// A quote older than this is not a price a stop may fire on (the refresher asks every 2 s).
+const BOOK_STALE_MS: i64 = 10_000;
 const NO_DELIVERY_MS: i64 = 4_133_404_800_000;
 
 /// The prefix Aster puts on a symbol whose quantity counts 1000 coins.
@@ -280,6 +282,8 @@ pub struct Market {
     pub quote_volume_24h: Option<f64>,
     /// Last traded price, from the same call and `None` for the same reason.
     pub last_price: Option<f64>,
+    /// `last_price` is the startup 24-hour ticker's and no live trade has replaced it yet.
+    pub price_seeded: bool,
     /// Top of book, from `ticker/bookTicker` and `None` until it is read.
     ///
     /// Both sides or neither: a book row carries the two together, and half a
@@ -310,6 +314,9 @@ pub struct Market {
     /// still opening counts as alive; the engine keeps it current. Orders read
     /// it (`fresh`), as TInvestCore's did.
     pub feed_fresh: bool,
+    /// When `bid`/`ask` were last written by the book refresher (ms); 0 = never stamped (a
+    /// fixture), which `quote` trusts.
+    pub book_ms: i64,
 }
 
 impl Market {
@@ -586,6 +593,11 @@ impl Market {
         price * self.step_size
     }
 
+    /// A trade price of this run is known: not the startup ticker's stand-in for one.
+    pub fn live_price(&self) -> bool {
+        self.last() > 0.0 && !self.price_seeded
+    }
+
     /// The last trade price, 0 while none is known.
     pub fn last(&self) -> f64 {
         self.last_price.unwrap_or(0.0)
@@ -600,7 +612,19 @@ impl Market {
     /// ask for a purchase, the last price standing in for a missing side.
     /// `None` without any price.
     pub fn marketable(&self, sell: bool, spread: f64) -> Option<f64> {
-        let side = if sell { self.bid } else { self.ask };
+        self.marketable_at(sell, spread, 0)
+    }
+
+    /// `marketable` priced off a book no older than `BOOK_STALE_MS` at `now_ms` (0 = no check):
+    /// under a 429 back-off the old side must not set the price of an exit.
+    pub fn marketable_at(&self, sell: bool, spread: f64, now_ms: i64) -> Option<f64> {
+        let side = if now_ms > 0 {
+            Some(self.quote(sell, now_ms))
+        } else if sell {
+            self.bid
+        } else {
+            self.ask
+        };
         let base = side.filter(|p| *p > 0.0).unwrap_or(self.last());
         if base <= 0.0 {
             return None;
@@ -625,8 +649,10 @@ impl Market {
     /// `price` pinned inside the band, unchanged while the band is unknown.
     pub fn within_limits(&self, price: f64) -> f64 {
         match self.band() {
-            Some((down, up)) => price.clamp(down, up),
-            None => price,
+            // `clamp` panics on `down > up` (a band a tick wide after snapping, a broken mark),
+            // and a NaN bound: the price stays as it is then.
+            Some((down, up)) if down <= up => price.clamp(down, up),
+            _ => price,
         }
     }
 
@@ -660,6 +686,20 @@ impl Market {
         self.mark_price = Some(1.0);
         self.multiplier_down = down;
         self.multiplier_up = up;
+    }
+
+    /// The side of the book an exit hits (the bid for a sale, the ask for a buy-back), 0 when
+    /// it is unknown or older than `BOOK_STALE_MS`: the refresher stands still under a 429
+    /// back-off, and an old quote must not decide a stop against the live `last`.
+    pub fn quote(&self, sells: bool, now_ms: i64) -> f64 {
+        if self.book_ms > 0 && now_ms - self.book_ms > BOOK_STALE_MS {
+            return 0.0;
+        }
+        if sells {
+            self.bid_px()
+        } else {
+            self.ask_px()
+        }
     }
 
     /// The best bid, 0 while unknown (the strategies' convention).
@@ -877,6 +917,7 @@ impl Catalog {
             .binary_search_by(|m| m.symbol.as_str().cmp(symbol))
         {
             self.markets[i].last_price = Some(price);
+            self.markets[i].price_seeded = false;
         }
     }
 
@@ -923,6 +964,7 @@ impl Catalog {
             {
                 self.markets[i].quote_volume_24h = Some(r.quote_volume);
                 self.markets[i].last_price = Some(r.last_price);
+                self.markets[i].price_seeded = true;
                 filled += 1;
             }
         }
@@ -1016,6 +1058,7 @@ impl Catalog {
     /// the one way a core that cannot reach the exchange can stop presenting
     /// old prices as current.
     pub fn apply_book(&mut self, rows: &[BookTicker]) -> usize {
+        let at = crate::aster::rest::now_ms();
         for m in &mut self.markets {
             m.bid = None;
             m.ask = None;
@@ -1032,6 +1075,7 @@ impl Catalog {
                 let m = &mut self.markets[i];
                 m.bid = Some(r.bid_price);
                 m.ask = Some(r.ask_price);
+                m.book_ms = at;
                 filled += 1;
             }
         }
@@ -1412,11 +1456,13 @@ fn market_of(s: &SymbolInfo) -> Market {
         tags: tags_of(s),
         quote_volume_24h: None,
         last_price: None,
+        price_seeded: false,
         bid: None,
         ask: None,
         mark_price: None,
         funding: None,
         feed_fresh: true,
+        book_ms: 0,
     };
     for f in &s.filters {
         match f {
@@ -1551,11 +1597,13 @@ pub(crate) mod fixtures {
             tags: vec![Tag::Crypto],
             quote_volume_24h: None,
             last_price: None,
+            price_seeded: false,
             bid: None,
             ask: None,
             mark_price: None,
             funding: None,
             feed_fresh: true,
+            book_ms: 0,
         }
     }
 
@@ -1588,6 +1636,18 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+    /// A band a tick wide or inverted (a broken mark) leaves the price alone instead of
+    /// panicking `f64::clamp`.
+    #[test]
+    fn a_degenerate_band_does_not_panic() {
+        let mut m = btc();
+        m.set_limits(10.0, 5.0, 0);
+        assert_eq!(m.within_limits(7.0), 7.0);
+        m.set_limits(5.0, 10.0, 0);
+        assert_eq!(m.within_limits(7.0), 7.0);
+        assert_eq!(m.within_limits(11.0), 10.0);
+    }
+
     use super::*;
 
     fn btc() -> Market {
@@ -1622,11 +1682,13 @@ mod tests {
             tags: vec![Tag::Top, Tag::Crypto],
             quote_volume_24h: None,
             last_price: None,
+            price_seeded: false,
             bid: None,
             ask: None,
             mark_price: None,
             funding: None,
             feed_fresh: true,
+            book_ms: 0,
         }
     }
 

@@ -82,6 +82,94 @@ pub(super) struct DealShot {
     exit_moves: Vec<Move>,
 }
 
+/// What a deal's picture is drawn from, owned so that it can leave the trading thread.
+enum OwnedSeries {
+    Bars(Vec<Candle>),
+    Ticks(Vec<HistoryTrade>),
+}
+
+/// One deal picture on its way to the drawing worker (`draw_and_send`).
+struct DealJob {
+    row: reports::Row,
+    stop: Option<f64>,
+    take: Option<f64>,
+    entry_moves: Vec<Move>,
+    exit_moves: Vec<Move>,
+    minutes: i64,
+    session: f64,
+    reporter: Option<telegram::Reporter>,
+    caption: String,
+    drawn: String,
+    series: OwnedSeries,
+}
+
+/// The queue of the one drawing worker (`aster-deal-png`), started on the first picture:
+/// whatever the number of deals that closed together, they are drawn one after another by one
+/// thread, and wait as small jobs, not as threads.
+static DRAWING: std::sync::OnceLock<Option<std::sync::mpsc::Sender<DealJob>>> =
+    std::sync::OnceLock::new();
+
+fn drawing_queue() -> Option<&'static std::sync::mpsc::Sender<DealJob>> {
+    DRAWING
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<DealJob>();
+            std::thread::Builder::new()
+                .name("aster-deal-png".into())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        // One bad picture costs that picture, not the worker.
+                        let coin = job.row.coin.clone();
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
+                            .is_err()
+                        {
+                            log::error!("{coin}: drawing the deal picture panicked");
+                        }
+                    }
+                })
+                .map_err(|e| log::warn!("deal picture worker: {e}"))
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+impl DealJob {
+    fn run(self) {
+        let row = &self.row;
+        let deal = chart::Deal {
+            market: &row.coin,
+            minutes: self.minutes,
+            short: row.is_short,
+            entry: row.buy_price,
+            entry_ms: row.buy_date * 1000,
+            exit: row.sell_price,
+            exit_ms: row.close_date * 1000,
+            stop: self.stop,
+            take: self.take,
+            entry_moves: &self.entry_moves,
+            exit_moves: &self.exit_moves,
+            caption: &self.drawn,
+            outcome: Some(chart::Outcome {
+                profit: row.profit,
+                spent: row.spent,
+                session: self.session,
+            }),
+        };
+        let series = match &self.series {
+            OwnedSeries::Bars(b) => chart::Series::Bars(b),
+            OwnedSeries::Ticks(t) => chart::Series::Ticks(t),
+        };
+        match chart::deal_png(series, &deal) {
+            Some(png) => {
+                if let Some(r) = &self.reporter {
+                    r.picture(telegram::Kind::Deal, self.caption.clone(), png);
+                }
+            }
+            None => log::warn!("{}: the deal's data draws no chart", row.coin),
+        }
+    }
+}
+
 /// The operator's state of the handler, apart from the trading state.
 #[derive(Default)]
 pub(super) struct Ops {
@@ -972,18 +1060,35 @@ impl CoreHandler {
                 .0,
             }),
         };
-        match chart::deal_png(series, &deal) {
-            Some(png) => {
-                if let Some(r) = &self.ops.telegram {
-                    r.picture(telegram::Kind::Deal, caption, png);
-                }
-                true
-            }
-            None => {
-                log::warn!("{}: the deal's data draws no chart", row.coin);
-                false
-            }
+        if !chart::drawable(&series) {
+            log::warn!("{}: the deal's data draws no chart", row.coin);
+            return false;
         }
+        // 2000×1200 with anti-aliasing and zlib is the better part of a second of CPU: not on
+        // the thread that trades. Owned copies go to a worker; pictures are drawn one at a time
+        // (a panic of fifty positions would otherwise draw fifty at once).
+        let owned = match series {
+            chart::Series::Bars(b) => OwnedSeries::Bars(b.to_vec()),
+            chart::Series::Ticks(t) => OwnedSeries::Ticks(t.to_vec()),
+        };
+        let job = DealJob {
+            row: row.clone(),
+            stop: shot.stop,
+            take: shot.take,
+            entry_moves: shot.entry_moves.clone(),
+            exit_moves: shot.exit_moves.clone(),
+            minutes,
+            session: deal.outcome.map_or(0.0, |o| o.session),
+            reporter: self.ops.telegram.clone(),
+            caption,
+            drawn,
+            series: owned,
+        };
+        let queued = drawing_queue().is_some_and(|q| q.send(job).is_ok());
+        if !queued {
+            log::warn!("{}: deal picture: no drawing worker", row.coin);
+        }
+        queued
     }
 
     /// The summary of the day's closed deals, once a trader's day, at the hour

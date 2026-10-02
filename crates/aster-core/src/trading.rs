@@ -74,6 +74,11 @@ pub struct OrderUpdate {
     pub message: String,
 }
 
+/// A failure that may be the clock's: a nonce outside the window, or no answer at all.
+fn clock_suspect(e: &rest::Error) -> bool {
+    !matches!(e, rest::Error::Api { code, .. } if *code != CODE_NONCE_EXPIRED)
+}
+
 /// The exchange refused the call for good: the request was read and turned
 /// down, so it did not and will not take effect. A 5xx, a timeout or a
 /// transport error leaves its fate unknown.
@@ -119,6 +124,9 @@ pub enum TradingEvent {
     /// The account's live orders: on start and after every reopening of the
     /// user-data stream, whose events in between may be lost.
     OpenOrders(Vec<OrderUpdate>),
+    /// The read of the account's live orders failed: it is asked again (the engine plans it),
+    /// or the restored orders would stay unchecked until the stream reopens, hours away.
+    OpenOrdersFailed,
     /// Round trip of the last call of an action, ms; a call that never
     /// answered reads as the call timeout.
     Ping(i64),
@@ -175,7 +183,12 @@ pub fn start(
                                 }
                                 Err(e) => {
                                     log::warn!("orders: open orders: {e}");
-                                    clock_due = Instant::now();
+                                    if clock_suspect(&e) {
+                                        clock_due = Instant::now();
+                                    }
+                                    if !send(TradingEvent::OpenOrdersFailed) {
+                                        return;
+                                    }
                                 }
                             }
                             continue;
@@ -209,7 +222,12 @@ pub fn start(
                         } else {
                             log::warn!("{op:?} order {order:#x} {leg:?}: {msg}");
                         }
-                        clock_due = Instant::now();
+                        // A refusal of the order itself (-2011 on a filled order, -2019) says
+                        // nothing about the clock: measuring it first would cost the next
+                        // order a round trip on the critical path.
+                        if done.code.is_none() || done.code == Some(CODE_NONCE_EXPIRED) {
+                            clock_due = Instant::now();
+                        }
                         let failed = TradingEvent::Failed {
                             action,
                             definitive,

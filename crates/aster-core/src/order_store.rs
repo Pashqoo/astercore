@@ -38,6 +38,10 @@ pub struct Saved {
     /// Ids of account orders left to the account (`Orders::left_ids`): a
     /// report of theirs after the restart stays theirs.
     pub left: Vec<String>,
+    /// Set by `open` when a file was there and could not be used (unreadable or damaged): the
+    /// orders of the previous run are lost, and the engine says so loudly. Never serialized.
+    #[serde(skip)]
+    pub lost: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -71,32 +75,34 @@ pub struct OrderStore {
 }
 
 impl OrderStore {
-    /// The store at `path` and what it holds; a missing or unreadable file
-    /// is an empty start (logged).
+    /// The store at `path` and what it holds. A missing file is a clean start; an unreadable or
+    /// damaged one is put aside and reported in `Saved::lost` (the engine raises the alarm).
     pub fn open(path: PathBuf) -> (Self, Saved) {
-        let saved = match fs::read(&path) {
-            // Kept aside for a post-mortem; the next save replaces the file.
-            // Strategies stay stopped: nothing says what was running.
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                let secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
-                let bad = path.with_extension(format!("json.bad-{secs}"));
-                let kept = fs::rename(&path, &bad).map_or_else(
-                    |e| format!("not kept: {e}"),
-                    |()| format!("kept as {}", bad.display()),
-                );
-                log::warn!(
-                    "orders: {}: {e}, starting without orders, strategies stopped ({kept})",
-                    path.display()
-                );
-                Saved::default()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::default(),
-            Err(e) => {
-                log::warn!("orders: {}: {e}", path.display());
-                Saved::default()
+        // Kept aside for a post-mortem; the next save replaces the file.
+        // Strategies stay stopped: nothing says what was running.
+        let aside = |why: String| {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let bad = path.with_extension(format!("json.bad-{secs}"));
+            let kept = fs::rename(&path, &bad).map_or_else(
+                |e| format!("not kept: {e}"),
+                |()| format!("kept as {}", bad.display()),
+            );
+            let lost = format!(
+                "{}: {why}, starting without orders, strategies stopped ({kept})",
+                path.display()
+            );
+            log::error!("orders: {lost}");
+            Saved {
+                lost: Some(lost),
+                ..Saved::default()
             }
+        };
+        let saved = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| aside(e.to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::default(),
+            Err(e) => aside(e.to_string()),
         };
         let store = Self {
             path,
@@ -168,6 +174,25 @@ impl OrderStore {
 
 #[cfg(test)]
 mod tests {
+    /// A file that cannot be read is not a clean start: the orders are reported lost and the
+    /// file is put aside instead of being replaced by the next save.
+    #[test]
+    fn an_unreadable_file_is_reported_lost_and_put_aside() {
+        let dir = std::env::temp_dir().join(format!("aster-store-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // A directory where the file should be: `fs::read` fails with something other than
+        // NotFound.
+        let path = dir.join("orders.json");
+        fs::create_dir_all(&path).unwrap();
+        let (_, saved) = OrderStore::open(path.clone());
+        assert!(saved.lost.is_some());
+        assert!(saved.orders.is_empty());
+        assert!(!path.exists(), "kept aside");
+        let (_, clean) = OrderStore::open(path);
+        assert!(clean.lost.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// A snapshot from before `left` existed still loads, with nothing left.
