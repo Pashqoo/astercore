@@ -550,7 +550,7 @@ URL с подписью не попадает в ошибки ureq; listenKey к
 `order_book_stream` — 42 полных снимка топ-20 за 6 с (с 01.10 книга глубже — 1000 уровней, ниже); `history_bars … 5m` — 1500 свечей CoinCard;
 `market_refresh` — `prices updated: 596`, `BTCUSDT … funding=0.009573` (фандинг теперь в рядах цен,
 а не только в каталоге). В журнале раз в 5 минут: `streams: trades#0 ok 1 session, trades#1 ok
-1 session, trades#2 ok 1 session, marks ok 1 session` и `load: … books 1 sets / 1 chunks …`.
+1 session, trades#2 ok 1 session, marks ok 1 session` и `load: … books 1 sets / 1 chunks …`. С 02.10 рядом — `shots:` (цена прохода стратегий).
 Контрактный тест на loopback подставным фидом проверяет то же плюс несчастливую ветку (отказ
 биржи по REST доходит до клиента отказом).
 

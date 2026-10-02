@@ -1339,6 +1339,10 @@ alwaysApply: true
   (`trades#N`, `books#N`, `candles#N`, `status#N`), строки журнала несут то же имя; раз в 5 мин сводка
   `streams: trades#0 ok 2 sessions, orders …` по наблюдаемым стримам. Метка стартует при регистрации: открывающийся стрим 15 с
   считается живым (восстановленные лесенки на старте не снимаются).
+- **Цена прохода стратегий (02.10).** Раз в `SUMMARY_EVERY_MS` (по монотонным часам, как `load:`) —
+  строка `shots: N passes in S s, avg X ms, max Y ms` (`engine::ShotsCost`): сколько стоит один
+  `run_shots`. Нужна, чтобы решать, как часто его можно гонять (MoonBot проверяет коридор MoonShot
+  каждые 16 мс, ядро — раз в 1000 мс).
 - **Счётчики нагрузки (M6 п.1, 20.09).** Рядом со сводкой `streams:`, тем же периодом
   (`stream_health::SUMMARY_EVERY_MS` = 5 мин, `CoreHandler::load_line`) — строка
   `load: pools <стратегия> N, … · passes X/s · batch full N · books N sets / N chunks ·

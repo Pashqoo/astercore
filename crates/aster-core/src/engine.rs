@@ -108,41 +108,40 @@ const TELEGRAM_UNSUPPORTED: &str = r#"{"enabled":false,"service_online":false,"s
 const PUMP_BATCH: usize = 256;
 /// How often stream liveness is judged.
 const HEALTH_EVERY_MS: i64 = 1_000;
-/// How often the strategy pass reports what it costs.
-const SHOTS_REPORT_MS: i64 = 300_000;
-
-/// What the strategy pass costs, reported once per [`SHOTS_REPORT_MS`]: the number that decides
-/// how often it may run (MoonBot checks a MoonShot corridor every 16 ms).
+/// What the strategy pass costs, reported with the `load:` line (`SUMMARY_EVERY_MS`): the number
+/// that decides how often it may run (MoonBot checks a MoonShot corridor every 16 ms). Timed on
+/// the monotonic clock, as that line is: a stepped wall clock must not print a period that never
+/// lasted.
 #[derive(Default)]
 struct ShotsCost {
     passes: u32,
     total: std::time::Duration,
     max: std::time::Duration,
-    since: i64,
+    since: Option<Instant>,
 }
 
 impl ShotsCost {
-    /// Adds one pass; the report line when the interval is up, and the count starts over.
-    fn record(&mut self, took: std::time::Duration, now: i64) -> Option<String> {
-        if self.since == 0 {
-            self.since = now;
-        }
+    /// Adds one pass finished at `at`; the report line when the interval is up, and the count
+    /// starts over.
+    fn record(&mut self, took: std::time::Duration, at: Instant) -> Option<String> {
+        let since = *self.since.get_or_insert(at);
         self.passes += 1;
         self.total += took;
         self.max = self.max.max(took);
-        if now - self.since < SHOTS_REPORT_MS {
+        let lasted = at.saturating_duration_since(since);
+        if lasted < std::time::Duration::from_millis(SUMMARY_EVERY_MS.unsigned_abs()) {
             return None;
         }
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
         let line = format!(
             "shots: {} passes in {} s, avg {:.2} ms, max {:.2} ms",
             self.passes,
-            (now - self.since) / 1000,
+            lasted.as_secs(),
             ms(self.total) / f64::from(self.passes),
             ms(self.max)
         );
         *self = Self {
-            since: now,
+            since: Some(at),
             ..Self::default()
         };
         Some(line)
@@ -686,7 +685,7 @@ impl CoreHandler {
         if !self.stopping && (self.shots_due || now - self.shots_at >= SHOTS_PERIOD_MS) {
             let began = Instant::now();
             self.run_shots(now);
-            if let Some(line) = self.shots_cost.record(began.elapsed(), now) {
+            if let Some(line) = self.shots_cost.record(began.elapsed(), Instant::now()) {
                 log::info!("{line}");
             }
         }
@@ -3267,16 +3266,28 @@ mod shots_cost_tests {
     #[test]
     fn the_cost_is_reported_once_per_interval_and_counted_afresh() {
         let mut c = ShotsCost::default();
-        let ms = Duration::from_millis;
-        assert!(c.record(ms(2), 1_000).is_none());
-        assert!(c.record(ms(6), 2_000).is_none());
-        let line = c
-            .record(ms(4), 1_000 + SHOTS_REPORT_MS)
-            .expect("the interval is up");
+        let (ms, base) = (Duration::from_millis, Instant::now());
+        let at = |s: u64| base + Duration::from_secs(s);
+        let period = SUMMARY_EVERY_MS as u64 / 1000;
+        assert!(c.record(ms(2), at(1)).is_none());
+        assert!(c.record(ms(6), at(2)).is_none());
+        let line = c.record(ms(4), at(1 + period)).expect("the interval is up");
         assert_eq!(line, "shots: 3 passes in 300 s, avg 4.00 ms, max 6.00 ms");
         // The next interval starts from this pass, with nothing carried over.
-        assert!(c.record(ms(1), 2_000 + SHOTS_REPORT_MS).is_none());
-        let line = c.record(ms(1), 1_000 + 2 * SHOTS_REPORT_MS).unwrap();
+        assert!(c.record(ms(1), at(2 + period)).is_none());
+        let line = c.record(ms(1), at(1 + 2 * period)).unwrap();
         assert_eq!(line, "shots: 2 passes in 300 s, avg 1.00 ms, max 1.00 ms");
+    }
+
+    /// An instant earlier than the start (`Instant` cannot step, but the argument can lag) is no
+    /// negative period: nothing reported, nothing panics.
+    #[test]
+    fn an_earlier_instant_is_no_negative_period() {
+        let mut c = ShotsCost::default();
+        let base = Instant::now() + Duration::from_secs(10);
+        assert!(c.record(Duration::from_millis(1), base).is_none());
+        assert!(c
+            .record(Duration::from_millis(1), base - Duration::from_secs(5))
+            .is_none());
     }
 }
