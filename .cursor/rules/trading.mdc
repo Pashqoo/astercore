@@ -175,6 +175,8 @@ alwaysApply: true
   потолок — первый брекет `/fapi/v3/leverageBracket`, смена — `POST /fapi/v3/leverage`.
   `ACCOUNT_CONFIG_UPDATE` ядро не потребляет. `exchangeInfo` даёт только `requiredMarginPercent` —
   потолок инструмента (5.0 → 20×), запасной вариант, а не плечо счёта.
+  Плечо рынка под лимит позиции — по `notionalCap` брекетов (`levman.rs`, `PLAN.md` «Управление
+  плечами»); живьём — только по `PLAN.md`, пока не записано иное.
 
 ### Сессии вместо расписания
 

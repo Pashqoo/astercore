@@ -1,5 +1,6 @@
-//! One-off account setup: every market isolated, at the highest leverage the account's
-//! brackets allow. Driven by `examples/set_isolated_max.rs`, never by the core itself.
+//! Account setup, market by market: the plan of a market (`plan_for`) and the calls that carry
+//! it out (`apply`). Driven by `examples/set_isolated_max.rs` (every market isolated, at the
+//! highest leverage the brackets allow) and by the core's leverage management (`levman`).
 //!
 //! The plan is a pure function of what the exchange states per symbol (`positionRisk`'s row, the
 //! brackets, the resting orders), so what a dry run prints is what an apply would send; only a
@@ -14,6 +15,7 @@ use crate::aster::rest::{self, Rest};
 use crate::aster::sign::Signer;
 
 pub const ISOLATED: &str = "ISOLATED";
+pub const CROSSED: &str = "CROSSED";
 /// `-4046`: the margin type already is the one asked for.
 const CODE_NO_NEED_TO_CHANGE: i64 = -4046;
 /// `-1003`: too many requests.
@@ -57,43 +59,81 @@ pub struct Plan {
     pub symbol: String,
     /// Set when something is to change but must not be touched now.
     pub block: Option<Block>,
-    /// Margin type to be set to `ISOLATED`.
-    pub margin: bool,
+    /// Margin type to be set (`ISOLATED` / `CROSSED`).
+    pub margin: Option<&'static str>,
     /// Leverage to be set, to this figure.
     pub leverage: Option<i32>,
 }
 
 impl Plan {
     pub fn is_noop(&self) -> bool {
-        self.block.is_none() && !self.margin && self.leverage.is_none()
+        self.block.is_none() && self.margin.is_none() && self.leverage.is_none()
     }
 }
 
+/// What is wanted of one symbol.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Want {
+    /// The margin type, `None` = leave it.
+    pub margin: Option<&'static str>,
+    /// The leverage, `None` = leave it.
+    pub leverage: Option<i32>,
+    /// A leverage below the target is raised to it; when false only a leverage above it is
+    /// lowered (a symbol whose leverage the row does not state is then left as it is).
+    pub raise: bool,
+}
+
 /// What one symbol needs, from its `positionRisk` row (`None` when the exchange sent none), its
-/// brackets' maximum and whether an order rests on it.
+/// brackets' maximum and whether an order rests on it: ISOLATED at the highest leverage.
 pub fn plan(symbol: &str, row: Option<&PositionRisk>, max: Option<i32>, orders: bool) -> Plan {
+    let Some(max) = max.filter(|&m| m > 0) else {
+        let block = if row.is_some() {
+            Block::NoBracket
+        } else {
+            Block::NoRow
+        };
+        return Plan {
+            symbol: symbol.to_string(),
+            block: Some(block),
+            margin: None,
+            leverage: None,
+        };
+    };
+    let want = Want {
+        margin: Some(ISOLATED),
+        leverage: Some(max),
+        raise: true,
+    };
+    plan_for(symbol, row, &want, orders)
+}
+
+/// What one symbol needs to get `want`. A symbol that already is as wanted needs nothing, even
+/// with a position; a change is held back while a position is open or an order rests.
+pub fn plan_for(symbol: &str, row: Option<&PositionRisk>, want: &Want, orders: bool) -> Plan {
     let mut out = Plan {
         symbol: symbol.to_string(),
         block: None,
-        margin: false,
+        margin: None,
         leverage: None,
     };
+    if want.margin.is_none() && want.leverage.is_none() {
+        return out;
+    }
     let Some(row) = row else {
         out.block = Some(Block::NoRow);
         return out;
     };
-    let Some(max) = max.filter(|&m| m > 0) else {
-        out.block = Some(Block::NoBracket);
-        return out;
-    };
-    // A row that does not state its margin type is not assumed isolated.
-    let isolated = row
-        .margin_type
-        .as_deref()
-        .is_some_and(|t| t.eq_ignore_ascii_case(ISOLATED));
-    let margin = !isolated;
-    let leverage = (row.leverage != Some(max)).then_some(max);
-    if !margin && leverage.is_none() {
+    // A row that does not state its margin type is not assumed to be the wanted one.
+    let margin = want.margin.filter(|kind| {
+        !row.margin_type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(kind))
+    });
+    let leverage = want.leverage.filter(|&target| match row.leverage {
+        Some(now) => now > target || (now < target && want.raise),
+        None => want.raise,
+    });
+    if margin.is_none() && leverage.is_none() {
         return out;
     }
     if row.amount != 0.0 {
@@ -162,7 +202,7 @@ fn is_limit(e: &rest::Error) -> bool {
 }
 
 /// Sends the plans, one call at a time, [`PACE`] apart. A refusal of one symbol is recorded and
-/// the run goes on; the leverage of a symbol goes out only when its margin is isolated. A rate
+/// the run goes on; the margin goes first and the leverage after it. A rate
 /// limit or a ban ends the run. The signer's clock is the caller's to have measured.
 pub fn apply(rest: &mut Rest, signer: &mut Signer, plans: &[Plan]) -> Report {
     let mut report = Report::default();
@@ -187,10 +227,13 @@ pub fn apply(rest: &mut Rest, signer: &mut Signer, plans: &[Plan]) -> Report {
             }
             calls += 1;
         };
-        if p.margin {
+        if let Some(kind) = p.margin {
             pause();
-            match rest.set_margin_type(signer, &p.symbol, ISOLATED) {
-                Ok(()) => report.margin_set += 1,
+            match rest.set_margin_type(signer, &p.symbol, kind) {
+                Ok(()) => {
+                    log::info!("setup: {} margin -> {kind}", p.symbol);
+                    report.margin_set += 1;
+                }
                 // Already isolated: what was asked for.
                 Err(rest::Error::Api { code, .. }) if code == CODE_NO_NEED_TO_CHANGE => {}
                 Err(e) if is_limit(&e) => {
@@ -214,7 +257,10 @@ pub fn apply(rest: &mut Rest, signer: &mut Signer, plans: &[Plan]) -> Report {
         if let Some(max) = p.leverage {
             pause();
             match rest.set_leverage(signer, &p.symbol, max) {
-                Ok(done) if done.leverage == max => report.leverage_set += 1,
+                Ok(done) if done.leverage == max => {
+                    log::info!("setup: {} leverage -> {max}x", p.symbol);
+                    report.leverage_set += 1;
+                }
                 Ok(done) => report.failed.push((
                     p.symbol.clone(),
                     format!(
@@ -263,7 +309,10 @@ mod tests {
     fn a_flat_cross_symbol_gets_both_steps() {
         let r = row("BTCUSDT", 0.0, Some("CROSSED"), Some(20));
         let p = plan("BTCUSDT", Some(&r), Some(200), false);
-        assert_eq!((p.block, p.margin, p.leverage), (None, true, Some(200)));
+        assert_eq!(
+            (p.block, p.margin, p.leverage),
+            (None, Some(ISOLATED), Some(200))
+        );
     }
 
     #[test]
@@ -280,13 +329,13 @@ mod tests {
         let p = plan("BTCUSDT", Some(&r), Some(200), false);
         assert_eq!(
             (p.block, p.margin, p.leverage),
-            (Some(Block::OpenPosition), false, None)
+            (Some(Block::OpenPosition), None, None)
         );
         let flat = row("BTCUSDT", 0.0, Some("ISOLATED"), Some(20));
         let p = plan("BTCUSDT", Some(&flat), Some(200), true);
         assert_eq!(
             (p.block, p.margin, p.leverage),
-            (Some(Block::OpenOrders), false, None)
+            (Some(Block::OpenOrders), None, None)
         );
     }
 
@@ -305,7 +354,7 @@ mod tests {
         }
         // A row that does not state its margin type is not assumed isolated.
         let r = row("X", 0.0, None, Some(5));
-        assert!(plan("X", Some(&r), Some(5), false).margin);
+        assert!(plan("X", Some(&r), Some(5), false).margin.is_some());
     }
 
     #[test]
@@ -328,6 +377,45 @@ mod tests {
         assert_eq!(got[0].block, Some(Block::OpenPosition));
         assert!(got[1].is_noop());
         assert_eq!(got[2].block, Some(Block::OpenOrders));
+    }
+
+    #[test]
+    fn without_raise_a_lower_leverage_stays_and_a_higher_one_is_lowered() {
+        let want = Want {
+            margin: None,
+            leverage: Some(50),
+            raise: false,
+        };
+        let low = row("A", 0.0, Some("ISOLATED"), Some(20));
+        assert!(plan_for("A", Some(&low), &want, false).is_noop());
+        let unknown = row("A", 0.0, Some("ISOLATED"), None);
+        assert!(plan_for("A", Some(&unknown), &want, false).is_noop());
+        let high = row("A", 0.0, Some("ISOLATED"), Some(125));
+        assert_eq!(plan_for("A", Some(&high), &want, false).leverage, Some(50));
+        let raise = Want {
+            raise: true,
+            ..want
+        };
+        assert_eq!(plan_for("A", Some(&low), &raise, false).leverage, Some(50));
+    }
+
+    #[test]
+    fn a_held_position_blocks_a_lowering_too_and_cross_is_a_margin_wish() {
+        let want = Want {
+            margin: Some(CROSSED),
+            leverage: Some(10),
+            raise: true,
+        };
+        let held = row("A", 3.0, Some("ISOLATED"), Some(50));
+        let p = plan_for("A", Some(&held), &want, false);
+        assert_eq!(
+            (p.block, p.margin, p.leverage),
+            (Some(Block::OpenPosition), None, None)
+        );
+        let flat = row("A", 0.0, Some("isolated"), Some(10));
+        let p = plan_for("A", Some(&flat), &want, false);
+        assert_eq!((p.margin, p.leverage), (Some(CROSSED), None));
+        assert!(plan_for("A", None, &Want::default(), false).is_noop());
     }
 
     #[test]

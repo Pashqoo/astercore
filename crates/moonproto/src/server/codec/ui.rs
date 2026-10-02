@@ -3,7 +3,9 @@
 
 use super::strat::{self, CheckedItem};
 use super::BaseHeader;
-use crate::commands::ui::{AutoStartConfig, AutoStartConfig2, ClientSettingsCommand, UICommand};
+use crate::commands::ui::{
+    AutoStartConfig, AutoStartConfig2, ClientSettingsCommand, LevManage, UICommand,
+};
 use crate::shared_config::{gzip_compress, serialize_payload, SharedConfig};
 
 pub const CMD_CLIENT_SETTINGS: u8 = 1;
@@ -11,6 +13,8 @@ pub const CMD_SETTINGS_REQUEST: u8 = 2;
 pub const CMD_STRAT_START_STOP: u8 = 3;
 pub const CMD_STRAT_START_STOP_V2: u8 = 4;
 const CMD_NEW_MARKET_NOTIFY: u8 = 8;
+/// `TLevManageCommand`: the terminal's leverage-management snapshot (the whole of it, on Apply).
+pub const CMD_LEV_MANAGE: u8 = 9;
 pub const CMD_RUNTIME_STATE: u8 = 20;
 const CMD_KERNEL_LICENSE_STATE: u8 = 22;
 pub const CMD_KERNEL_LICENSE_STATE_REQUEST: u8 = 23;
@@ -146,6 +150,14 @@ pub fn with_uid(payload: &[u8], uid: u64) -> Vec<u8> {
 pub fn default_shared_config_blob() -> Vec<u8> {
     let plain = serialize_payload(&SharedConfig::default()).expect("default shared config");
     gzip_compress(&plain).expect("gzip default shared config")
+}
+
+/// The leverage-management snapshot of an inbound `TLevManageCommand` payload.
+pub fn lev_manage(payload: &[u8]) -> Option<LevManage> {
+    match UICommand::parse(payload)? {
+        UICommand::LevManage(l) => Some(l),
+        _ => None,
+    }
 }
 
 /// `TSharedConfig` (CmdId 28): header + `len:u32` + gzip blob.

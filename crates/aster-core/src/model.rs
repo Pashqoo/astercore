@@ -2200,12 +2200,14 @@ mod tests {
                 symbol: "BTCUSDT".into(),
                 brackets: vec![LeverageBracket {
                     initial_leverage: 125,
+                    notional_cap: 0.0,
                 }],
             },
             SymbolBrackets {
                 symbol: "NOPEUSDT".into(),
                 brackets: vec![LeverageBracket {
                     initial_leverage: 50,
+                    notional_cap: 0.0,
                 }],
             },
             SymbolBrackets {

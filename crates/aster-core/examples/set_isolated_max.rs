@@ -65,7 +65,7 @@ fn summary(plans: &[Plan]) -> String {
     format!(
         "{} markets: margin to set {}, leverage to set {}, already right {}, blocked {}",
         plans.len(),
-        n(&|p| p.margin),
+        n(&|p| p.margin.is_some()),
         n(&|p| p.leverage.is_some()),
         n(&|p| p.is_noop()),
         n(&|p| p.block.is_some()),
@@ -124,7 +124,7 @@ fn main() -> ExitCode {
             None => println!(
                 "  {}: margin {}, leverage {}",
                 p.symbol,
-                if p.margin { "-> ISOLATED" } else { "ok" },
+                p.margin.map_or("ok".into(), |k| format!("-> {k}")),
                 p.leverage.map_or("ok".into(), |l| format!("-> {l}x")),
             ),
         }

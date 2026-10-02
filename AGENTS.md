@@ -145,6 +145,13 @@
 9. **Telegram** (M4): токен бота и привязка чата PIN-кодом — на странице, вкладка Telegram. Для
    проверки без Telegram — `ASTER_TELEGRAM_API=http://127.0.0.1:<порт>` на заглушку Bot API.
 
+10. **Плечи** (поток `aster-levman`): в журнале `leverage: settings received — limit config …`
+    на Apply терминала, затем `leverage: <причина>: N of M markets read …, margin set …, leverage set
+    …, left alone …, failed …` и построчно `setup: BTCUSDT leverage -> 50x`. Проверка живьём без
+    риска: настройка на один рынок (`200 BTC` — Config с лимитом только у BTC), зонд — отдельный
+    крейт в скрэтчпаде, шлёт `LevManage` через `client.settings().manage_leverage` (фича
+    `diagnostics` вендора). Файл `data/lev_manage.bin` в рабочем каталоге ядра.
+
 `MIN_NOTIONAL` на всех символах = 5 USDT, значит живая проверка ордера стоит пять долларов.
 
 ## Чего здесь нет

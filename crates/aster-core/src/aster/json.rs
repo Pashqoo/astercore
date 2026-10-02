@@ -605,6 +605,23 @@ pub struct SymbolBrackets {
 pub struct LeverageBracket {
     #[serde(rename = "initialLeverage")]
     pub initial_leverage: i32,
+    /// The largest notional (USDT) this bracket's leverage holds for; `0` when the row states
+    /// none, which no limit is read against.
+    #[serde(default, rename = "notionalCap", deserialize_with = "cap_of")]
+    pub notional_cap: f64,
+}
+
+/// Lenient, like the leverage figure: the cap is read when it is a positive number (or a string
+/// of one) and is `0` otherwise, so a row without it still gives its maximum.
+fn cap_of<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.and_then(|v| match v {
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        serde_json::Value::Number(n) => n.as_f64(),
+        _ => None,
+    })
+    .filter(|c| c.is_finite() && *c > 0.0)
+    .unwrap_or(0.0))
 }
 
 impl SymbolBrackets {
@@ -615,6 +632,27 @@ impl SymbolBrackets {
             .map(|b| b.initial_leverage)
             .filter(|&l| l > 0)
             .max()
+    }
+
+    /// The highest leverage that still holds a position of `limit` USDT: a bracket's leverage
+    /// holds up to its `notionalCap`, and the caps shrink as the leverage grows. When `limit`
+    /// is above every cap, the leverage of the widest bracket (the lowest the exchange offers);
+    /// `None` when no bracket states a cap, so nothing is guessed.
+    pub fn leverage_for_limit(&self, limit: f64) -> Option<i32> {
+        let capped = || {
+            self.brackets
+                .iter()
+                .filter(|b| b.initial_leverage > 0 && b.notional_cap > 0.0)
+        };
+        capped()
+            .filter(|b| b.notional_cap >= limit)
+            .map(|b| b.initial_leverage)
+            .max()
+            .or_else(|| {
+                capped()
+                    .max_by(|a, b| a.notional_cap.total_cmp(&b.notional_cap))
+                    .map(|b| b.initial_leverage)
+            })
     }
 }
 

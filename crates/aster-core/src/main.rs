@@ -24,6 +24,7 @@ use aster_core::control::{self, Control};
 use aster_core::engine::{self, CoreHandler, FeedLink};
 use aster_core::feed;
 use aster_core::key_store;
+use aster_core::levman;
 use aster_core::load::Load;
 use aster_core::model::{Catalog, QUOTE};
 use aster_core::order_store::OrderStore;
@@ -36,6 +37,7 @@ use aster_core::stream_health::StreamHealth;
 use aster_core::trading;
 use aster_core::{telegram, web};
 use moonproto::server::codec::engine as engine_codec;
+use moonproto::server::codec::ui;
 use moonproto::server::Server;
 
 /// One past TInvestCore's 3100: the two cores are expected to run on the same
@@ -58,6 +60,8 @@ const EMULATOR_ORDERS_FILE: &str = "data/orders-emulator.json";
 /// The strategy list as MoonBot text (`strategy_file.rs`) and the trade
 /// reports (`reports.rs`), beside it.
 const STRATEGIES_FILE: &str = "data/strategies.txt";
+/// The terminal's last leverage-management snapshot (`levman`).
+const LEV_MANAGE_FILE: &str = "data/lev_manage.bin";
 /// A day of request counters and round trips for the page's API tab.
 /// Telemetry and nothing else: losing it costs a chart.
 const API_METER_FILE: &str = "data/api_meter.json";
@@ -459,6 +463,10 @@ fn main() -> ExitCode {
     };
     let (store, saved) = OrderStore::open(PathBuf::from(orders_file));
     let mut handler = handler.with_orders(store, saved);
+    // The terminal's leverage management survives a restart with or without an account; only
+    // an account acts on it.
+    let lev_saved = levman::load(std::path::Path::new(LEV_MANAGE_FILE));
+    handler = handler.with_levman(PathBuf::from(LEV_MANAGE_FILE), lev_saved.clone(), None);
     if let Some((account_rest, signer, first)) = account {
         // The order workers sign with clones of the account's signer: one
         // wallet, one nonce sequence (`Signer`). `orders_rest` is the first
@@ -467,6 +475,16 @@ fn main() -> ExitCode {
         let mut orders_rest = Rest::on(signer.network());
         orders_rest.set_clock_delta_ms(account_rest.clock_delta_ms());
         let trading = trading::start(orders_rest, signer.clone(), grids, ev_tx.clone());
+        // The leverage management of the terminal: its own client and thread, the wallet's
+        // signer (one nonce sequence), the settings of the previous run acted on at once.
+        let mut lev_rest = Rest::on(signer.network());
+        lev_rest.set_clock_delta_ms(account_rest.clock_delta_ms());
+        let lev_config = lev_saved
+            .as_deref()
+            .and_then(ui::lev_manage)
+            .map(|l| levman::Config::from_wire(&l));
+        let lev_worker = levman::start(lev_rest, signer.clone(), lev_config);
+        handler = handler.with_levman(PathBuf::from(LEV_MANAGE_FILE), lev_saved, Some(lev_worker));
         account::start(
             account_rest,
             signer,

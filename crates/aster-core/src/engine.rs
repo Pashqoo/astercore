@@ -40,6 +40,7 @@ use crate::candles5m::Candles5m;
 use crate::emulator::{self, Emulator};
 use crate::feed::{FeedCommand, FeedEvent};
 use crate::guards;
+use crate::levman;
 use crate::load::Load;
 use crate::model::{Catalog, QUOTE, QUOTE_CODE};
 use crate::moonshot::{self, Cmd, MoonShot, Params, WorkWindow, BTC_SYMBOL};
@@ -301,6 +302,12 @@ pub struct CoreHandler {
     /// The order worker; `None` on a core without an account, where every
     /// order is refused before it is made.
     trading: Option<Sender<TradeCommand>>,
+    /// The terminal's last `TLevManageCommand`, kept across restarts and handed to every
+    /// terminal that connects; empty when none was sent.
+    lev_manage: Vec<u8>,
+    /// Where `lev_manage` is kept, and the worker that acts on it (an account is needed for it).
+    lev_file: Option<std::path::PathBuf>,
+    levman: Option<Sender<levman::Msg>>,
     order_store: Option<OrderStore>,
     /// Why the previous run's orders could not be restored (`order_store::Saved::lost`), until
     /// the account has been compared with the empty list.
@@ -422,6 +429,9 @@ impl CoreHandler {
             // report keys its rows by them).
             orders: Orders::starting_at(now_ms() as u64),
             trading: None,
+            lev_manage: Vec::new(),
+            lev_file: None,
+            levman: None,
             order_store: None,
             orders_lost: None,
             pending_actions: Vec::new(),
@@ -544,6 +554,20 @@ impl CoreHandler {
         // The restored emulator mode decides which deals the sessions count.
         self.replay_guards();
         self.order_store = Some(store);
+        self
+    }
+
+    /// Keeps the terminal's leverage management in `file` (`saved` is what the previous run
+    /// left) and acts on it through `worker` (`levman::start`).
+    pub fn with_levman(
+        mut self,
+        file: std::path::PathBuf,
+        saved: Option<Vec<u8>>,
+        worker: Option<Sender<levman::Msg>>,
+    ) -> Self {
+        self.lev_manage = saved.unwrap_or_default();
+        self.lev_file = Some(file);
+        self.levman = worker;
         self
     }
 
@@ -1406,6 +1430,44 @@ impl CoreHandler {
         match hdr.cmd_id {
             ui::CMD_CLIENT_SETTINGS => {
                 self.set_client_settings(payload.to_vec(), now_ms());
+                session.send_encrypted(UI, &ui::with_uid(payload, rand_uid()), true);
+            }
+            // «Настройка плеча» → Apply: the whole snapshot. Kept, echoed like the client
+            // settings, and acted on at once by the leverage worker.
+            ui::CMD_LEV_MANAGE => {
+                let Some(lev) = ui::lev_manage(payload) else {
+                    log::warn!(
+                        "leverage: a TLevManageCommand that does not parse ({} bytes)",
+                        payload.len()
+                    );
+                    return;
+                };
+                let config = levman::Config::from_wire(&lev);
+                log::info!(
+                    "leverage: settings received — limit config {:?}, by max order {}, up {}, fixed {} {}, \
+                     isolated {}, cross {}",
+                    lev.lev_control,
+                    config.auto_max_order,
+                    config.auto_lev_up,
+                    config.auto_fix_lev,
+                    config.fix_lev,
+                    config.auto_isolated,
+                    config.auto_cross,
+                );
+                self.lev_manage = payload.to_vec();
+                if let Some(file) = &self.lev_file {
+                    levman::save(file, payload);
+                }
+                match &self.levman {
+                    Some(tx) => {
+                        if tx.send(levman::Msg::Config(config)).is_err() {
+                            log::error!("leverage: the worker is gone, nothing is applied");
+                        }
+                    }
+                    None => {
+                        log::warn!("leverage: no account, the settings are kept but not applied")
+                    }
+                }
                 session.send_encrypted(UI, &ui::with_uid(payload, rand_uid()), true);
             }
             // MoonBot's guarded shutdown: refused while the core holds a
@@ -3299,6 +3361,9 @@ impl Handler for CoreHandler {
     fn on_connected(&mut self, session: &mut Session) {
         log::info!("client {:#x} connected", session.client_id());
         session.send_encrypted(UI, &ui::runtime_state(rand_uid(), true, false), true);
+        if !self.lev_manage.is_empty() {
+            session.send_encrypted(UI, &ui::with_uid(&self.lev_manage, rand_uid()), true);
+        }
         // A core pushes its Telegram state on connect (moonproto
         // `docs/telegram.md`); the terminal asks for it only on a reconnect.
         session.send_encrypted(
