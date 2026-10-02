@@ -37,8 +37,8 @@ pub struct Trailing {
     pub pct: f64,
     /// `TrailingSpread` %: how far its exit crosses the book (0 = `PANIC_SPREAD`).
     pub spread: f64,
-    /// `TrailingEMA`: EMA over this many passes of the price it trails (0 or
-    /// 1 = the price itself).
+    /// `TrailingEMA`: EMA over this many points of the price it trails, one point per
+    /// [`EMA_TICK_MS`] (0 or 1 = the price itself).
     pub ema: u32,
     /// `UseTakeProfit` with `TakeProfit` %: the line appears only once the
     /// price has reached it; without it, once `StopLossDelay` has passed.
@@ -89,8 +89,8 @@ pub struct Config {
     /// band). Only the emulator and an exit with an allowed drop read it: a
     /// live stop with no floor goes out as a MARKET order (`moonshot`).
     pub market: bool,
-    /// `StopLossEMA`: stops 1–3 watch an EMA over this many passes of the
-    /// book price (0 = the price itself), so a single spike fires nothing.
+    /// `StopLossEMA`: stops 1–3 watch an EMA over this many points of the book price, one
+    /// point per [`EMA_TICK_MS`] (0 = the price itself), so a single spike fires nothing.
     pub ema: u32,
     /// `StopLossDelay`: no stop and no trailing fires this many seconds after the fill.
     pub delay: f64,
@@ -259,17 +259,30 @@ impl Line {
     };
 }
 
+/// One point of an EMA per this long: MoonBot averages the bid of its REST ticker, which comes
+/// about every 2.15 s (`_doc/STRATEGY_FORMULAS/sell-common.md`, the core developer's answer of
+/// 23.09), not the pass — however often the pass runs, `StopLossEMA = 3` is three ticker points.
+pub const EMA_TICK_MS: i64 = 2_150;
+
+/// The average and the time (ms since the fill) of its last point.
 #[derive(Debug, Default, Clone, Copy)]
-struct Ema(f64);
+struct Ema {
+    value: f64,
+    at: i64,
+}
 
 impl Ema {
-    fn next(&mut self, px: f64, n: u32) -> f64 {
-        if n <= 1 || self.0 <= 0.0 {
-            self.0 = px;
-        } else {
-            self.0 += (px - self.0) * 2.0 / (f64::from(n) + 1.0);
+    /// The average after the price `px` seen `at_ms` into the position: it takes a new point
+    /// once per [`EMA_TICK_MS`] and is the same in between. `n <= 1` is the price itself.
+    fn next(&mut self, px: f64, n: u32, at_ms: i64) -> f64 {
+        if n <= 1 || self.value <= 0.0 {
+            self.value = px;
+            self.at = at_ms;
+        } else if at_ms.saturating_sub(self.at) >= EMA_TICK_MS {
+            self.value += (px - self.value) * 2.0 / (f64::from(n) + 1.0);
+            self.at = at_ms;
         }
-        self.0
+        self.value
     }
 }
 
@@ -419,8 +432,10 @@ impl State {
                 }
             }
         }
-        let stop_px = self.ema.next(p.px, cfg.ema);
-        let trail_px = self.trail_ema.next(p.px, cfg.trailing.map_or(0, |t| t.ema));
+        let stop_px = self.ema.next(p.px, cfg.ema, p.held_ms);
+        let trail_px = self
+            .trail_ema
+            .next(p.px, cfg.trailing.map_or(0, |t| t.ema), p.held_ms);
         let main = self.main_level(cfg).map(|l| exit_price(short, base, l));
         let third = self.third_level(cfg).map(|l| exit_price(short, base, l));
         let line = match (main, third) {
@@ -631,5 +646,30 @@ mod tests {
         );
         assert_eq!(confirm(260.0, 287.85, 296.75, false, 0, 100), (true, 100));
         assert_eq!(confirm(290.0, 287.85, 296.75, false, 100, 200), (false, 0));
+    }
+
+    /// `StopLossEMA` counts ticker points, not passes: however often the pass looks, the average
+    /// takes one point per `EMA_TICK_MS`, and `n <= 1` is the price itself.
+    #[test]
+    fn the_ema_takes_one_point_per_ticker_interval_whatever_the_pass_rate() {
+        let mut slow = Ema::default();
+        let mut fast = Ema::default();
+        // The first sight seeds both at 100.
+        assert_eq!(slow.next(100.0, 3, 0), 100.0);
+        assert_eq!(fast.next(100.0, 3, 0), 100.0);
+        // A spike to 90: seen once a second by one, every 100 ms by the other, for 2 s.
+        for t in (1..=20).map(|i| i * 100) {
+            fast.next(90.0, 3, t);
+        }
+        slow.next(90.0, 3, 1_000);
+        slow.next(90.0, 3, 2_000);
+        assert_eq!(fast.value, 100.0, "no point yet before {EMA_TICK_MS} ms");
+        assert_eq!(slow.value, 100.0);
+        // The first point after the interval moves both the same: 100 + (90 − 100)·2/4.
+        let (a, b) = (fast.next(90.0, 3, 2_200), slow.next(90.0, 3, 2_200));
+        assert_eq!((a, b), (95.0, 95.0));
+        // The price itself without averaging.
+        assert_eq!(Ema::default().next(42.0, 0, 7), 42.0);
+        assert_eq!(Ema::default().next(42.0, 1, 7), 42.0);
     }
 }

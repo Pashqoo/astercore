@@ -13,7 +13,8 @@
 //! lines of trading on top. Market data (M1) is here: the tape, the books and
 //! the candles the terminal subscribes to, fed from `feed.rs`; so is manual
 //! trading (M2), and the strategies with their emulator and trade reports
-//! (M3): one pass a second (`run_shots`), whose commands go through `Orders`
+//! (M3): one pass a second, a tenth of a second while a strategy order is live (`run_shots`),
+//! whose commands go through `Orders`
 //! as the terminal's do. Every Engine API method outside what is implemented
 //! answers with a refusal naming itself, which is how the terminal shows a
 //! missing feature instead of waiting out a timeout.
@@ -108,8 +109,27 @@ const TELEGRAM_UNSUPPORTED: &str = r#"{"enabled":false,"service_online":false,"s
 const PUMP_BATCH: usize = 256;
 /// How often stream liveness is judged.
 const HEALTH_EVERY_MS: i64 = 1_000;
+/// The timer of the strategy pass, `idle` ms after the last one (which took `took_us`): every
+/// [`SHOTS_PERIOD_MS`] whatever it cost; sooner only once [`SHOTS_DUTY`] times its duration has
+/// passed — at once when `woken` (an order report, a strike-extending trade), and every
+/// [`SHOTS_FAST_MS`] while `strategy_order_live` says an order of a strategy is live (a ladder to
+/// follow, an exit to move). The order scan runs only when the rest holds.
+fn pass_due(
+    idle: i64,
+    took_us: i64,
+    woken: bool,
+    strategy_order_live: impl FnOnce() -> bool,
+) -> bool {
+    if idle >= SHOTS_PERIOD_MS {
+        return true;
+    }
+    idle.saturating_mul(1_000) >= took_us.saturating_mul(SHOTS_DUTY)
+        && (woken || (idle >= SHOTS_FAST_MS && strategy_order_live()))
+}
+
 /// What the strategy pass costs, reported with the `load:` line (`SUMMARY_EVERY_MS`): the number
-/// that decides how often it may run (MoonBot checks a MoonShot corridor every 16 ms). Timed on
+/// that told how often it may run (MoonBot checks a MoonShot corridor every 16 ms). The timer
+/// itself ([`pass_due`]) goes by the last pass alone, not by these figures. Timed on
 /// the monotonic clock, as that line is: a stepped wall clock must not print a period that never
 /// lasted.
 #[derive(Default)]
@@ -147,9 +167,17 @@ impl ShotsCost {
         Some(line)
     }
 }
-/// The strategy pass runs this often, and at once after an order report or a
-/// trade that extends a strike (TInvestCore's period).
+/// The strategy pass runs at least this often (TInvestCore's period) — the idle one: see
+/// [`pass_due`] for the fast mode and the wake-ups after an order report or a trade that extends
+/// a strike.
 const SHOTS_PERIOD_MS: i64 = 1_000;
+/// While a strategy order is live the pass runs this often (MoonBot checks a MoonShot corridor
+/// every 16 ms; a replace here takes a round trip to the exchange anyway). The samplers of
+/// Drops, Strike and Hook keep one sample per time slot, so more passes only refresh it.
+const SHOTS_FAST_MS: i64 = 100;
+/// A pass is never started sooner than this many times its own duration after the last one, a
+/// wake-up included: below the second's period a pass takes at most one twentieth of a core.
+const SHOTS_DUTY: i64 = 20;
 /// The markets' mean hourly delta (`moonshot::market_delta`) is a sweep of
 /// the whole catalog: taken this often, not on every pass.
 const MARKET_DELTA_EVERY_MS: i64 = 10_000;
@@ -276,13 +304,15 @@ pub struct CoreHandler {
     /// Markets the exchange takes no new positions on (`-4140`/`-4141` on an
     /// entry), for this run: an entry there is refused by the core.
     closed_markets: HashMap<String, i64>,
-    /// The strategy engine, its tick windows and the time of its last pass;
-    /// `shots_due` runs the next one at once.
+    /// The strategy engine, its tick windows and the start of its last pass (monotonic: a stepped
+    /// wall clock must not hold the timer); `shots_due` wakes the next one ([`pass_due`]).
     shots: MoonShot,
     windows: Windows,
-    shots_at: i64,
+    shots_began: Instant,
     shots_due: bool,
     shots_cost: ShotsCost,
+    /// What the last pass took, µs: the fast period keeps its duty to it ([`SHOTS_DUTY`]).
+    shots_took_us: i64,
     /// The markets' mean hourly delta and when it was taken.
     market_delta: (Option<f64>, i64),
     /// When the core started: warm-up bars that end before it seed the
@@ -382,8 +412,9 @@ impl CoreHandler {
             closed_markets: HashMap::new(),
             shots: MoonShot::default(),
             windows: Windows::default(),
-            shots_at: 0,
+            shots_began: Instant::now(),
             shots_cost: ShotsCost::default(),
+            shots_took_us: 0,
             shots_due: false,
             market_delta: (None, 0),
             started_at: now_ms(),
@@ -682,10 +713,12 @@ impl CoreHandler {
         }
         // Not while stopping: an entry placed now would be one more to
         // withdraw. `start_order` is the terminal's door, shut by the same flag.
-        if !self.stopping && (self.shots_due || now - self.shots_at >= SHOTS_PERIOD_MS) {
+        if !self.stopping && self.shots_pass_due() {
             let began = Instant::now();
             self.run_shots(now);
-            if let Some(line) = self.shots_cost.record(began.elapsed(), Instant::now()) {
+            let took = began.elapsed();
+            self.shots_took_us = i64::try_from(took.as_micros()).unwrap_or(i64::MAX);
+            if let Some(line) = self.shots_cost.record(took, Instant::now()) {
                 log::info!("{line}");
             }
         }
@@ -2582,11 +2615,21 @@ impl CoreHandler {
         }
     }
 
+    /// Whether the strategy pass is due now: [`pass_due`] on the monotonic clock.
+    fn shots_pass_due(&self) -> bool {
+        let idle = i64::try_from(self.shots_began.elapsed().as_millis()).unwrap_or(i64::MAX);
+        pass_due(idle, self.shots_took_us, self.shots_due, || {
+            self.orders
+                .iter()
+                .any(|o| o.strategy_id != 0 && !trade::status::is_terminal(o.status))
+        })
+    }
+
     /// One strategy pass: its commands go through `Orders` like the
     /// terminal's. The auto-start rules are judged first, so a stop asked for
     /// now is in force before the pass would place the next entry.
     fn run_shots(&mut self, now: i64) {
-        self.shots_at = now;
+        self.shots_began = Instant::now();
         self.shots_due = false;
         if now - self.market_delta.1 >= MARKET_DELTA_EVERY_MS {
             self.market_delta = (
@@ -3255,6 +3298,54 @@ fn action_leg(a: &Action) -> Leg {
         | Action::Replace { leg, .. }
         | Action::Query { leg, .. }
         | Action::QueryRequest { leg, .. } => *leg,
+    }
+}
+
+#[cfg(test)]
+mod pass_timer_tests {
+    use super::*;
+
+    #[test]
+    fn the_pass_runs_fast_only_while_a_strategy_order_is_live() {
+        let live = || true;
+        let idle_book = || false;
+        // Nothing live: the second's period, as before.
+        assert!(!pass_due(999, 700, false, idle_book));
+        assert!(pass_due(1_000, 700, false, idle_book));
+        // A live order: every 100 ms, not sooner.
+        assert!(!pass_due(99, 700, false, live));
+        assert!(pass_due(100, 700, false, live));
+    }
+
+    #[test]
+    fn a_dear_pass_is_not_started_again_before_its_duty_is_kept() {
+        // A 30 ms pass (a wide pool): the next not before 600 ms, live order or not.
+        assert!(!pass_due(100, 30_000, false, || true));
+        assert!(!pass_due(599, 30_000, false, || true));
+        assert!(pass_due(600, 30_000, false, || true));
+        // The slow period still comes whatever it cost.
+        assert!(pass_due(1_000, 90_000, false, || false));
+    }
+
+    /// An order report or a strike trade wakes the pass at once — but a burst of them cannot
+    /// run passes back to back: the duty holds for the wake-up as well.
+    #[test]
+    fn a_wake_up_runs_at_once_but_keeps_the_duty() {
+        assert!(pass_due(0, 0, true, || false));
+        assert!(pass_due(2, 100, true, || false));
+        assert!(!pass_due(2, 700, true, || false));
+        assert!(pass_due(14, 700, true, || false));
+        assert!(!pass_due(0, 0, false, || true));
+    }
+
+    #[test]
+    fn the_order_scan_is_skipped_when_it_cannot_matter() {
+        let scanned = std::cell::Cell::new(false);
+        assert!(!pass_due(50, 0, false, || {
+            scanned.set(true);
+            true
+        }));
+        assert!(!scanned.get());
     }
 }
 
