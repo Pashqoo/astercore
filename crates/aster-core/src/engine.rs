@@ -2087,10 +2087,6 @@ impl CoreHandler {
         fx
     }
 
-    /// `-4140` (the symbol is closed) / `-4141` (no new positions on it) on an
-    /// entry: the market takes no new entry for this run — the core refuses
-    /// the next one instead of the exchange. Exits, closes and moves of what
-    /// is already open are not touched: a position there still needs them.
     /// The markets closed to entries, as the strategies see them.
     fn sync_closed_markets(&mut self) {
         let closed: HashSet<String> = self.closed_markets.keys().cloned().collect();
@@ -2108,6 +2104,10 @@ impl CoreHandler {
         }
     }
 
+    /// `-4140` (the symbol is closed) / `-4141` (no new positions on it) on an
+    /// entry: the market takes no new entry for an hour (`CLOSED_MARKET_MS`) — the core refuses
+    /// the next one instead of the exchange. Exits, closes and moves of what
+    /// is already open are not touched: a position there still needs them.
     fn market_closed(&mut self, action: &Action, msg: &str) -> Effects {
         let entry = matches!(
             action,
