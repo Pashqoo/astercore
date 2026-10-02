@@ -3789,10 +3789,18 @@ fn start_tier(
 /// be refused with the whole budget already spent on it.
 fn smallest_order(m: &Market, price: f64) -> f64 {
     let lot = m.lot_value(price);
-    if lot <= 0.0 || m.min_notional <= lot {
+    if lot <= 0.0 {
         return lot;
     }
-    (m.min_notional / lot - 1e-9).ceil() * lot
+    // Whole lots that clear both the notional floor and `LOT_SIZE.minQty` (a market can
+    // have `minQty` above one step).
+    let for_notional = (m.min_notional / lot - 1e-9).ceil();
+    let for_qty = if m.step_size > 0.0 {
+        (m.min_qty / m.step_size - 1e-9).ceil()
+    } else {
+        0.0
+    };
+    for_notional.max(for_qty).max(1.0) * lot
 }
 
 /// The entry of `tier` skipped: the smallest order at `price` is past
@@ -6255,6 +6263,10 @@ mod tests {
         assert!((smallest_order(&m, 0.5) - 5.0).abs() < 1e-9);
         // A step worth more than the floor is its own minimum.
         assert!((smallest_order(&m, 80.0) - 80.0).abs() < 1e-9);
+        // `LOT_SIZE.minQty` above the lots the notional floor needs wins.
+        m.min_qty = 12.0;
+        assert!((smallest_order(&m, 0.5) - 6.0).abs() < 1e-9);
+        m.min_qty = 0.0;
         m.min_notional = 0.0;
         assert!((smallest_order(&m, 0.5) - 0.5).abs() < 1e-9);
     }

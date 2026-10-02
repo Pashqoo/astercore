@@ -39,12 +39,29 @@ static DAY_FILE: Mutex<Option<DayFile>> = Mutex::new(None);
 
 struct StderrLog;
 
+/// A log target of this workspace: the core's modules and the vendored `moonproto`.
+fn own_target(target: &str) -> bool {
+    ["aster_core", "moonproto"].iter().any(|own| {
+        target
+            .strip_prefix(own)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    })
+}
+
 impl Log for StderrLog {
-    fn enabled(&self, _: &Metadata) -> bool {
-        true
+    /// Dependencies are held to `info` whatever the configured level: at `trace` ureq prints the
+    /// whole request URI (Telegram bot token, signed query) and tungstenite the handshake path
+    /// (`/ws/<listenKey>`), none of which may reach a log.
+    fn enabled(&self, meta: &Metadata) -> bool {
+        own_target(meta.target()) || meta.level() <= Level::Info
     }
 
     fn log(&self, record: &Record) {
+        // The `log!` macros check only the global level and call this directly: the target
+        // filter of `enabled` is applied here, or it is never applied.
+        if !self.enabled(record.metadata()) {
+            return;
+        }
         let level = match record.level() {
             Level::Error => "E",
             Level::Warn => "W",
@@ -220,6 +237,17 @@ pub fn set_level(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependencies_are_held_to_info() {
+        let meta = |target, level| Metadata::builder().target(target).level(level).build();
+        assert!(StderrLog.enabled(&meta("aster_core::trading", Level::Trace)));
+        assert!(StderrLog.enabled(&meta("moonproto::server", Level::Debug)));
+        assert!(StderrLog.enabled(&meta("ureq", Level::Info)));
+        assert!(!StderrLog.enabled(&meta("ureq::util", Level::Trace)));
+        assert!(!StderrLog.enabled(&meta("tungstenite::handshake", Level::Debug)));
+        assert!(!StderrLog.enabled(&meta("aster_core_extra", Level::Trace)));
+    }
 
     /// 2026-09-19 20:59:59.999 UTC = 23:59:59.999 MSK.
     const LAST_MS_19TH_MSK: i64 = 1_789_851_599_999;

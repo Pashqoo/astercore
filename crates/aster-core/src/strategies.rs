@@ -521,6 +521,12 @@ pub struct Strategies {
     folders_last_modified: i64,
     running: bool,
     file: Option<PathBuf>,
+    /// The file exists but could not be read (permissions, not UTF-8, a filesystem hiccup): the
+    /// empty list is not the file's content, so [`Self::save`] must not write over it.
+    unreadable: bool,
+    /// The file as this run found it is copied to `<file>.prev` before the first write: a block
+    /// the parser skipped (`strategy_file`) is gone from the file at that write.
+    backed_up: std::cell::Cell<bool>,
 }
 
 impl Strategies {
@@ -547,14 +553,37 @@ impl Strategies {
             folders_last_modified: now,
             running: false,
             file,
+            unreadable: false,
+            backed_up: std::cell::Cell::new(false),
         };
         let Some(path) = this.file.as_deref() else {
             return this;
         };
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return this;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return this,
+            Err(e) => {
+                log::error!(
+                    "strategies: cannot read {}: {e}; starting with an empty list and NOT \
+                     saving over the file until the core is restarted with a readable one",
+                    path.display()
+                );
+                this.unreadable = true;
+                return this;
+            }
         };
         let (list, folders) = strategy_file::parse(&text, &this.schema);
+        // Text that parses to nothing is a foreign or damaged file, not an empty list: it is
+        // kept as it is until the operator looks at it.
+        if list.is_empty() && folders.is_empty() && !text.trim().is_empty() {
+            log::error!(
+                "strategies: {} has content but no strategy could be read from it; starting \
+                 with an empty list and NOT saving over the file",
+                path.display()
+            );
+            this.unreadable = true;
+            return this;
+        }
         for s in &list {
             add_folder(&mut this.folders, &s.path);
         }
@@ -771,11 +800,36 @@ impl Strategies {
         let Some(path) = &self.file else {
             return;
         };
+        if self.unreadable {
+            log::error!(
+                "strategies: {} was unreadable at start, the change is kept in memory only",
+                path.display()
+            );
+            return;
+        }
         let text = strategy_file::render(&self.list, &self.folders, &self.schema);
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Err(e) = std::fs::write(path, text) {
+        if !self.backed_up.replace(true) && path.exists() {
+            let mut prev = path.as_os_str().to_owned();
+            prev.push(".prev");
+            if let Err(e) = std::fs::copy(path, PathBuf::from(prev)) {
+                log::warn!("strategies: backup of {}: {e}", path.display());
+            }
+        }
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let written = std::fs::File::create(&tmp)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(text.as_bytes())?;
+                f.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
             log::error!("strategies: write {}: {e}", path.display());
         }
     }
@@ -925,6 +979,41 @@ mod tests {
         for f in ["A", "A/B", "Empty"] {
             assert!(again.folders().iter().any(|x| x == f), "folder {f}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that cannot be read (here: not UTF-8) is not the empty list: the first change from
+    /// the terminal must not write over it.
+    #[test]
+    fn unreadable_file_is_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("aster-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("strategies.txt");
+        let bytes = [0xC8u8, 0xE3, 0xF0, 0xE0, 0x0D, 0x0A];
+        std::fs::write(&file, bytes).unwrap();
+        let mut st = Strategies::new(Some(file.clone()), 1_000);
+        assert!(st.list().is_empty());
+        st.set_checked(&[CheckedItem {
+            strategy_id: 1,
+            checked: true,
+        }]);
+        st.save();
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the core itself writes for an empty list reads back as empty and stays savable.
+    #[test]
+    fn own_empty_file_stays_savable() {
+        let dir = std::env::temp_dir().join(format!("aster-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("strategies.txt");
+        let st = Strategies::new(Some(file.clone()), 1_000);
+        st.save();
+        let again = Strategies::new(Some(file.clone()), 2_000);
+        assert!(again.list().is_empty());
+        assert!(!again.unreadable);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

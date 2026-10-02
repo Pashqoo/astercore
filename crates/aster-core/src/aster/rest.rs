@@ -304,6 +304,16 @@ impl Rest {
             .collect()
     }
 
+    /// `GET /fapi/v3/positionSide/dual`, signed, weight 30: `true` when the account is in hedge
+    /// mode (a long and a short per symbol). The order model is written for one-way mode
+    /// (`positionSide` is never sent), where a short nets against a long.
+    pub fn dual_side_position(&mut self, signer: &mut Signer) -> Result<bool, Error> {
+        let v: serde_json::Value = self.signed_get(signer, "/fapi/v3/positionSide/dual", &[])?;
+        v.get("dualSidePosition")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| Error::Decode(format!("/fapi/v3/positionSide/dual: {v}")))
+    }
+
     /// `POST /fapi/v3/listenKey`, signed, weight 1: the account's user-data
     /// stream key. An account with an active key gets that same key back with
     /// its 60 minutes renewed (docs; measured 01.10: two calls, one key), so

@@ -987,6 +987,14 @@ impl Orders {
         n
     }
 
+    /// A position of the opposite side to `short` is open on `market` in the same mode
+    /// (`emulator`): in one-way mode an entry against it would net it on the exchange.
+    pub fn holds_against(&self, market: &str, short: bool, emulator: bool) -> bool {
+        self.map.values().any(|o| {
+            o.uid == market && o.is_short != short && o.emulator == emulator && o.holds_position()
+        })
+    }
+
     /// Every order still listed (finished ones until `records` prunes them).
     pub fn iter(&self) -> impl Iterator<Item = &CoreOrder> {
         self.map.values()
@@ -1254,6 +1262,9 @@ impl Orders {
                 let o = self.map.get_mut(&id).expect("order");
                 o.status = status::BUY_FAIL;
                 o.done_ms = now_ms;
+                // The `Refused` gate of the strategies reads this for its cooldown; left at 0 the
+                // strategy asks again every pass.
+                o.buy.state.close_ms = now_ms;
                 fx.logs.push(format!(
                     "{}: {}size {size:.0} USDT at {price}: {e}",
                     o.market,
@@ -1357,6 +1368,7 @@ impl Orders {
         o.pending = 0.0;
         o.status = status::BUY_CANCEL;
         o.done_ms = now_ms;
+        o.buy.state.close_ms = now_ms;
         fx.logs
             .push(format!("{}: pending order cancelled", o.market));
         fx.changed(id);
@@ -1399,6 +1411,26 @@ impl Orders {
             let Some(m) = model.get(&uid) else {
                 continue;
             };
+            // A hand entry armed while flat, or before the opposite position opened, is
+            // judged again at the trigger, as `start_order` judges an immediate one.
+            let (hand, short, emulator) = {
+                let o = &self.map[&id];
+                (o.strategy_id == 0 || o.hand, o.is_short, o.emulator)
+            };
+            if hand && self.holds_against(&uid, short, emulator) {
+                let o = self.map.get_mut(&id).expect("pending order");
+                o.pending = 0.0;
+                o.status = status::BUY_FAIL;
+                o.done_ms = now_ms;
+                o.buy.state.close_ms = now_ms;
+                fx.logs.push(format!(
+                    "{}: pending order not placed: a {} position is open on it",
+                    o.market,
+                    if short { "long" } else { "short" }
+                ));
+                fx.changed(id);
+                continue;
+            }
             // The pending order carried its USDT budget in `notional`; the
             // entry is sized from it now, at the trigger price.
             self.place_entry(id, m, price, size, true, now_ms, &mut fx);
@@ -3246,6 +3278,35 @@ mod tests {
         assert_eq!(orders.get(id).unwrap().record().stop, None);
         orders.set_stops(id, true, false, -2.0, 0.5);
         assert_eq!(orders.get(id).unwrap().record().stop, Some((294.0, 0.5)));
+    }
+
+    /// A hand entry against an open position of the other side is not placed — at the start
+    /// (`holds_against`, asked by the engine) and when a pending one fires.
+    #[test]
+    fn a_hand_entry_against_an_open_position_is_not_placed() {
+        let mut model = sber_model();
+        let sber = model.get("u-sber").unwrap().clone();
+        let mut orders = Orders::new();
+        let fx = orders.start(1, &start(7000.0, 310.0, 0.0), &sber, 1);
+        let key = post_key(&fx);
+        orders.apply(&update(&key, "9001", ExecStatus::Filled, 2, 2, 309.5), 20);
+        assert!(orders.get(1).unwrap().holds_position());
+        assert!(orders.holds_against("u-sber", true, false));
+        assert!(!orders.holds_against("u-sber", false, false));
+        assert!(!orders.holds_against("u-sber", true, true));
+        assert!(!orders.holds_against("other", true, false));
+
+        // A hand short armed at 301 (above the last 300) fires when the price gets there.
+        let mut pending = start(3000.0, 301.0, 0.0);
+        pending.is_short = true;
+        pending.strategy_id = 0;
+        let id = orders.start_pending(2, &pending, &sber, 30).changed[0];
+        model.set_last("u-sber", 302.0);
+        let fx = orders.watch(&model, 40);
+        assert!(fx.actions.is_empty(), "{:?}", fx.actions);
+        let o = orders.get(id).unwrap();
+        assert_eq!((o.status, o.pending), (status::BUY_FAIL, 0.0));
+        assert_eq!(o.buy.state.close_ms, 40);
     }
 
     #[test]

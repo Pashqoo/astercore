@@ -1658,6 +1658,16 @@ impl CoreHandler {
             );
             return self.orders.fail_start(req_uid, s, &reason, now);
         }
+        // The strategies judge this themselves (`opposite`); a hand entry against an open
+        // position would net it on the exchange (one-way mode) and leave two orders for one.
+        if is_manual && self.orders.holds_against(&s.market, s.is_short, emulated) {
+            let reason = format!(
+                "{}: a {} position is open on it: close it before entering the other way",
+                s.market,
+                if s.is_short { "long" } else { "short" }
+            );
+            return self.orders.fail_start(req_uid, s, &reason, now);
+        }
         let m = self.catalog.get(&s.market).expect("tradable");
         if !m.fresh() {
             let reason = format!(

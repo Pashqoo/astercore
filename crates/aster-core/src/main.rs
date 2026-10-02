@@ -315,6 +315,21 @@ fn main() -> ExitCode {
                 eprintln!("account: {who}: clock: {e}");
                 return ExitCode::FAILURE;
             }
+            match account_rest.dual_side_position(&mut signer) {
+                Ok(false) => {}
+                Ok(true) => {
+                    eprintln!(
+                        "account: {who}: the account is in hedge mode; the core's order model is \
+                         one-way (every entry would be refused with -4061). Switch the account to \
+                         one-way mode and start again"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("account: {who}: position mode: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
             match account::read(&mut account_rest, &mut signer, &symbols_of_account) {
                 Ok(a) => {
                     println!(
