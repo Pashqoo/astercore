@@ -114,6 +114,13 @@ pub const PANIC_SPREAD: f64 = 0.015;
 const PANIC_CHASE_MS: i64 = 2_000;
 /// Retry pause after the exchange refused a panic exit call.
 const PANIC_RETRY_MS: i64 = 10_000;
+
+/// The wait before a refused panic exit is tried again: 10 s, doubling to 160 s. An exit the
+/// exchange keeps refusing (a dust position under the minimum notional, a reduce-only mismatch)
+/// is a thing to look at, not to ask for every ten seconds all night.
+fn panic_retry_ms(fails: u32) -> i64 {
+    PANIC_RETRY_MS << fails.saturating_sub(1).min(4)
+}
 /// A fresh fill's units may still be missing from `positionRisk` this long.
 const POSITION_GRACE_MS: i64 = 10_000;
 
@@ -499,6 +506,10 @@ pub struct CoreOrder {
     /// Earliest time of the next panic exit call.
     #[serde(skip)]
     panic_next: i64,
+    /// Panic/stop exits refused in a row: the retry waits longer each time (`panic_retry_ms`)
+    /// and starts over when an exit is live.
+    #[serde(skip)]
+    panic_fails: u32,
     rev: u64,
     done_ms: i64,
 }
@@ -646,6 +657,42 @@ impl CoreOrder {
     /// at `entry × ratio` once the entry fills.
     pub fn planned_ratio(&self) -> f64 {
         self.planned_ratio
+    }
+
+    /// Count this order's lots in `step` units instead of its own `lot`: exact or not at all.
+    /// `false` (and nothing changed) when some count is not a whole number of new lots.
+    fn rescale_lot(&mut self, step: f64) -> bool {
+        let ratio = self.lot / step;
+        let conv = |v: i64| {
+            let x = v as f64 * ratio;
+            // Absolute: a relative tolerance would pass a half lot at half a million lots.
+            ((x - x.round()).abs() <= 1e-6).then(|| x.round() as i64)
+        };
+        let mut all = vec![
+            self.buy.lots,
+            self.buy.filled_lots,
+            self.sell.lots,
+            self.sell.filled_lots,
+        ];
+        for ex in [&self.buy, &self.sell] {
+            for e in &ex.executions {
+                all.push(e.lots);
+                all.push(e.filled);
+            }
+        }
+        if all.iter().any(|v| conv(*v).is_none()) {
+            return false;
+        }
+        for ex in [&mut self.buy, &mut self.sell] {
+            ex.lots = conv(ex.lots).unwrap_or(ex.lots);
+            ex.filled_lots = conv(ex.filled_lots).unwrap_or(ex.filled_lots);
+            for e in &mut ex.executions {
+                e.lots = conv(e.lots).unwrap_or(e.lots);
+                e.filled = conv(e.filled).unwrap_or(e.filled);
+            }
+        }
+        self.lot = step;
+        true
     }
 
     /// The strategy's stop shown in the image as `(price, spread %)`
@@ -924,9 +971,12 @@ impl Orders {
         }
     }
 
-    /// Take `tick` from today's catalog: a restored order carries the
-    /// previous run's copy, and the exchange may move a market's tick between
-    /// runs. `lot` stays: filled lots count in it.
+    /// Take `tick` and the lot from today's catalog: a restored order carries the previous
+    /// run's copy, and the exchange may move a market's tick or step between runs. The lot
+    /// counts of the order are re-expressed in today's lot when that is exact (every count a
+    /// whole number of new lots); when it is not, the order keeps its old lot, which is said
+    /// at once — a quantity that cannot be written on the new grid is a refusal to look at,
+    /// not a size to guess.
     /// Returns `(refreshed, missing)`: orders on a market today's catalog lacks.
     pub fn respec<'a>(&mut self, market_of: impl Fn(&str) -> Option<&'a Market>) -> (usize, usize) {
         let (mut refreshed, mut missing) = (0, 0);
@@ -936,6 +986,26 @@ impl Orders {
                 continue;
             };
             o.tick = m.tick_size;
+            // (`lot` 0 is a file without the field: nothing to convert from.)
+            if m.step_size > 0.0 && o.lot > 0.0 && (o.lot - m.step_size).abs() > o.lot * 1e-9 {
+                let old = o.lot;
+                if o.rescale_lot(m.step_size) {
+                    log::warn!(
+                        "orders: {}: the lot changed from {old} to {}, the order's lots follow",
+                        o.market,
+                        m.step_size
+                    );
+                } else {
+                    log::error!(
+                        "orders: {}: the lot changed from {old} to {} and the order's quantities \
+                         are not whole new lots; its orders go out on the NEW grid with the OLD \
+                         counts (off by {}×) — close this position by hand",
+                        o.market,
+                        m.step_size,
+                        old / m.step_size
+                    );
+                }
+            }
             refreshed += 1;
         }
         (refreshed, missing)
@@ -1644,7 +1714,8 @@ impl Orders {
                     if !size.is_finite() || size <= 0.0 || lot_value <= 0.0 {
                         return fx;
                     }
-                    let requested = (size / lot_value).floor() as i64;
+                    // A size of exactly k lots must not floor to k−1 over a last binary digit.
+                    let requested = (size / lot_value + 1e-9).floor() as i64;
                     if !target.resize && requested < 1 && ex.filled_lots == 0 {
                         fx.logs.push(format!(
                             "{market}: size {size:.0} USDT is below one lot ({lot_value:.2} USDT)"
@@ -2452,8 +2523,18 @@ impl Orders {
             fx.logs
                 .push(format!("{market}: order rejected {}", u.message));
             if leg == Leg::Sell && o.panic {
-                o.panic_next = now_ms + PANIC_RETRY_MS;
+                o.panic_fails = o.panic_fails.saturating_add(1);
+                o.panic_next = now_ms + panic_retry_ms(o.panic_fails);
             }
+        } else if current
+            && leg == Leg::Sell
+            && matches!(
+                u.status,
+                ExecStatus::New | ExecStatus::PartiallyFilled | ExecStatus::Filled
+            )
+        {
+            // The exit is live: the refusals before it are over.
+            o.panic_fails = 0;
         }
         self.set_status(id, next, now_ms);
         let o = self.map.get_mut(&id).expect("order");
@@ -3028,7 +3109,14 @@ impl Orders {
             });
         }
         if o.panic {
-            o.panic_next = now_ms + PANIC_RETRY_MS;
+            if leg == Leg::Sell && matches!(op, Op::Post | Op::Replace) && definitive {
+                // The exchange refused the exit itself: look at it less and less often.
+                o.panic_fails = o.panic_fails.saturating_add(1);
+                o.panic_next = now_ms + panic_retry_ms(o.panic_fails);
+            } else {
+                // Anything else (a cancel or a query refused, the other leg): the plain retry.
+                o.panic_next = now_ms + PANIC_RETRY_MS;
+            }
         }
         fx
     }
@@ -3156,6 +3244,21 @@ impl Orders {
 
     fn remove(&mut self, id: u64) {
         if let Some(o) = self.map.remove(&id) {
+            // A report of this order's exit that comes AFTER it is forgotten would be a foreign
+            // one: `adopt` would let it close some other position of the market. Its ids are
+            // remembered as settled (the `left` set: reports of those stay unattached).
+            let mut ids: Vec<String> = Vec::new();
+            for ex in [&o.buy, &o.sell] {
+                ids.push(ex.key.clone());
+                ids.extend(
+                    ex.executions
+                        .iter()
+                        .flat_map(|e| std::iter::once(e.key.clone()).chain(e.ids.iter().cloned())),
+                );
+            }
+            for settled in ids {
+                self.remember_left(settled);
+            }
             for ex in [&o.buy, &o.sell] {
                 self.unbind(&ex.key);
             }
@@ -3380,6 +3483,58 @@ mod tests {
         assert_eq!(orders.get(id).unwrap().record().stop, None);
         orders.set_stops(id, true, false, -2.0, 0.5);
         assert_eq!(orders.get(id).unwrap().record().stop, Some((294.0, 0.5)));
+    }
+
+    /// A restored order is re-expressed in today's lot when the exchange changed the step: every
+    /// count a whole number of new lots, or the order keeps its old lot (and says so).
+    #[test]
+    fn a_restored_orders_lots_follow_a_changed_step_when_exact() {
+        let model = sber_model();
+        let sber = model.get("u-sber").unwrap();
+        let mut orders = Orders::new();
+        let fx = orders.start(1, &start(7000.0, 310.0, 0.0), sber, 1);
+        let key = post_key(&fx);
+        orders.apply(&update(&key, "9001", ExecStatus::Filled, 2, 2, 309.5), 20);
+        let before = orders.get(1).unwrap();
+        assert_eq!((before.lot, before.buy.filled_lots), (10.0, 2));
+
+        // The step halves: the same 20 units are 4 lots.
+        let mut finer = sber.clone();
+        finer.step_size = 5.0;
+        orders.respec(|_| Some(&finer));
+        let o = orders.get(1).unwrap();
+        assert_eq!((o.lot, o.buy.filled_lots, o.buy.lots), (5.0, 4, 4));
+
+        // The step grows to 30: 20 units are not a whole lot — the order keeps its lot.
+        let mut coarse = sber.clone();
+        coarse.step_size = 30.0;
+        orders.respec(|_| Some(&coarse));
+        let o = orders.get(1).unwrap();
+        assert_eq!((o.lot, o.buy.filled_lots), (5.0, 4));
+    }
+
+    /// The retry of a refused panic exit backs off from 10 s to 160 s.
+    #[test]
+    fn a_refused_panic_exit_is_retried_less_and_less_often() {
+        let secs: Vec<i64> = (0..8).map(|n| panic_retry_ms(n) / 1000).collect();
+        assert_eq!(secs, [10, 10, 20, 40, 80, 160, 160, 160]);
+    }
+
+    /// An order forgotten after its time is not forgotten by the exchange's late reports: its
+    /// ids are remembered as settled, so a report of its exit cannot be taken for a foreign one
+    /// that closes another position.
+    #[test]
+    fn a_pruned_orders_ids_stay_settled() {
+        let model = sber_model();
+        let sber = model.get("u-sber").unwrap();
+        let mut orders = Orders::new();
+        let fx = orders.start(1, &start(7000.0, 310.0, 0.0), sber, 1);
+        let key = post_key(&fx);
+        orders.apply(&update(&key, "9001", ExecStatus::Filled, 2, 2, 309.5), 20);
+        assert!(!orders.left.contains("9001"));
+        orders.remove(1);
+        assert!(orders.left.contains("9001") && orders.left.contains(&key));
+        assert!(orders.get(1).is_none());
     }
 
     /// A strategy's fired stop on a LIVE order leaves at MARKET: a reduce-only market sale with

@@ -620,12 +620,38 @@ fn forward(frame: StreamData, tx: &Sender<FeedEvent>) -> bool {
 /// Anything else is a decode default (`json::str_f64` reads garbage as 0), and
 /// a zero-priced print on the terminal's chart is a spike to the axis.
 fn trade_of(t: AggTrade) -> Option<FeedEvent> {
-    (t.price > 0.0 && t.qty > 0.0).then(|| FeedEvent::Trade {
+    // A print without a time (`T` missing decodes as 0) is dated 1970: the tape's deltas would
+    // saturate and the windows would take it for the oldest trade there is.
+    let stamped = plausible_stamp(t.time_ms, rest::now_ms());
+    if t.price > 0.0 && t.qty > 0.0 && !stamped {
+        // Said now and then, not per print: a clock off by an hour would drop every trade.
+        static DROPPED: AtomicUsize = AtomicUsize::new(0);
+        let n = DROPPED.fetch_add(1, Ordering::Relaxed);
+        if n == 0 || n.is_multiple_of(10_000) {
+            log::warn!(
+                "trade stream: {} print(s) dropped for an impossible time (latest {}: {} ms)",
+                n + 1,
+                t.symbol,
+                t.time_ms
+            );
+        }
+    }
+    (t.price > 0.0 && t.qty > 0.0 && stamped).then(|| FeedEvent::Trade {
         price: t.price,
         qty: t.signed_qty(),
         time_ms: t.time_ms,
         symbol: t.symbol,
     })
+}
+
+/// A trade's own time can be believed: present, and not ahead of our clock by more than the
+/// drift between the exchange's and ours. A bad stamp ahead would age a day of `Windows` buckets
+/// out at once (eviction goes by the newest minute seen); one at 0 is dated 1970.
+fn plausible_stamp(time_ms: i64, now_ms: i64) -> bool {
+    // An hour, not minutes: this clock is raw (no exchange offset), and a Mac a few minutes
+    // off its NTP must not lose the tape. A year-ahead stamp is far past either.
+    const FUTURE_TOLERANCE_MS: i64 = 60 * 60_000;
+    time_ms > 0 && time_ms <= now_ms + FUTURE_TOLERANCE_MS
 }
 
 fn rows(rows: &[[Dec; 2]]) -> Vec<(f64, f64)> {
@@ -946,6 +972,19 @@ fn history_rows(rows: &[AggTrade], start: i64) -> Vec<HistoryTrade> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_trade_stamp_is_believed_unless_missing_or_ahead_of_the_clock() {
+        let now = 1_800_000_000_000;
+        assert!(plausible_stamp(now - 5_000, now));
+        assert!(plausible_stamp(now + 50 * 60_000, now), "drift is allowed");
+        assert!(!plausible_stamp(0, now), "no time at all");
+        assert!(!plausible_stamp(now + 61 * 60_000, now));
+        assert!(
+            !plausible_stamp(now + 400 * 86_400_000, now),
+            "a bad stamp a year ahead"
+        );
+    }
+
     /// The reconnect backoff doubles from 3 s to its ceiling, and starts over only after a
     /// session that lived a minute AND heard something — a silent one closed by the idle limit
     /// does not.

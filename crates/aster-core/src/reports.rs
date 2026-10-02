@@ -167,6 +167,10 @@ pub struct Row {
     pub strategy_id: u64,
     /// The emulator's deal: shown in the report, kept out of the profit.
     pub emulator: bool,
+    /// The exit price is the core's estimate (the position left the account without an order
+    /// the core saw, `ExitSource::Outside`): shown in the report, kept out of what the
+    /// auto-stop counts as losses — a guess at a price must not stop the trading.
+    pub estimated: bool,
 }
 
 impl Row {
@@ -179,6 +183,7 @@ impl Row {
         self.coin = d.coin.to_owned();
         self.is_short = d.is_short;
         self.emulator = d.emulator;
+        self.estimated = d.exit == ExitSource::Outside;
         self.strategy_id = d.strategy_id;
         // A deleted strategy's rows keep the kind they were written with.
         match (d.strategy_id, d.signal_type) {
@@ -537,7 +542,7 @@ impl Reports {
     pub fn closed_deals(&self, with_emulator: bool) -> Vec<crate::autostop::Closed> {
         self.rows
             .values()
-            .filter(|r| r.closed && !r.deleted && (with_emulator || !r.emulator))
+            .filter(|r| r.closed && !r.deleted && !r.estimated && (with_emulator || !r.emulator))
             .map(|r| crate::autostop::Closed {
                 close_s: r.close_date,
                 profit: r.profit,
@@ -785,6 +790,11 @@ mod tests {
             (row.sell_reason.as_str(), row.comment.as_str()),
             ("Manual Sell", "closed outside the core")
         );
+        // The estimate shows in the report and counts in the profit, but a guessed price must
+        // not feed the auto-stop's losses.
+        assert!(row.estimated);
+        assert_eq!(r.closed_deals(false).len(), 1);
+        assert_eq!(r.rows().filter(|x| x.closed).count(), 2);
     }
 
     #[test]

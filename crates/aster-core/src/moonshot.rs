@@ -39,7 +39,8 @@ use crate::windows::Windows;
 
 /// The market whose moves drive `MShotAddBTC*Delta` and `Delta_BTC_*`.
 pub const BTC_SYMBOL: &str = "BTCUSDT";
-/// No entries on a market this long after one was refused (-2019, -4140…).
+/// No entries on a market this long after one was refused (-2019…). (-4140/-4141 are not a
+/// cooldown: the market is closed to entries for `CLOSED_MARKET_MS`, `engine.rs`.)
 const REJECT_COOLDOWN_MS: i64 = 60_000;
 /// No entries anywhere this long after the exchange's rate limit answer.
 const RATE_HALT_MS: i64 = 60_000;
@@ -541,6 +542,10 @@ impl Params {
     /// when that is dearer but within `LOT_OVER_BUDGET`; none past that.
     fn entry_size(&self, i: usize, m: &Market, price: f64) -> Option<f64> {
         let (budget, lot) = (self.tier_size(i), smallest_order(m, price));
+        // A market whose step did not arrive has no lot to size by: no entry, said by the caller.
+        if lot.is_nan() || lot <= 0.0 {
+            return None;
+        }
         if lot <= budget {
             Some(budget)
         } else if lot <= budget * LOT_OVER_BUDGET {
@@ -587,6 +592,8 @@ struct Memo {
     wait_since: i64,
     wait_near: bool,
     wait_ref: f64,
+    /// A move refused for being over the lot budget has been said (once, not every pass).
+    lot_said: bool,
     /// The position's stops.
     stops: stops::State,
     cancel_at: i64,
@@ -747,6 +754,8 @@ pub struct MoonShot {
     /// first session, and between sessions): a fill would go unseen, so no
     /// entries anywhere but the emulator's.
     fills_unseen: bool,
+    /// Markets the exchange takes no new positions on (`set_closed_markets`).
+    closed: HashSet<String>,
     /// The core-wide emulator mode (`emu_mode`): every strategy trades in
     /// the emulator, as one with `EmulatorMode` does.
     emulator: bool,
@@ -1038,6 +1047,12 @@ impl MoonShot {
     pub fn set_emulator(&mut self, on: bool) {
         self.emulator = on;
         self.funds.emulator = on;
+    }
+
+    /// Markets the exchange refused new positions on (`-4140`/`-4141`), as the engine learned
+    /// them: a real entry is not started there again, instead of failing once a minute.
+    pub fn set_closed_markets(&mut self, closed: &HashSet<String>) {
+        self.closed.clone_from(closed);
     }
 
     /// A detect of the strategy on the market (`NextDetectPenalty`), seen by
@@ -1512,7 +1527,9 @@ impl MoonShot {
                     Some(Gate::Universe)
                 } else if !(free_market_slot || engaged_markets.contains(&idx)) {
                     Some(Gate::MarketSlots)
-                } else if !m.live() {
+                } else if !m.live()
+                    || (!(p.emulator || self.emulator) && self.closed.contains(&m.symbol))
+                {
                     Some(Gate::NotTrading)
                 } else if !(m.live_price() || now < self.price_wait_until) {
                     Some(Gate::NoPrice)
@@ -2280,7 +2297,10 @@ impl MoonShot {
                 }
                 continue;
             }
-            let Some(size) = p.entry_size(i, m, price) else {
+            // Sized at the price the order will actually rest at: on the tick grid, where the lot
+            // count is taken (`Orders::target_entry` floors size / (rounded price × lot)).
+            let rested = m.nearest(price);
+            let Some(size) = p.entry_size(i, m, if rested > 0.0 { rested } else { price }) else {
                 if self.over_lot.insert(key) {
                     cmds.push(over_lot_log(s, p, m, i, price));
                 }
@@ -2357,11 +2377,32 @@ impl MoonShot {
             if price <= 0.0 || (price - current).abs() < tick {
                 continue;
             }
+            // The moved entry is sized by the same rule as a new one: a lot dearer than the
+            // budget by more than `LOT_OVER_BUDGET` is not placed — the order stays where it is.
+            // Sized at the price it will rest at, on the tick grid (where `target_entry` takes
+            // the lot count), as a new entry is.
+            let rested = m.nearest(price);
+            let Some(size) = p.entry_size(i, m, if rested > 0.0 { rested } else { price }) else {
+                if !std::mem::replace(&mut memo.lot_said, true) {
+                    cmds.push(over_lot_log(s, p, m, i, price));
+                }
+                continue;
+            };
+            memo.lot_said = false;
+            // A move to a bigger size (a dearer lot at the new price) spends the difference:
+            // it goes through the balance check like a new entry.
+            // Only when a whole further lot is bought: the budget is not the notional of the
+            // lots placed (that is the budget floored to lots), and the leftover is not spent.
+            let one_lot = m.lot_value(if rested > 0.0 { rested } else { price });
+            let more = size - rec.buy.notional;
+            if one_lot > 0.0 && more >= one_lot && !self.funds.take(s, p, m, more, cmds) {
+                continue;
+            }
             memo.wait_since = 0;
             cmds.push(Cmd::MoveEntry {
                 order: o.id,
                 price,
-                size: p.tier_size(i).max(smallest_order(m, price)),
+                size,
                 planned: c.hook.map_or(0.0, |h| h.planned(p, m, price)),
             });
             let delay = if near {
@@ -3967,6 +4008,11 @@ fn is_committed(o: &CoreOrder) -> bool {
 
 /// Closed trade that lost money (mean exit against mean entry, fees aside).
 fn is_loss(o: &CoreOrder) -> bool {
+    // A position that left the account unseen was booked at the core's guess of the price: no
+    // penalty is started on a guess.
+    if o.exit_source() == crate::reports::ExitSource::Outside {
+        return false;
+    }
     let rec = o.record();
     let (entry, exit) = (rec.buy.mean_price, rec.sell.mean_price);
     entry > 0.0
@@ -8135,6 +8181,10 @@ mod tests {
         p.price = 0.30;
         p.price_min = 0.10;
         let mut m = model();
+        // A lot worth a few USDT, as on the real ETH market (the fixture's lot of 10 at this
+        // price is 25 000 USDT, and a move is no longer sized past the budget).
+        m.at_mut(1).unwrap().step_size = 0.001;
+        m.at_mut(1).unwrap().min_qty = 0.001;
         m.at_mut(1).unwrap().last_price = Some(2476.85);
         let orders = reference_order(&m, false, 2466.88, 100_000.0, 1_000_000, false);
         let cmds =
@@ -8143,6 +8193,27 @@ mod tests {
             moves(&cmds),
             [(42, Leg::Buy, 2469.42)],
             "The original repositions at 0.4025%, but the clone waits for 0.5%"
+        );
+    }
+
+    /// A move is sized by the rule of a new entry: where the smallest order is dearer than the
+    /// budget by more than `LOT_OVER_BUDGET`, the entry stays where it is (it used to be moved
+    /// at `max(budget, lot)` — here a lot of 25 000 USDT against a budget of 6000).
+    #[test]
+    fn a_move_to_a_lot_far_over_the_budget_is_not_made() {
+        let (s, mut p) = reference_params();
+        p.price = 0.30;
+        p.price_min = 0.10;
+        let mut m = model();
+        m.at_mut(1).unwrap().last_price = Some(2476.85);
+        let orders = reference_order(&m, false, 2466.88, 100_000.0, 1_000_000, false);
+        let cmds =
+            reference_manage_entries(&mut MoonShot::default(), &s, &p, &orders, &m, 1_001_000);
+        assert!(moves(&cmds).is_empty(), "{:?}", moves(&cmds));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Log(l) if l.contains("exceeds the budget"))),
+            "said once"
         );
     }
 
@@ -8339,6 +8410,9 @@ mod tests {
         p.price = 0.3;
         p.price_min = 0.1;
         let mut m = model();
+        // A lot worth a few dozen USDT, as on the real BTC market.
+        m.at_mut(1).unwrap().step_size = 0.0001;
+        m.at_mut(1).unwrap().min_qty = 0.0001;
         m.at_mut(1).unwrap().last_price = Some(76894.70);
         m.at_mut(1).unwrap().tick_size = 0.1;
         let os = reference_order(&m, true, 77203.20, 1_000_000.0, 1_000_000, false);

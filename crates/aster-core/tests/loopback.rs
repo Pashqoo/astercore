@@ -1471,7 +1471,7 @@ fn an_entry_refused_for_a_closed_market_closes_it_to_entries() {
             100.0,
         ))
         .expect("sent");
-    assert!(log_line(&client, "takes no new positions on it (until"));
+    assert!(log_line(&client, "takes no new positions on it (up to an"));
     let post = std::iter::from_fn(|| orders.try_recv().ok()).find(|c| {
         matches!(
             c,

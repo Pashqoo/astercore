@@ -610,7 +610,12 @@ fn pct_or_panic(pct: f64) -> f64 {
 }
 
 fn secs_ms(s: f64) -> i64 {
-    (s * 1000.0) as i64
+    // As `moonshot::secs_ms`: a typed setting, NaN is 0, and ten years is the ceiling, so a
+    // sum with a clock cannot wrap.
+    if s.is_nan() {
+        return 0;
+    }
+    (s.min(315_360_000.0) * 1000.0) as i64
 }
 
 #[cfg(test)]

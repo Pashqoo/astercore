@@ -87,6 +87,9 @@ const API: u8 = Command::API.to_byte();
 const OPEN_ORDERS_AFTER_MS: i64 = 3_000;
 /// The wait before a failed read of the account's open orders is made again.
 const OPEN_ORDERS_RETRY_MS: i64 = 10_000;
+/// How long a market the exchange refused new positions on (`-4140`/`-4141`) stays closed to
+/// the core's own entries.
+const CLOSED_MARKET_MS: i64 = 60 * 60_000;
 /// How often stops, trailing, pending triggers and panic exits are judged
 /// (`Orders::watch`), as TInvestCore did.
 const WATCH_EVERY_MS: i64 = 1_000;
@@ -233,7 +236,7 @@ pub struct CoreHandler {
     worker_lost: bool,
     /// Markets the exchange takes no new positions on (`-4140`/`-4141` on an
     /// entry), for this run: an entry there is refused by the core.
-    closed_markets: HashSet<String>,
+    closed_markets: HashMap<String, i64>,
     /// The strategy engine, its tick windows and the time of its last pass;
     /// `shots_due` runs the next one at once.
     shots: MoonShot,
@@ -336,7 +339,7 @@ impl CoreHandler {
             stopping: false,
             shutdown_requested: false,
             worker_lost: false,
-            closed_markets: HashSet::new(),
+            closed_markets: HashMap::new(),
             shots: MoonShot::default(),
             windows: Windows::default(),
             shots_at: 0,
@@ -1728,9 +1731,9 @@ impl CoreHandler {
         if let Err(reason) = ready {
             return self.orders.fail_start(req_uid, s, &reason, now);
         }
-        if !emulated && self.closed_markets.contains(&s.market) {
+        if !emulated && self.closed_markets.contains_key(&s.market) {
             let reason = format!(
-                "{}: the exchange takes no new positions on it (until the core's next start)",
+                "{}: the exchange takes no new positions on it (up to an hour)",
                 s.market
             );
             return self.orders.fail_start(req_uid, s, &reason, now);
@@ -2082,6 +2085,23 @@ impl CoreHandler {
     /// entry: the market takes no new entry for this run — the core refuses
     /// the next one instead of the exchange. Exits, closes and moves of what
     /// is already open are not touched: a position there still needs them.
+    /// The markets closed to entries, as the strategies see them.
+    fn sync_closed_markets(&mut self) {
+        let closed: HashSet<String> = self.closed_markets.keys().cloned().collect();
+        self.shots.set_closed_markets(&closed);
+    }
+
+    /// A market the exchange refused new positions on is tried again after `CLOSED_MARKET_MS`:
+    /// `-4140` can be a halt of an hour, and a refusal that lasted the run would outlive it.
+    fn expire_closed_markets(&mut self, now: i64) {
+        let before = self.closed_markets.len();
+        self.closed_markets
+            .retain(|_, at| now - *at < CLOSED_MARKET_MS);
+        if self.closed_markets.len() != before {
+            self.sync_closed_markets();
+        }
+    }
+
     fn market_closed(&mut self, action: &Action, msg: &str) -> Effects {
         let entry = matches!(
             action,
@@ -2096,13 +2116,18 @@ impl CoreHandler {
         let Some(symbol) = self.orders.get(action.order()).map(|o| o.uid.clone()) else {
             return Effects::default();
         };
-        if !self.closed_markets.insert(symbol.clone()) {
+        if self
+            .closed_markets
+            .insert(symbol.clone(), now_ms())
+            .is_some()
+        {
             return Effects::default();
         }
+        self.sync_closed_markets();
         Effects {
             logs: vec![format!(
-                "{symbol}: the exchange takes no new positions on it — entries refused until \
-                 the next start"
+                "{symbol}: the exchange takes no new positions on it — entries refused for an \
+                 hour"
             )],
             ..Effects::default()
         }
@@ -2179,7 +2204,9 @@ impl CoreHandler {
         self.guard_rules = None;
         let rules = self.guard_rules();
         let mut guards = std::mem::take(&mut self.guards);
-        guards.replay(self.reports.rows(), |r| rule_of(&rules, r));
+        guards.replay(self.reports.rows().filter(|r| !r.estimated), |r| {
+            rule_of(&rules, r)
+        });
         self.guards = guards;
     }
 
@@ -2332,7 +2359,10 @@ impl CoreHandler {
                 self.penalty_marks = None;
                 let row = row.clone();
                 let rule = rule_of(&rules, &row);
-                fx.logs.extend(self.guards.book(&row, rule, now));
+                // An estimated exit (`Row.estimated`) is no session profit or loss.
+                if !row.estimated {
+                    fx.logs.extend(self.guards.book(&row, rule, now));
+                }
                 // The entry is whole (BUY_DONE, or SELL_SET once its exit is
                 // on): MoonBot announces a position, not a partial fill.
                 if !row.closed
@@ -2488,7 +2518,11 @@ impl CoreHandler {
         let rules = self.guard_rules();
         let counts =
             |r: &reports::Row| rules.get(&r.strategy_id).map(|&(emu, _)| emu) == Some(r.emulator);
-        let totals = guards::totals(self.reports.rows(), now / 1000 - window_s, counts);
+        let totals = guards::totals(
+            self.reports.rows().filter(|r| !r.estimated),
+            now / 1000 - window_s,
+            counts,
+        );
         let (streaks, manual) = self
             .penalty_marks
             .get_or_insert_with(|| guards::penalty_marks(self.reports.rows(), counts))
@@ -2514,6 +2548,7 @@ impl CoreHandler {
         // A ranked pool taken before the warm-up lands is a pool by accident:
         // every volume key reads zero out of an empty window.
         self.shots.set_warming(!self.warmup_done);
+        self.expire_closed_markets(now);
         let cmds = self.shots.tick(
             &self.strategies,
             &self.orders,
@@ -2852,7 +2887,8 @@ impl CoreHandler {
         self.penalty_marks = None;
         let row = row.clone();
         let rules = self.guard_rules();
-        if let Some(text) = self.guards.book(&row, rule_of(&rules, &row), now) {
+        let booked = (!row.estimated).then(|| self.guards.book(&row, rule_of(&rules, &row), now));
+        if let Some(text) = booked.flatten() {
             log::info!("{text}");
             self.outbox.push((LOG, log_msg(now, &text)));
         }
