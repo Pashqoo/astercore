@@ -188,3 +188,47 @@ fn client_reaches_connected_v1_stun() {
 fn client_reaches_connected_v2_dns() {
     client_reaches_connected(TransportMode::V2);
 }
+
+/// A client silent for more than `SESSION_IDLE_MS` is dropped by the server's own timer, and
+/// the handler hears of it.
+#[test]
+fn a_silent_session_is_closed_after_the_idle_limit() {
+    use crate::protocol::handshake::Hello;
+    use std::sync::Mutex;
+
+    struct Closed(Arc<Mutex<Vec<u64>>>);
+    impl Handler for Closed {
+        fn on_connected(&mut self, _s: &mut Session) {}
+        fn on_command(&mut self, _s: &mut Session, _cmd: u8, _payload: &[u8]) {}
+        fn on_closed(&mut self, client_id: u64) {
+            self.0.lock().unwrap().push(client_id);
+        }
+    }
+    let closed = Arc::new(Mutex::new(Vec::new()));
+    let key = ServerKey::generate(None, 0, TransportMode::V0);
+    let mut server = Server::bind(&key, Closed(Arc::clone(&closed))).expect("bind");
+    let mut session = Session::new(
+        Arc::clone(&server.wire),
+        77,
+        "127.0.0.1:1".parse().unwrap(),
+        &server.master_key,
+        &server.mac_key,
+        &Hello::new(1, 2),
+    );
+    session.authorized = true;
+    session.last_recv = server.wire.now() - super::SESSION_IDLE_MS + 5_000;
+    server.sessions.insert(77, session);
+
+    server.step();
+    assert!(
+        closed.lock().unwrap().is_empty(),
+        "inside the limit it stays"
+    );
+    assert!(server.sessions.contains_key(&77));
+
+    server.sessions.get_mut(&77).unwrap().last_recv =
+        server.wire.now() - super::SESSION_IDLE_MS - 1;
+    server.step();
+    assert_eq!(*closed.lock().unwrap(), [77]);
+    assert!(!server.sessions.contains_key(&77));
+}

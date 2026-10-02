@@ -127,7 +127,7 @@ impl Stamp {
 /// opening counts as alive for one staleness window. Also counts the sessions
 /// the stream opened (the `streams:` line) and carries its rotation phase.
 #[derive(Debug, Clone)]
-pub struct Beat(Arc<[AtomicI64; 4]>);
+pub struct Beat(Arc<[AtomicI64; 5]>);
 
 impl Beat {
     pub fn new() -> Self {
@@ -148,6 +148,18 @@ impl Beat {
             wall: self.0[0].load(Ordering::Relaxed),
             mono: self.0[1].load(Ordering::Relaxed),
         }
+    }
+
+    /// A frame of DATA arrived (a text frame — not a pong or a ping, which `touch` also takes).
+    /// What «this session heard something» is judged on.
+    pub fn touch_data(&self) {
+        self.0[4].store(Stamp::now().mono, Ordering::Relaxed);
+    }
+
+    /// Whether a data frame arrived after `since` (monotonic clock; a wall-clock step cannot
+    /// fake it).
+    pub fn heard_data_since(&self, since: Stamp) -> bool {
+        self.0[4].load(Ordering::Relaxed) > since.mono
     }
 
     /// A session opened. Not a frame: the beat stays as the last frame left it, or a gateway
@@ -320,6 +332,7 @@ pub fn run_at(
         match read {
             Ok(Message::Text(text)) => {
                 beat.touch();
+                beat.touch_data();
                 on_text(text.as_str());
             }
             Ok(Message::Close(frame)) => {

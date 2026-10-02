@@ -299,7 +299,7 @@ pub fn start(
                             log::warn!("account: {e}");
                             clock_due = Instant::now();
                             let since = *failing_since.get_or_insert_with(Instant::now);
-                            (last.is_some() && since.elapsed() >= STALE_AFTER).then(|| {
+                            withdraw_snapshot(last.is_some(), since.elapsed()).then(|| {
                                 log::error!(
                                     "account: no read for {} s — the terminal is told the \
                                      money is unknown until the next one",
@@ -322,6 +322,12 @@ pub fn start(
             }
         })
         .expect("spawn");
+}
+
+/// Whether the snapshot is withdrawn (the terminal told the money is unknown): there is one to
+/// withdraw, and the reads have failed for [`STALE_AFTER`].
+fn withdraw_snapshot(has_snapshot: bool, failing_for: Duration) -> bool {
+    has_snapshot && failing_for >= STALE_AFTER
 }
 
 /// What the stream thread tells the account thread.
@@ -394,7 +400,15 @@ impl Stream {
             self.key_due = Instant::now() + KEY_EVERY;
             return true;
         }
-        match rest.listen_key(signer) {
+        let answer = rest.listen_key(signer);
+        self.place(answer)
+    }
+
+    /// What `renew` does with the exchange's answer: a key is placed for the stream (a
+    /// CHANGED one also stops the session on the old key) and asked again in [`KEY_EVERY`]; a
+    /// refusal is asked again in [`KEY_RETRY`].
+    fn place(&mut self, answer: Result<String, rest::Error>) -> bool {
+        match answer {
             Ok(key) => {
                 let changed = self.key.as_ref().is_some_and(|k| *k != key);
                 if changed {
@@ -499,6 +513,8 @@ fn user_stream(network: Network, slot: Arc<Slot>, wake: Sender<Wake>, feed: Send
                 if wake.send(Wake::Ended).is_err() {
                     return;
                 }
+                // Unlike the market streams (`feed::healthy_session`), no frame is required: a quiet
+                // account sends no events, and a session that lived on its pongs is a healthy one.
                 if opened.elapsed() > BACKOFF_MAX {
                     backoff = Duration::from_secs(1);
                 }
@@ -573,6 +589,59 @@ mod tests {
             entry_price: entry,
             unrealized,
         }
+    }
+
+    /// The snapshot is withdrawn after a minute of failed reads, not before, and only if there
+    /// is one.
+    #[test]
+    fn the_snapshot_is_withdrawn_after_a_minute_of_refusals() {
+        let sec = Duration::from_secs;
+        assert!(!withdraw_snapshot(true, sec(0)));
+        assert!(!withdraw_snapshot(true, sec(59)));
+        assert!(withdraw_snapshot(true, STALE_AFTER));
+        assert!(withdraw_snapshot(true, sec(600)));
+        assert!(!withdraw_snapshot(false, sec(600)));
+    }
+
+    fn stream_for_test() -> Stream {
+        let (_tx, rx) = mpsc::channel();
+        Stream {
+            wake: Some(rx),
+            slot: Arc::new(Slot::default()),
+            key: None,
+            key_due: Instant::now(),
+        }
+    }
+
+    /// The listenKey: the first one is placed, the same one again is only a renewal (the stream
+    /// goes on), a different one stops the session on the old key, and a refusal is asked
+    /// again in a minute, not in half an hour.
+    #[test]
+    fn a_listen_key_is_placed_renewed_replaced_and_retried() {
+        let mut stream = stream_for_test();
+        assert!(stream.place(Ok("key-1".into())));
+        assert_eq!(stream.slot.lock().take().as_deref(), Some("key-1"));
+        assert!(!stream.slot.stop.load(Ordering::Relaxed));
+        assert!(stream.key_due > Instant::now() + KEY_EVERY - Duration::from_secs(5));
+
+        assert!(stream.place(Ok("key-1".into())));
+        assert!(
+            !stream.slot.stop.load(Ordering::Relaxed),
+            "a renewal keeps the session"
+        );
+
+        assert!(stream.place(Ok("key-2".into())));
+        assert!(
+            stream.slot.stop.load(Ordering::Relaxed),
+            "a new key ends the old session"
+        );
+        assert_eq!(stream.slot.lock().take().as_deref(), Some("key-2"));
+
+        let before = Instant::now();
+        assert!(!stream.place(Err(rest::Error::Transport("down".into()))));
+        assert!(stream.key_due <= before + KEY_RETRY + Duration::from_secs(1));
+        assert!(stream.key_due > before);
+        assert_eq!(stream.key.as_deref(), Some("key-2"), "the last key stays");
     }
 
     fn symbols(rows: &[&str], usdt: &[&str]) -> Symbols {

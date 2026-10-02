@@ -512,6 +512,41 @@ mod tests {
             .join("&")
     }
 
+    /// What the worker and the engine make of each refusal the exchange can give, from the real
+    /// `rest::Error` (no hand-written message): refused for good or of unknown fate, whether the
+    /// clock is suspected, whether it counts as a rate limit.
+    #[test]
+    fn exchange_refusals_are_classified_by_status_and_code() {
+        use crate::moonshot::rate_limited;
+        let api = |status: u16, code: i64| rest::Error::Api {
+            status,
+            code,
+            msg: "x".into(),
+        };
+        //            error                    definitive  clock?  rate-limited
+        let table = [
+            (api(400, -4225), true, true, false), // nonce outside the window
+            (api(400, -2022), true, false, false), // reduce-only refused
+            (api(400, -2019), true, false, false), // margin is insufficient
+            (api(400, -2011), true, false, false), // cancel of a finished order
+            (api(400, -1111), true, false, false), // precision
+            (api(400, -4164), true, false, false), // below the minimum notional
+            (api(400, -4141), true, false, false), // symbol closed
+            (api(429, -1003), true, false, true), // too many requests
+            (api(418, -1003), true, false, true), // banned
+            (api(400, -1015), true, false, true), // too many new orders
+            (api(503, -1001), false, false, false), // gateway trouble: fate unknown
+            (api(408, 0), false, false, false),   // timed out upstream
+            (rest::Error::Transport("reset".into()), false, true, false),
+        ];
+        for (e, definitive_, clock, limited) in table {
+            let text = e.to_string();
+            assert_eq!(definitive(&e), definitive_, "definitive: {text}");
+            assert_eq!(clock_suspect(&e), clock, "clock: {text}");
+            assert_eq!(rate_limited(&text), limited, "rate limit: {text}");
+        }
+    }
+
     #[test]
     fn an_entry_limit_and_a_market_exit_are_written_on_the_grid() {
         let entry = post_params(

@@ -274,21 +274,29 @@ loopback + 54 теста серверной части вендора, `tools/ch
 
 Поведение есть, тест его не подтверждает; смена формата проходит зелёной.
 
-- [ ] `tests/loopback.rs:1437` — тест сам пишет строку `api 400/-4141: …`, а ядро узнаёт закрытый
+- [x] `tests/loopback.rs:1437` — тест сам пишет строку `api 400/-4141: …`, а ядро узнаёт закрытый
   рынок через `contains("/-4141:")` по Display `rest::Error` (`engine.rs:2003`, `rest.rs:49`). Нести
   `code: i64` в `TradingEvent::Failed`, тестировать от `rest::Error::Api`.
-- [ ] `trading.rs:611` — маппинг отказов проверен только по HTTP-статусу; ветки по кодам
+  **02.10:** тест строит текст из настоящего `rest::Error::Api` (`code_marker`/`msg_has_code` — одно место формата; `rate_limited` и `-2013` читают тем же). Не сделано: `code: i64` внутри `TradingEvent::Failed`; нет теста на -4140, не-входную ногу и посторонний код.
+- [x] `trading.rs:611` — маппинг отказов проверен только по HTTP-статусу; ветки по кодам
   (-4225, -2022, -2019, -1111, -4164) без теста. Табличный тест код → (definitive, повтор, уровень).
-- [ ] `orders.rs:2125` — `stop_out` (стоп стратегии на живом ордере → MARKET) вызывается только из
+  **02.10:** таблица `exchange_refusals_are_classified_by_status_and_code` (из настоящих `rest::Error`). Не покрыто: ветка `-2022` как «громкая» (в самом цикле воркера).
+- [x] `orders.rs:2125` — `stop_out` (стоп стратегии на живом ордере → MARKET) вызывается только из
   `engine.rs:2448`, у engine.rs 0 юнитов; покрыт ручной StopLoss и эмулятор. Юнит на живом ордере:
   `Action::Post{price: None, sell: true}`.
-- [ ] `account.rs:290` — снятие снимка счёта через `STALE_AFTER` не тестируется, `Instant::now()`
+  **02.10:** `a_fired_stop_of_a_live_order_exits_at_market` + близнец эмулятора (лимит).
+- [x] `account.rs:290` — снятие снимка счёта через `STALE_AFTER` не тестируется, `Instant::now()`
   зашит в поток. Вынести решение в чистую fn (last, failing_since, now).
-- [ ] `account.rs:380` — `renew()` listenKey (смена ключа, `KEY_RETRY`) без теста.
-- [ ] `feed.rs:489` — бэкофф реконнекта без теста.
-- [ ] `telegram.rs:646` — цикл привязки PIN без теста (только `new_pin()`).
-- [ ] `moonproto/src/server/session.rs:466` + `mod.rs:134` — «Order/UI/Strat/API/Balance только
+  **02.10:** решение вынесено в `withdraw_snapshot`; проводка в цикле потока не покрыта.
+- [x] `account.rs:380` — `renew()` listenKey (смена ключа, `KEY_RETRY`) без теста.
+  **02.10:** `Stream::place` под тестом (слот, `stop`, `KEY_RETRY`); `notify_one` и `clock_due` не покрыты.
+- [x] `feed.rs:489` — бэкофф реконнекта без теста.
+  **02.10:** `doubled`/`healthy_session` под тестом; проводка в `spawn_stream` не покрыта.
+- [x] `telegram.rs:646` — цикл привязки PIN без теста (только `new_pin()`).
+  **02.10:** `judge_guess` вынесен и покрыт (счёт, журнал, смена PIN каждые 10); цикл опроса и привязка чата — нет.
+- [x] `moonproto/src/server/session.rs:466` + `mod.rs:134` — «Order/UI/Strat/API/Balance только
   Crypted», отказ повтора, закрытие по 60 с — ни в `server/tests.rs`, ни в loopback.
+  **02.10:** `sensitive_commands_are_delivered_only_inside_crypted`, `a_replayed_crypted_packet_is_refused` (`session.rs`) и `a_silent_session_is_closed_after_the_idle_limit` (`tests.rs`). Не покрыто: Grouped/Sliced с чувствительным семейством в открытом виде; перенос адреса в `mod.rs`.
 
 ### Мелкие
 
@@ -332,7 +340,8 @@ loopback + 54 теста серверной части вендора, `tools/ch
   24 ч окон (tape.rs от этого защищён).
 - [ ] `feed.rs:584`, `trades_stream.rs:84` — `trade_of` не требует `time_ms > 0`; `T` с
   `serde(default)` даёт пакет 1970-го, дельты в `i16::MAX`.
-- [ ] `feed.rs:515` — сессия, молчавшая 75 с и закрытая по idle, «здорова» и сбрасывает бэкофф.
+- [x] `feed.rs:515` — сессия, молчавшая 75 с и закрытая по idle, «здорова» и сбрасывает бэкофф.
+  **02.10:** `healthy_session` требует кадр данных (`Beat::touch_data`; pong не считается). Пользовательский поток `account.rs` намеренно без этого условия — тихий счёт кадров не шлёт.
 - [ ] `aster/json.rs:336`, `:626` (и `:99`, `:526`, `:555`, `:590`) — целые с `serde(default)` без
   толерантного десериализатора: `null`/строка валит весь `!markPrice@arr` каждые 3 с.
 - [ ] `screener.rs:49` — комментарий про `feed::MAX_INSTRUMENTS`, которого нет; чанк —

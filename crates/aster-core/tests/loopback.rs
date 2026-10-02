@@ -765,7 +765,12 @@ fn a_refused_history_call_reaches_the_client_as_a_failure() {
         } => Some((client_id, request_uid)),
         _ => None,
     });
-    let refusal = "api 429/-1003: Too many requests";
+    let refusal = &aster_core::aster::rest::Error::Api {
+        status: 429,
+        code: -1003,
+        msg: "Too many requests".into(),
+    }
+    .to_string();
     core.ev_tx
         .send(FeedEvent::CandlesReply {
             client_id,
@@ -1446,7 +1451,14 @@ fn an_entry_refused_for_a_closed_market_closes_it_to_entries() {
         .send(FeedEvent::Trading(TradingEvent::Failed {
             action: posted,
             definitive: true,
-            msg: "api 400/-4141: Symbol is closed for new positions.".into(),
+            // The text the order worker really makes of the exchange's refusal, not a copy of
+            // its format written here.
+            msg: aster_core::aster::rest::Error::Api {
+                status: 400,
+                code: -4141,
+                msg: "Symbol is closed for new positions.".into(),
+            }
+            .to_string(),
         }))
         .unwrap();
     assert!(log_line(&client, "takes no new positions"));

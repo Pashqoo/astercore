@@ -48,10 +48,11 @@ const RATE_HALT_MS: i64 = 60_000;
 /// `-1003 TOO_MANY_REQUESTS` or `-1015` (too many new orders) —
 /// `rest::Error` reads `api {status}/{code}: …`.
 pub fn rate_limited(msg: &str) -> bool {
-    msg.contains("api 429/")
-        || msg.contains("api 418/")
-        || msg.contains("/-1003:")
-        || msg.contains("/-1015:")
+    use crate::aster::rest::{msg_has_code, msg_has_status};
+    msg_has_status(msg, 429)
+        || msg_has_status(msg, 418)
+        || msg_has_code(msg, -1003)
+        || msg_has_code(msg, -1015)
 }
 const CANCEL_RETRY_MS: i64 = 5_000;
 /// After a restart, entries restored on a market wait this long for its

@@ -100,7 +100,7 @@ use crate::trading::{ExecStatus, OrderUpdate};
 /// Terminal orders stay listed this long so late status requests still resolve.
 const KEEP_DONE_MS: i64 = 120_000;
 /// `-2013 NO_SUCH_ORDER`: the exchange does not know the order.
-pub(crate) const CODE_ORDER_NOT_FOUND: &str = "-2013";
+pub(crate) const CODE_ORDER_NOT_FOUND: i64 = -2013;
 /// «Not found» answers to one request key after which the request is taken
 /// as never having reached the exchange. The pause after each doubles from
 /// `RESOLVE_PERIOD_MS` (10 + 20 + … + 160 s: about 5 minutes).
@@ -2921,7 +2921,7 @@ impl Orders {
             // give-up there posts a second exit.
             ex.resolve_at = now_ms + 10_000;
             let last = ex.executions.last().unwrap();
-            if !msg.contains(CODE_ORDER_NOT_FOUND)
+            if !crate::aster::rest::msg_has_code(msg, CODE_ORDER_NOT_FOUND)
                 || last.filled > 0
                 || last.ids.iter().any(|id| broker_id(id))
                 || last.status.is_some_and(|s| s != ExecStatus::New)
@@ -2949,7 +2949,7 @@ impl Orders {
             fx.extend(self.apply(&u, now_ms));
             return fx;
         }
-        if op == Op::Query && msg.contains(CODE_ORDER_NOT_FOUND) {
+        if op == Op::Query && crate::aster::rest::msg_has_code(msg, CODE_ORDER_NOT_FOUND) {
             if let Some(e) = ex.executions.iter().find(|e| e.ids.contains(request)) {
                 if !broker_id(request) {
                     // REST resolves broker ids only: «not found» for a stream
@@ -3380,6 +3380,52 @@ mod tests {
         assert_eq!(orders.get(id).unwrap().record().stop, None);
         orders.set_stops(id, true, false, -2.0, 0.5);
         assert_eq!(orders.get(id).unwrap().record().stop, Some((294.0, 0.5)));
+    }
+
+    /// A strategy's fired stop on a LIVE order leaves at MARKET: a reduce-only market sale with
+    /// no price, not a limit through the book (`PLAN.md`, п. 2).
+    #[test]
+    fn a_fired_stop_of_a_live_order_exits_at_market() {
+        let model = sber_model();
+        let sber = model.get("u-sber").unwrap();
+        let mut orders = Orders::new();
+        let fx = orders.start(1, &start(7000.0, 310.0, 0.0), sber, 1);
+        let key = post_key(&fx);
+        orders.apply(&update(&key, "9001", ExecStatus::Filled, 2, 2, 309.5), 20);
+        assert_eq!(orders.get(1).unwrap().status, status::BUY_DONE);
+        let fx = orders.stop_out(1, reason::STOP_LOSS, sber, 30);
+        assert!(
+            matches!(
+                &fx.actions[..],
+                [Action::Post {
+                    sell: true,
+                    price: None,
+                    lots: 2,
+                    ..
+                }]
+            ),
+            "{:?}",
+            fx.actions
+        );
+        // The emulated twin leaves as a limit through the book: `at_market` keeps `market_exit`
+        // off for an emulated order, so the exit is priced with the panic spread.
+        let fx = orders.start(2, &start(7000.0, 310.0, 0.0), sber, 40);
+        let key = post_key(&fx);
+        orders.set_emulator(2);
+        orders.apply(&update(&key, "9002", ExecStatus::Filled, 2, 2, 309.5), 50);
+        let fx = orders.stop_out(2, reason::STOP_LOSS, sber, 60);
+        assert!(
+            matches!(
+                &fx.actions[..],
+                [Action::Post {
+                    sell: true,
+                    price: Some(_),
+                    ..
+                }]
+            ),
+            "{:?}",
+            fx.actions
+        );
     }
 
     /// A hand entry against an open position of the other side is not placed — at the start
@@ -5313,6 +5359,11 @@ mod tests {
         assert_eq!(os.get(ids[0]).unwrap().status, status::SELL_SET);
         let held = [("u-sber".to_string(), 10.0)].into_iter().collect();
         assert!(os.reconcile(&held, &m, 1150).changed.is_empty());
+        assert_eq!(os.get(ids[0]).unwrap().status, status::SELL_SET);
+        // A second read once the fills are settled is only their FIRST sighting as missing:
+        // had the grace filter been dropped, the first read at 1150 would count and this
+        // one would close them.
+        assert!(os.reconcile(&held, &m, 11_200).changed.is_empty());
         assert_eq!(os.get(ids[0]).unwrap().status, status::SELL_SET);
     }
 

@@ -798,6 +798,101 @@ mod tests {
         s.on_sliced_ack(&payload);
     }
 
+    /// What a client sends in a Crypted packet: its encoder is this session's decoder.
+    fn crypted(s: &Session, msg_num: u64, cmd: Command, payload: &[u8]) -> Vec<u8> {
+        let mut plain = vec![0u8, 0];
+        plain.extend_from_slice(&msg_num.to_le_bytes());
+        plain.push(cmd.to_byte());
+        plain.push(0);
+        plain.extend_from_slice(payload);
+        crypto::encrypt_with_cipher(&s.decode, &plain, &[])
+    }
+
+    /// The families that move money and settings are accepted only out of an AES-GCM envelope:
+    /// the same bytes in the clear are dropped, and `SessionClose` is no exception.
+    #[test]
+    fn sensitive_commands_are_delivered_only_inside_crypted() {
+        let families = [
+            Command::Order,
+            Command::UI,
+            Command::Strat,
+            Command::API,
+            Command::Balance,
+        ];
+        for (n, cmd) in families.into_iter().enumerate() {
+            let mut s = session();
+            let mut delivered = Vec::new();
+            s.on_packet(cmd.to_byte(), b"payload", 7, &mut delivered);
+            assert!(delivered.is_empty(), "{cmd:?} in the clear");
+            assert!(!s.fresh_crypted, "{cmd:?} in the clear moves nothing");
+
+            let wrapped = crypted(&s, 1000 + n as u64, cmd, b"payload");
+            s.on_packet(
+                Command::Crypted.to_byte(),
+                &wrapped,
+                wrapped.len(),
+                &mut delivered,
+            );
+            assert!(
+                matches!(&delivered[..], [Delivered::Command { cmd: c, payload }]
+                    if *c == cmd.to_byte() && payload == b"payload"),
+                "{cmd:?} inside Crypted"
+            );
+            assert!(s.fresh_crypted);
+        }
+        let mut s = session();
+        let mut delivered = Vec::new();
+        s.on_packet(Command::SessionClose.to_byte(), b"", 1, &mut delivered);
+        assert!(delivered.is_empty(), "a clear SessionClose closes nothing");
+        let wrapped = crypted(&s, 2000, Command::SessionClose, b"");
+        s.on_packet(
+            Command::Crypted.to_byte(),
+            &wrapped,
+            wrapped.len(),
+            &mut delivered,
+        );
+        assert!(matches!(&delivered[..], [Delivered::SessionClose]));
+    }
+
+    /// A Crypted packet seen again is refused by the replay window, and does not count as
+    /// «fresh» for the address either; a packet that is not authentic does not.
+    #[test]
+    fn a_replayed_crypted_packet_is_refused() {
+        let mut s = session();
+        let mut delivered = Vec::new();
+        let wrapped = crypted(&s, 5000, Command::API, b"once");
+        s.on_packet(
+            Command::Crypted.to_byte(),
+            &wrapped,
+            wrapped.len(),
+            &mut delivered,
+        );
+        assert_eq!(delivered.len(), 1);
+        assert!(s.fresh_crypted);
+
+        s.fresh_crypted = false;
+        s.on_packet(
+            Command::Crypted.to_byte(),
+            &wrapped,
+            wrapped.len(),
+            &mut delivered,
+        );
+        assert_eq!(delivered.len(), 1, "the second copy is not delivered");
+        assert!(!s.fresh_crypted, "and does not move the address");
+
+        let mut forged = crypted(&s, 5001, Command::API, b"forged");
+        let last = forged.len() - 1;
+        forged[last] ^= 0x55;
+        s.on_packet(
+            Command::Crypted.to_byte(),
+            &forged,
+            forged.len(),
+            &mut delivered,
+        );
+        assert_eq!(delivered.len(), 1);
+        assert!(!s.fresh_crypted);
+    }
+
     #[test]
     fn sliced_send_is_paced_by_the_tick_budget() {
         let mut s = session();

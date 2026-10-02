@@ -2082,7 +2082,10 @@ impl CoreHandler {
             action,
             Action::Post { leg: Leg::Buy, .. } | Action::Replace { leg: Leg::Buy, .. }
         );
-        if !entry || !(msg.contains("/-4140:") || msg.contains("/-4141:")) {
+        if !entry
+            || !(crate::aster::rest::msg_has_code(msg, -4140)
+                || crate::aster::rest::msg_has_code(msg, -4141))
+        {
             return Effects::default();
         }
         let Some(symbol) = self.orders.get(action.order()).map(|o| o.uid.clone()) else {

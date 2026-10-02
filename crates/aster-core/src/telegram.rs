@@ -742,21 +742,24 @@ fn poll_loop(
                 }
                 continue;
             }
-            if u.text.trim() != pin {
-                pin_misses += 1;
-                if pin_misses == 1 || pin_misses.is_multiple_of(PIN_TRIES) {
+            if let Guess::Wrong {
+                misses,
+                say,
+                redraw,
+            } = judge_guess(&pin, &u.text, &mut pin_misses)
+            {
+                if say {
                     log::warn!(
-                        "telegram: chat {} sent something that is not the PIN ({pin_misses} so far)",
+                        "telegram: chat {} sent something that is not the PIN ({misses} so far)",
                         u.chat_id
                     );
                 }
-                if pin_misses.is_multiple_of(PIN_TRIES) {
+                if redraw {
                     pin = new_pin();
                     pin_at = None;
                 }
                 continue;
             }
-            pin_misses = 0;
             // Ours only to stop asking for the PIN: the trading loop owns the
             // settings, writes the chat into them, saves the file and answers
             // the chat — this thread's copy is as old as its last long poll.
@@ -775,6 +778,35 @@ fn poll_loop(
             pin_at = None;
             log::info!("telegram: chat {} approved", u.chat_id);
         }
+    }
+}
+
+/// What a message to a bot that has no chat yet makes of the current PIN.
+#[derive(Debug, PartialEq, Eq)]
+enum Guess {
+    Right,
+    /// Not the PIN: `misses` wrong ones so far against this PIN; `say` — worth a journal line
+    /// (the first, then every [`PIN_TRIES`]th); `redraw` — a new PIN is drawn (every
+    /// [`PIN_TRIES`]th), so guessing a million values is not a matter of patience.
+    Wrong {
+        misses: u32,
+        say: bool,
+        redraw: bool,
+    },
+}
+
+/// The PIN check of the pairing loop, apart from the network: a right guess clears the count.
+fn judge_guess(pin: &str, text: &str, misses: &mut u32) -> Guess {
+    if text.trim() == pin {
+        *misses = 0;
+        return Guess::Right;
+    }
+    *misses += 1;
+    let tenth = misses.is_multiple_of(PIN_TRIES);
+    Guess::Wrong {
+        misses: *misses,
+        say: *misses == 1 || tenth,
+        redraw: tenth,
     }
 }
 
@@ -1576,6 +1608,46 @@ fn duration(secs: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Pairing by PIN: a right one (spaces around it allowed) pairs and clears the count; a
+    /// wrong one is counted, reported on the first and every tenth, and the tenth draws a new
+    /// PIN — and a count carried over a right guess would not start from zero.
+    #[test]
+    fn the_pairing_pin_is_judged_counted_and_redrawn() {
+        let mut misses = 0;
+        assert_eq!(
+            judge_guess("123456", " 123456\n", &mut misses),
+            Guess::Right
+        );
+        assert_eq!(
+            judge_guess("123456", "654321", &mut misses),
+            Guess::Wrong {
+                misses: 1,
+                say: true,
+                redraw: false
+            }
+        );
+        for n in 2..PIN_TRIES {
+            assert_eq!(
+                judge_guess("123456", "nope", &mut misses),
+                Guess::Wrong {
+                    misses: n,
+                    say: false,
+                    redraw: false
+                }
+            );
+        }
+        assert_eq!(
+            judge_guess("123456", "nope", &mut misses),
+            Guess::Wrong {
+                misses: PIN_TRIES,
+                say: true,
+                redraw: true
+            }
+        );
+        assert_eq!(judge_guess("123456", "123456", &mut misses), Guess::Right);
+        assert_eq!(misses, 0);
+    }
+
     use super::*;
 
     fn events_all_on() -> Events {

@@ -94,7 +94,14 @@ impl Emulator {
             None => TradingEvent::Failed {
                 action,
                 definitive: true,
-                msg: format!("{CODE_ORDER_NOT_FOUND}: the emulator knows no such order"),
+                // What the real exchange's refusal reads like, so that the core's reading of
+                // it (`rest::msg_has_code`) is the same for an emulated order.
+                msg: crate::aster::rest::Error::Api {
+                    status: 400,
+                    code: CODE_ORDER_NOT_FOUND,
+                    msg: "the emulator knows no such order".into(),
+                }
+                .to_string(),
             },
         }
     }
@@ -341,7 +348,9 @@ mod tests {
             exchange_id: "1".into(),
         };
         match emu.answer(lost, &orders, model.at(1), 5) {
-            TradingEvent::Failed { msg, .. } => assert!(msg.contains(CODE_ORDER_NOT_FOUND)),
+            TradingEvent::Failed { msg, .. } => {
+                assert!(crate::aster::rest::msg_has_code(&msg, CODE_ORDER_NOT_FOUND))
+            }
             _ => panic!("answered an unknown order"),
         }
     }

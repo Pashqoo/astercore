@@ -501,6 +501,7 @@ fn spawn_stream(
             let mut backoff = RECONNECT_MIN;
             while !stop.load(Ordering::Relaxed) {
                 let opened = Instant::now();
+                let started = ws::Stamp::now();
                 let res = ws::guarded(|| {
                     ws::run(&streams, idle, &stop, &beat, |frame| {
                         // A replaced session's last frame must not undo the
@@ -524,7 +525,9 @@ fn spawn_stream(
                 if res.is_err() && !books.is_empty() && !stop.load(Ordering::Relaxed) {
                     let _ = ev_tx.send(FeedEvent::BooksUnavailable(books.clone()));
                 }
-                if opened.elapsed() >= HEALTHY_SESSION {
+                // A session that only sat there silent until the idle limit closed it is not a
+                // healthy one, however long it lived.
+                if healthy_session(opened.elapsed(), beat.heard_data_since(started)) {
                     backoff = RECONNECT_MIN;
                 }
                 match res {
@@ -532,12 +535,23 @@ fn spawn_stream(
                     Err(e) => {
                         log::warn!("stream {name}: {e}; retry in {}s", backoff.as_secs());
                         pause(backoff, &stop);
-                        backoff = (backoff * 2).min(RECONNECT_MAX);
+                        backoff = doubled(backoff);
                     }
                 }
             }
         })
         .expect("spawn");
+}
+
+/// A session that starts the backoff over: it lived [`HEALTHY_SESSION`] AND delivered a data
+/// frame (a pong is not one).
+fn healthy_session(lived: Duration, heard_a_frame: bool) -> bool {
+    lived >= HEALTHY_SESSION && heard_a_frame
+}
+
+/// The next reconnect backoff: doubled, up to [`RECONNECT_MAX`].
+fn doubled(backoff: Duration) -> Duration {
+    (backoff * 2).min(RECONNECT_MAX)
 }
 
 /// Sleep `d`, or less if `stop` is set meanwhile — a replaced chunk's thread
@@ -932,6 +946,27 @@ fn history_rows(rows: &[AggTrade], start: i64) -> Vec<HistoryTrade> {
 
 #[cfg(test)]
 mod tests {
+    /// The reconnect backoff doubles from 3 s to its ceiling, and starts over only after a
+    /// session that lived a minute AND heard something — a silent one closed by the idle limit
+    /// does not.
+    #[test]
+    fn the_reconnect_backoff_doubles_and_resets_only_after_a_session_that_heard() {
+        let mut b = RECONNECT_MIN;
+        let mut seen = vec![b.as_secs()];
+        for _ in 0..6 {
+            b = doubled(b);
+            seen.push(b.as_secs());
+        }
+        assert_eq!(seen, [3, 6, 12, 24, 48, 60, 60]);
+        let minute = Duration::from_secs(60);
+        assert!(healthy_session(minute, true));
+        assert!(
+            !healthy_session(minute, false),
+            "silent until the idle limit"
+        );
+        assert!(!healthy_session(minute - Duration::from_secs(1), true));
+    }
+
     use super::*;
 
     fn agg(id: i64, time_ms: i64, price: f64, qty: f64, buyer_is_maker: bool) -> AggTrade {

@@ -33,7 +33,9 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub enum Error {
     /// Non-2xx with Aster's own body. `code` is the exchange's negative
-    /// integer (`-1021`, `-2019`); the policy table in `PLAN.md` is keyed on it.
+    /// integer (`-1021`, `-2019`). The order worker passes a failure on as TEXT, so the readers
+    /// of that text ([`msg_has_code`], [`msg_has_status`]) live beside `Display`, which writes
+    /// it; `PLAN.md`'s policy table is keyed on the code.
     Api {
         status: u16,
         code: i64,
@@ -43,10 +45,30 @@ pub enum Error {
     Decode(String),
 }
 
+/// How an exchange code sits inside an `Error`'s text: `/-4141:` (`api 400/-4141: …`). The
+/// order worker hands failures to the engine as text, and the engine recognises codes by this
+/// marker — so it is written here, once, for both the writer (`Display`) and the readers
+/// ([`msg_has_code`]).
+pub fn code_marker(code: i64) -> String {
+    format!("/{code}:")
+}
+
+/// Whether `msg`, the text of an [`Error::Api`], carries HTTP status `status` (`api 429/…`).
+pub fn msg_has_status(msg: &str, status: u16) -> bool {
+    msg.contains(&format!("api {status}/"))
+}
+
+/// Whether `msg`, the text of an [`Error::Api`], carries the exchange code `code`.
+pub fn msg_has_code(msg: &str, code: i64) -> bool {
+    msg.contains(&code_marker(code))
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Api { status, code, msg } => write!(f, "api {status}/{code}: {msg}"),
+            Self::Api { status, code, msg } => {
+                write!(f, "api {status}{} {msg}", code_marker(*code))
+            }
             Self::Transport(e) => write!(f, "transport: {e}"),
             Self::Decode(e) => write!(f, "decode: {e}"),
         }
@@ -642,4 +664,32 @@ pub fn now_us() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The engine finds an exchange code in the text of the error the worker made: the writer
+    /// and the readers share `code_marker`, so a change of the format cannot part them.
+    #[test]
+    fn a_code_is_found_in_the_text_the_error_makes() {
+        let e = Error::Api {
+            status: 400,
+            code: -4141,
+            msg: "Symbol is closed for new positions.".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "api 400/-4141: Symbol is closed for new positions."
+        );
+        assert!(msg_has_code(&e.to_string(), -4141));
+        assert!(!msg_has_code(&e.to_string(), -4140));
+        // A code is not found inside another number, nor in a message that only mentions it.
+        assert!(!msg_has_code("api 400/-41410: x", -4141));
+        assert!(!msg_has_code("transport: reset", -4141));
+        assert!(msg_has_status(&e.to_string(), 400));
+        assert!(!msg_has_status(&e.to_string(), 429));
+        assert!(!msg_has_status("transport: api 429 reset", 429));
+    }
 }
