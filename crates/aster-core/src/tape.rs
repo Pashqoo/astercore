@@ -132,6 +132,12 @@ impl Tape {
     /// millisecond only the ring heard; nothing is ever drawn twice, the two
     /// sides of the cut being disjoint.
     ///
+    /// The history is `aggTrades` (merged fills) and the ring holds raw fills (since 02.10). An
+    /// aggregate is stamped `T` but 4-19 % of the multi-fill ones (measured 02.10, BTC, ETH, SOL)
+    /// have fills in a later millisecond, so the last aggregate before the seam can have such a
+    /// tail counted again from the ring: at most one aggregate's tail, at the seam of a deal's
+    /// picture, no more.
+    ///
     /// What the reach cannot see: a stream gap that ends inside the seam's
     /// own millisecond, and a dealer print, which the gateway's reply carries
     /// (`TRADE_SOURCE_ALL`) and this ring deliberately does not. Neither is

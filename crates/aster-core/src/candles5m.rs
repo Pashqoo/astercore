@@ -9,7 +9,8 @@
 //! volume column of the screener shows (`Vol.` is the 24-hour quote volume).
 //!
 //! Seeded from `klines 5m` at startup (`feed.rs`, the warm-up) and kept from
-//! the `aggTrade` tape after it. TInvestCore derived the same answer from its
+//! the raw `trade` tape after it (an `aggTrade` is the sum of its fills, so the turnover is the
+//! same). TInvestCore derived the same answer from its
 //! minute windows (`windows.rs`, 24 hours deep); those serve the strategies
 //! here, and a day of minutes would not reach the 41 hours the client keeps
 //! anyway.

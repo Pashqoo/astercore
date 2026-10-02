@@ -314,7 +314,7 @@ pub struct Market {
     /// charges on 97 of the 595 rows.
     pub funding: Option<Funding>,
     /// The market's trade stream is alive: the session that carries its
-    /// `aggTrade` answers (`stream_health`). True from the start, as a stream
+    /// `trade` frames (`stream_health`). True from the start, as a stream
     /// still opening counts as alive; the engine keeps it current. Orders read
     /// it (`fresh`), as TInvestCore's did.
     pub feed_fresh: bool,

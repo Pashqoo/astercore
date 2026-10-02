@@ -647,16 +647,18 @@ pub struct OrderReply {
     pub update_ms: i64,
 }
 
-/// One aggregated trade, from `<symbol>@aggTrade` or `GET /fapi/v1/aggTrades`.
+/// One trade as the core reads it: an aggregated trade of `GET /fapi/v1/aggTrades` (the last-hour
+/// history), or a raw fill of `<symbol>@trade` (the live tape, [`StreamEvent::Trade`]).
 ///
-/// Measured 01.10 the two carry the same fields under the same names; the
+/// Measured 01.10 the `aggTrade` stream and the REST rows carry the same fields under the same names; the
 /// stream adds `e`, `E` and `s`, which is why `symbol` defaults — the REST
 /// answer is per symbol and does not repeat it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AggTrade {
     #[serde(default, rename = "s")]
     pub symbol: String,
-    /// Aggregate trade id, the paging key of the REST call.
+    /// Aggregate trade id, the paging key of the REST call. A live `trade` frame has no `a` (its
+    /// id is `t`, which the core does not read): 0 there, so nothing may key on it for live prints.
     #[serde(default, rename = "a")]
     pub id: i64,
     #[serde(default, deserialize_with = "str_f64", rename = "p")]
@@ -786,8 +788,12 @@ impl From<MarkPriceUpdate> for PremiumIndex {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "e")]
 pub enum StreamEvent {
-    #[serde(rename = "aggTrade")]
-    AggTrade(AggTrade),
+    /// `<symbol>@trade`: one fill. The stream the core reads, because `aggTrade` merges the fills
+    /// of one taker order at one price (measured 02.10: 18-28 % fewer prints on BTCUSDT and
+    /// SOLUSDT than the exchange's raw tape in the same window). The fields the core reads are
+    /// those of [`AggTrade`] under the same names, so it is decoded as one (`a` defaults to 0).
+    #[serde(rename = "trade")]
+    Trade(AggTrade),
     #[serde(rename = "depthUpdate")]
     Depth(Depth),
     #[serde(rename = "kline")]
@@ -981,13 +987,14 @@ mod stream_tests {
     /// The frames below are the ones the exchange sent on 01.10, cut short.
     #[test]
     fn the_four_stream_shapes_decode() {
-        let agg = r#"{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1790870843144,"a":88157604,"s":"BTCUSDT","p":"84249.3","q":"0.016","f":148352617,"l":148352617,"T":1790870842950,"m":true}}"#;
+        // The raw tape's frame, as measured on 02.10.
+        let agg = r#"{"stream":"btcusdt@trade","data":{"e":"trade","E":1790870843144,"T":1790870842950,"s":"BTCUSDT","t":148352617,"p":"84249.3","q":"0.016","X":"MARKET","m":true}}"#;
         let Envelope {
-            data: StreamData::One(StreamEvent::AggTrade(t)),
+            data: StreamData::One(StreamEvent::Trade(t)),
             ..
         } = serde_json::from_str(agg).unwrap()
         else {
-            panic!("aggTrade")
+            panic!("trade")
         };
         assert_eq!(
             (t.symbol.as_str(), t.price, t.time_ms),

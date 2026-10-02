@@ -1,4 +1,4 @@
-//! Aster's market data on its own threads: static `aggTrade` sessions over
+//! Aster's market data on its own threads: static `trade` (raw tape) sessions over
 //! the whole catalog, one `!markPrice@arr` session, chunked dynamic sessions
 //! for the books and candles the terminal follows (`subs`), a serial worker
 //! for the on-demand REST calls (chart history, the tape of the last hour),
@@ -9,7 +9,7 @@
 //! The shape is TInvestCore's `feed.rs`; what changed is the venue under it.
 //! A chunk there was a grpc-web stream of 300 instruments, here it is a
 //! WebSocket session of at most 200 streams (`ws::MAX_STREAMS`, measured), so
-//! the catalog's 596 `aggTrade` streams are three sessions. Trading statuses
+//! the catalog's 596 `trade` streams are three sessions. Trading statuses
 //! have no stream at all on Aster — `status` rides `exchangeInfo` — so that
 //! group is gone, and so is the MOEX history thread: deep history is the
 //! exchange's own `klines`.
@@ -222,7 +222,7 @@ pub fn start(
         beat.rotate_at_phase(i as i64 * spread);
         let streams = chunk
             .iter()
-            .map(|s| format!("{}@aggTrade", s.to_lowercase()))
+            .map(|s| format!("{}@trade", s.to_lowercase()))
             .collect();
         spawn_stream(
             name,
@@ -591,7 +591,7 @@ fn forward(frame: StreamData, tx: &Sender<FeedEvent>) -> bool {
             }
             FeedEvent::Marks(marks)
         }
-        StreamData::One(StreamEvent::AggTrade(t)) => match trade_of(t) {
+        StreamData::One(StreamEvent::Trade(t)) => match trade_of(t) {
             Some(ev) => ev,
             None => return true,
         },

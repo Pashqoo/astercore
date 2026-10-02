@@ -4,7 +4,7 @@
 //!
 //! The shape is TInvestCore's `tinvest/stream.rs` without the grpc-web: a
 //! session is opened for a FIXED set of streams named in the URL
-//! (`/stream?streams=a@aggTrade/b@depth@100ms`), read until it ends, and the
+//! (`/stream?streams=a@trade/b@depth@100ms`), read until it ends, and the
 //! owner reopens it. Naming the set in the URL rather than sending `SUBSCRIBE`
 //! keeps the exchange's "10 incoming messages a second" limit out of the
 //! picture entirely, and a changed set is a new session — the same rule the
@@ -12,7 +12,7 @@
 //!
 //! Measured 01.10, and every number below rests on it: a session takes at
 //! most **200 streams** (the 201st is refused with close code 3003, "subscribed
-//! channels exceeds limit"), 200 `aggTrade` names make a 3658-byte URL that
+//! channels exceeds limit"), 200 `aggTrade` names (`trade` ones are shorter) make a 3658-byte URL that
 //! the gateway takes while the whole catalog in one URL is refused with
 //! HTTP 414, the handshake costs ~0.8 s, and the gateway closes a connection
 //! after 24 hours on its own.
@@ -392,10 +392,10 @@ mod tests {
 
     #[test]
     fn the_url_names_every_stream() {
-        let u = url(&["btcusdt@aggTrade".into(), "!markPrice@arr".into()]);
+        let u = url(&["btcusdt@trade".into(), "!markPrice@arr".into()]);
         assert_eq!(
             u,
-            "wss://fstream.asterdex.com/stream?streams=btcusdt@aggTrade/!markPrice@arr"
+            "wss://fstream.asterdex.com/stream?streams=btcusdt@trade/!markPrice@arr"
         );
     }
 }
