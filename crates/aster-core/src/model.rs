@@ -1060,17 +1060,40 @@ impl Catalog {
     /// [`Catalog::index_of_symbol`] for text an operator typed — a strategy's
     /// `CoinsWhiteList`/`CoinsBlackList`, the terminal's global black list —
     /// where the case is nobody's contract. Aster spells every symbol in
-    /// upper case, so the upper-cased spelling is the only other candidate.
+    /// upper case, so the upper-cased spelling is the other candidate. MoonBot
+    /// lists name coins, not symbols (`btc, eth`, `1000pepe` in its own
+    /// strategy files), so a word that is no symbol is tried as a coin: the
+    /// one market whose base asset it is, or whose folded `1000` coin
+    /// ([`Market::alias_1000`], what the terminal is told as the canonic
+    /// currency: `pepe` for `1000PEPEUSDT`).
     pub fn index_of_symbol_ci(&self, symbol: &str) -> Option<u16> {
+        let up = symbol.to_ascii_uppercase();
         self.index_of_symbol(symbol)
-            .or_else(|| self.index_of_symbol(&symbol.to_ascii_uppercase()))
+            .or_else(|| self.index_of_symbol(&up))
+            .or_else(|| {
+                let mut by_base = self.bases(&up);
+                let first = by_base.next()?;
+                by_base.next().is_none().then_some(first)
+            })
     }
 
     /// Whether an inexact spelling is refused because two markets answer to
-    /// it. Never on Aster: no two symbols share an upper case. Kept for the
-    /// screener's log line, which tells «ambiguous» from «unknown».
-    pub fn symbol_is_ambiguous(&self, _symbol: &str) -> bool {
-        false
+    /// it: two markets on one coin. Not seen on Aster: the catalog holds only
+    /// `USDT`-quoted markets, and their bases are unique (checked 02.10
+    /// against `exchangeInfo`). Kept for the screener's log line, which tells
+    /// «ambiguous» from «unknown».
+    pub fn symbol_is_ambiguous(&self, symbol: &str) -> bool {
+        self.bases(&symbol.to_ascii_uppercase()).nth(1).is_some()
+    }
+
+    /// Markets whose base asset or folded `1000` coin is `up`.
+    fn bases<'a>(&'a self, up: &'a str) -> impl Iterator<Item = u16> + 'a {
+        self.iter()
+            .filter(move |(_, m)| {
+                m.base.eq_ignore_ascii_case(up)
+                    || m.alias_1000().is_some_and(|c| c.eq_ignore_ascii_case(up))
+            })
+            .map(|(i, _)| i)
     }
 
     /// The market at `m_index`.
@@ -1620,6 +1643,36 @@ mod tests {
         for name in MarketTags::PICKLIST.split('|') {
             assert!(MarketTags::parse(name).is_ok(), "{name}");
         }
+    }
+
+    /// What the trader typed into `CoinsWhiteList` on 02.10 (`btc, eth`) found
+    /// nothing, and both MoonShot strategies stood without a market: MoonBot
+    /// lists name coins. A coin is its one market; a symbol still wins.
+    #[test]
+    fn typed_market_is_a_symbol_or_a_coin_in_any_case() {
+        use fixtures::market;
+        let c = Catalog::of(vec![
+            market("1000PEPEUSDT", "1000PEPE", 0.0000001, 1.0),
+            market("BTCUSDT", "BTC", 0.1, 0.001),
+            market("ETHUSDT", "ETH", 0.01, 0.001),
+        ]);
+        for typed in ["BTCUSDT", "btcusdt", "BTC", "btc", "Btc"] {
+            assert_eq!(c.index_of_symbol_ci(typed), Some(1), "{typed}");
+        }
+        assert_eq!(c.index_of_symbol_ci("eth"), Some(2));
+        assert_eq!(c.index_of_symbol_ci("1000pepe"), Some(0));
+        assert_eq!(c.index_of_symbol_ci("pepe"), Some(0), "the folded coin");
+        for typed in ["", "nope", "USDT", "bt"] {
+            assert_eq!(c.index_of_symbol_ci(typed), None, "{typed}");
+            assert!(!c.symbol_is_ambiguous(typed), "{typed}");
+        }
+        // Two markets on one base is no answer, and said so.
+        let mut usdc = market("BTCUSDC", "BTC", 0.1, 0.001);
+        usdc.quote = "USDC".into();
+        let two = Catalog::of(vec![market("BTCUSDT", "BTC", 0.1, 0.001), usdc]);
+        assert_eq!(two.index_of_symbol_ci("btc"), None);
+        assert!(two.symbol_is_ambiguous("btc"));
+        assert_eq!(two.index_of_symbol_ci("btcusdc"), Some(0));
     }
 
     #[test]

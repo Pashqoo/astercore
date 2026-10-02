@@ -1109,7 +1109,7 @@ impl MoonShot {
         let twins: Vec<String> = black
             .iter()
             .filter(|t| model.index_of_symbol_ci(t).is_some())
-            .map(|t| format!("{t}_"))
+            .map(|t| format!("{}_", t.to_uppercase()))
             .collect();
         let mut q = p.clone();
         q.black.extend(
@@ -1121,6 +1121,15 @@ impl MoonShot {
                     black.contains(&up) || twins.iter().any(|t| up.starts_with(t))
                 })
                 .cloned(),
+        );
+        // A coin the operator typed (`btc`) bans its market the way the
+        // strategy's own black list does (`Catalog::index_of_symbol_ci`).
+        q.black.extend(
+            black
+                .iter()
+                .filter_map(|t| model.index_of_symbol_ci(t))
+                .filter_map(|i| model.at(i))
+                .map(|m| m.symbol.clone()),
         );
         Cow::Owned(q)
     }
@@ -4972,6 +4981,11 @@ mod tests {
         fresh.set_black_list(HashSet::from(["SGAZP".to_string()]));
         let cmds = fresh.tick(&st, &Orders::new(), &model, &win, sched, t);
         assert_eq!(starts(&cmds).len(), 1);
+        // Typed as the trader types it, in lower case: still banned.
+        let mut typed = MoonShot::default();
+        typed.set_black_list(HashSet::from(["sber".to_string()]));
+        let cmds = typed.tick(&st, &Orders::new(), &model, &win, sched, t);
+        assert!(starts(&cmds).is_empty());
     }
 
     #[test]
@@ -7352,8 +7366,8 @@ mod tests {
             [model.index_of_symbol("SBER").unwrap()]
         );
 
-        // No two Aster symbols share an upper case, so no spelling is
-        // ambiguous (TInvestCore had `SiZ5` beside `SIZ5`).
+        // No two Aster markets share a symbol's upper case or a coin, so no
+        // spelling is ambiguous (TInvestCore had `SiZ5` beside `SIZ5`).
         assert!(!model.symbol_is_ambiguous("sber"));
     }
 
