@@ -1989,9 +1989,12 @@ impl CoreHandler {
     /// «Move all» (Order opcode 11) of one leg on a market (TInvestCore, as
     /// is): `kind` 2 moves every resting order `value` percent (immune ones
     /// too, as MoonBot); `kind` 0 moves the ones `move_kind` picks — All (5),
-    /// LastSet (6), TopVol (2), LowVol (3) — to the price `value`, for a
-    /// `side` (0 both, 1 long, 2 short), skipping immune ones. The price zone
-    /// (`kind` 1) and other kinds are said to be unsupported.
+    /// LastSet (6), TopVol (2), LowVol (3) — to the price `value`; Shift (1) moves the
+    /// whole grid so that its order nearest the market lands on `value` (nearest is the
+    /// highest resting price of a grid below the market, the lowest above it — not the live
+    /// market price). All of them for a `side` (0 both, 1 long, 2 short), skipping immune
+    /// ones, which Shift leaves out of the anchor too. The price zone (`kind` 1) and other
+    /// kinds are said to be unsupported.
     #[allow(clippy::too_many_arguments)]
     fn move_all(
         &mut self,
@@ -2060,6 +2063,37 @@ impl CoreHandler {
                         .collect(),
                 };
                 pick.into_iter().map(|r| (r.id, r.leg, value)).collect()
+            }
+            // Parallel shift: the order nearest the market lands on `value`, the rest keep
+            // their distance to it. Each direction is its own grid (resting below the market
+            // is a long entry or a short's close), so the nearest is the highest there and
+            // the lowest above; the smaller id wins a tie (the sort above).
+            (0, 1) => {
+                found.retain(|r| !r.immune);
+                let below = |r: &Resting| {
+                    (r.leg == Leg::Buy) != self.orders.get(r.id).is_some_and(|o| o.is_short)
+                };
+                let anchor = |grid_below: bool| {
+                    let grid = found.iter().filter(|r| below(r) == grid_below);
+                    if grid_below {
+                        grid.max_by(|a, b| a.price.total_cmp(&b.price).then(b.id.cmp(&a.id)))
+                    } else {
+                        grid.min_by(|a, b| a.price.total_cmp(&b.price))
+                    }
+                    .map(|r| r.price)
+                };
+                let anchors = [anchor(true), anchor(false)];
+                // One tick-aligned distance for the grid: the members stay a whole number of
+                // ticks apart, as they were.
+                let to = m.nearest(value);
+                found
+                    .iter()
+                    .filter_map(|r| {
+                        let from = anchors[usize::from(!below(r))]?;
+                        let shift = to - from;
+                        Some((r.id, r.leg, r.price + shift))
+                    })
+                    .collect()
             }
             (1, _) => return unsupported("by price zone"),
             _ => return unsupported("of this kind"),

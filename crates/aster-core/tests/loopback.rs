@@ -1284,13 +1284,23 @@ fn log_line(client: &MoonClient, needle: &str) -> bool {
 }
 
 fn post_entry(client: &MoonClient, orders: &Receiver<TradeCommand>) -> String {
+    post_entry_at(client, orders, 83_000.0)
+}
+
+fn post_entry_at(client: &MoonClient, orders: &Receiver<TradeCommand>, price: f64) -> String {
+    post_side_at(client, orders, moonproto::OrderSide::Long, price)
+}
+
+fn post_side_at(
+    client: &MoonClient,
+    orders: &Receiver<TradeCommand>,
+    side: moonproto::OrderSide,
+    price: f64,
+) -> String {
     client
         .trade()
         .new_order(moonproto::NewOrderParams::new(
-            "BTCUSDT",
-            moonproto::OrderSide::Long,
-            83_000.0,
-            100.0,
+            "BTCUSDT", side, price, 100.0,
         ))
         .expect("the order request itself is sent");
     match next_action(orders) {
@@ -1427,6 +1437,84 @@ fn move_all_moves_every_resting_entry_to_the_price() {
         moved,
         vec![("911".to_string(), 82_500.0), ("912".to_string(), 82_500.0)]
     );
+    let _ = client.disconnect();
+}
+
+/// «Move all» in the Shift kind: the entry nearest the market (the highest of a
+/// long's) lands on the price, the rest keep their distance to it.
+#[test]
+fn move_all_shift_keeps_the_grid_and_puts_the_nearest_on_the_price() {
+    shift_grid(
+        moonproto::OrderSide::Long,
+        [("931", 83_000.0), ("932", 82_800.0)],
+        82_500.0,
+        [("931", 82_500.0), ("932", 82_300.0)],
+    );
+}
+
+/// The same for a short's entries, which rest above the market: the lowest is the
+/// nearest, so it lands on the price and the dearer one keeps its distance above it.
+#[test]
+fn move_all_shift_anchors_a_short_grid_on_its_lowest_entry() {
+    shift_grid(
+        moonproto::OrderSide::Short,
+        [("933", 84_500.0), ("934", 84_800.0)],
+        84_000.0,
+        [("933", 84_000.0), ("934", 84_300.0)],
+    );
+}
+
+fn shift_grid(
+    side: moonproto::OrderSide,
+    grid: [(&str, f64); 2],
+    to: f64,
+    expected: [(&str, f64); 2],
+) {
+    let (core, orders) = FedCore::trading();
+    let client = core.connect();
+    for (i, (id, price)) in grid.into_iter().enumerate() {
+        let key = post_side_at(&client, &orders, side, price);
+        // The exchange's report carries the price the order rests at.
+        let mut ack = report(&key, id, ExecStatus::New, 1, 0);
+        if let FeedEvent::Trading(TradingEvent::Order(u)) = &mut ack {
+            u.price = price;
+        }
+        core.ev_tx.send(ack).unwrap();
+        let n = i + 1;
+        assert!(wait_until(Duration::from_secs(5), || {
+            let _ = client.drain_events();
+            client.snapshot().is_some_and(|s| {
+                s.orders()
+                    .iter()
+                    .filter(|o| o.status == moonproto::OrderWorkerStatus::BuySet)
+                    .count()
+                    >= n
+            })
+        }));
+    }
+    client
+        .trade()
+        .move_all_buys(
+            "BTCUSDT",
+            moonproto::MoveAllBuysParams::replace_kind(
+                moonproto::BulkMoveKind::Shift,
+                to,
+                moonproto::PositionFilter::Both,
+            ),
+        )
+        .expect("sent");
+    let mut moved = Vec::new();
+    for _ in 0..2 {
+        match next_action(&orders) {
+            Action::Replace {
+                exchange_id, price, ..
+            } => moved.push((exchange_id, price)),
+            other => panic!("{other:?}"),
+        }
+    }
+    moved.sort_by(|a, b| a.0.cmp(&b.0));
+    let expected: Vec<(String, f64)> = expected.iter().map(|(i, p)| (i.to_string(), *p)).collect();
+    assert_eq!(moved, expected);
     let _ = client.disconnect();
 }
 
