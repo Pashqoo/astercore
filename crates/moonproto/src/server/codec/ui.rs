@@ -160,6 +160,26 @@ pub fn lev_manage(payload: &[u8]) -> Option<LevManage> {
     }
 }
 
+/// `TLevManageCommand` (CmdId 9) as the core sends it to terminals: `cmd_ver` 1, the five flags
+/// (auto max order, allow up, isolated, cross, fixed), the fixed leverage, the Telegram flag and
+/// the Config text — the layout `commands::ui::build_lev_manage` writes and `UICommand` reads.
+pub fn build_lev_manage(
+    uid: u64,
+    flags: [bool; 5],
+    fix_lev: i32,
+    tlg_report: bool,
+    lev_control: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(super::BASE_HEADER_SIZE + 12 + lev_control.len());
+    BaseHeader::write(&mut out, CMD_LEV_MANAGE, uid);
+    out.push(1);
+    out.extend(flags.map(u8::from));
+    out.extend_from_slice(&fix_lev.to_le_bytes());
+    out.push(u8::from(tlg_report));
+    crate::commands::registry::write_string(&mut out, lev_control);
+    out
+}
+
 /// `TSharedConfig` (CmdId 28): header + `len:u32` + gzip blob.
 pub fn shared_config_payload(uid: u64, blob: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(super::BASE_HEADER_SIZE + 4 + blob.len());
@@ -280,6 +300,26 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn lev_manage_round_trips() {
+        let raw = build_lev_manage(5, [true, true, false, true, false], 20, true, "5000 def");
+        let l = lev_manage(&raw).expect("parses");
+        assert_eq!(
+            (
+                l.auto_max_order,
+                l.auto_lev_up,
+                l.auto_isolated,
+                l.auto_cross,
+                l.auto_fix_lev
+            ),
+            (true, true, false, true, false)
+        );
+        assert_eq!(
+            (l.fix_lev, l.tlg_report, l.lev_control.as_str()),
+            (20, true, "5000 def")
+        );
     }
 
     #[test]

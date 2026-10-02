@@ -60,7 +60,7 @@ const EMULATOR_ORDERS_FILE: &str = "data/orders-emulator.json";
 /// The strategy list as MoonBot text (`strategy_file.rs`) and the trade
 /// reports (`reports.rs`), beside it.
 const STRATEGIES_FILE: &str = "data/strategies.txt";
-/// The terminal's last leverage-management snapshot (`levman`).
+/// The last leverage-management settings, from the terminal or the page (`levman`).
 const LEV_MANAGE_FILE: &str = "data/lev_manage.bin";
 /// A day of request counters and round trips for the page's API tab.
 /// Telemetry and nothing else: losing it costs a chart.
@@ -483,7 +483,7 @@ fn main() -> ExitCode {
             .as_deref()
             .and_then(ui::lev_manage)
             .map(|l| levman::Config::from_wire(&l));
-        let lev_worker = levman::start(lev_rest, signer.clone(), lev_config);
+        let lev_worker = levman::start(lev_rest, signer.clone(), lev_config, handler.lev_status());
         handler = handler.with_levman(PathBuf::from(LEV_MANAGE_FILE), lev_saved, Some(lev_worker));
         account::start(
             account_rest,

@@ -2210,6 +2210,7 @@ mod tests {
             // in the terminal and the thresholds are the picture's business.
             auto_stop: control::AutoStopView::default(),
             terminal_shots: None,
+            leverage: control::LeverageView::default(),
         };
         // Two deals closed today, one of them inside the hour; the third is
         // the terminal's kind of row — bought, still open — and no deal yet.

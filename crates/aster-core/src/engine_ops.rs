@@ -332,6 +332,10 @@ impl CoreHandler {
                     self.ops.settings.telegram.chat_id = chat_id;
                     let _ = self.settings_written(&format!("chat {chat_id} approved"));
                 }
+                ControlCmd::Leverage { edit, reply } => {
+                    let answer = self.leverage_edited(&edit);
+                    let _ = reply.send(answer);
+                }
                 ControlCmd::SettingsEdit { edit, reply } => {
                     let answer = self.settings_edited(&edit);
                     let _ = reply.send(answer);
@@ -724,6 +728,32 @@ impl CoreHandler {
             );
         }
         failure.map_or(Ok(()), Err)
+    }
+
+    /// The page's leverage settings: the same as a terminal's Apply — kept, acted on at once and
+    /// shown to the terminals that are connected. Refused without an account, where nothing
+    /// could be acted on, and for a Config line no terminal could have typed.
+    fn leverage_edited(&mut self, e: &control::LevEdit) -> Result<(), String> {
+        if self.levman.is_none() {
+            return Err("no account: this core only emulates, leverage is not managed".into());
+        }
+        let tlg_report = ui::lev_manage(&self.lev_manage).is_some_and(|l| l.tlg_report);
+        let config = levman::Config {
+            auto_max_order: e.auto_max_order,
+            auto_lev_up: e.auto_lev_up,
+            auto_isolated: e.auto_isolated,
+            auto_cross: e.auto_cross,
+            auto_fix_lev: e.auto_fix_lev,
+            fix_lev: e.fix_lev,
+            tlg_report,
+            text: e.lev_control.trim().to_string(),
+            limits: levman::Limits::parse(&e.lev_control),
+        };
+        let payload = config.to_wire(rand_uid());
+        self.lev_manage_set(&payload)?;
+        // The terminals' own window shows what the core now holds.
+        self.outbox.push((UI, payload));
+        Ok(())
     }
 
     /// One edit from the page: merge it, apply what applies at once, save.
@@ -1217,6 +1247,31 @@ impl CoreHandler {
             settings: control::SettingsView::from(&self.ops.settings),
             auto_stop: control::AutoStopView::from(&self.auto_stop),
             terminal_shots: self.ops.terminal_shots.clone(),
+            leverage: self.leverage_view(),
+        }
+    }
+}
+
+impl CoreHandler {
+    fn leverage_view(&self) -> control::LeverageView {
+        let held = ui::lev_manage(&self.lev_manage).map(|l| levman::Config::from_wire(&l));
+        control::LeverageView {
+            applies: self.levman.is_some(),
+            limits: held.as_ref().map_or_else(Vec::new, |c| c.limits.describe()),
+            config: held.map(|c| control::LevEditView {
+                auto_max_order: c.auto_max_order,
+                auto_lev_up: c.auto_lev_up,
+                auto_isolated: c.auto_isolated,
+                auto_cross: c.auto_cross,
+                auto_fix_lev: c.auto_fix_lev,
+                fix_lev: c.fix_lev,
+                lev_control: c.text,
+            }),
+            last: self
+                .lev_status
+                .lock()
+                .map(|l| l.clone())
+                .unwrap_or_default(),
         }
     }
 }

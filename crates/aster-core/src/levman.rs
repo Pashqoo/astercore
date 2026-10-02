@@ -1,5 +1,6 @@
 //! The terminal's «Настройка плеча» (MoonBot's leverage management), served by the core: the
-//! terminal sends its whole `TLevManageCommand` on Apply, the core keeps it, applies it at once
+//! terminal sends its whole `TLevManageCommand` on Apply (the page's Leverage tab sends the same
+//! settings), the core keeps it, applies it at once
 //! and again every hour (MoonBot checks hourly too: the brackets change on the exchange's side).
 //!
 //! What is asked of a market, in MoonBot's order of priority:
@@ -24,6 +25,7 @@ use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -88,6 +90,20 @@ impl Limits {
             .map_or(self.default, |r| r.limit)
     }
 
+    /// The limits as the core reads them, one line each, for the page.
+    pub fn describe(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.default != 0 {
+            out.push(format!("def: {}", self.default));
+        }
+        out.extend(
+            self.rules
+                .iter()
+                .map(|r| format!("{}: {}", r.token, r.limit)),
+        );
+        out
+    }
+
     fn is_empty(&self) -> bool {
         self.default <= 0 && self.rules.iter().all(|r| r.limit <= 0)
     }
@@ -128,6 +144,9 @@ pub struct Config {
     pub auto_cross: bool,
     pub auto_fix_lev: bool,
     pub fix_lev: i32,
+    pub tlg_report: bool,
+    /// The Config line as typed, for the page and for sending the settings back to terminals.
+    pub text: String,
     pub limits: Limits,
 }
 
@@ -140,8 +159,39 @@ impl Config {
             auto_cross: l.auto_cross,
             auto_fix_lev: l.auto_fix_lev,
             fix_lev: l.fix_lev,
+            tlg_report: l.tlg_report,
+            text: l.lev_control.clone(),
             limits: Limits::parse(&l.lev_control),
         }
+    }
+
+    /// The settings as `TLevManageCommand` for the terminals.
+    pub fn to_wire(&self, uid: u64) -> Vec<u8> {
+        ui::build_lev_manage(
+            uid,
+            [
+                self.auto_max_order,
+                self.auto_lev_up,
+                self.auto_isolated,
+                self.auto_cross,
+                self.auto_fix_lev,
+            ],
+            self.fix_lev,
+            self.tlg_report,
+            &self.text,
+        )
+    }
+
+    /// The settings a terminal or the page may hand over: a whole fixed leverage, a Config line
+    /// a person could have typed.
+    pub fn check(&self) -> Result<(), String> {
+        if !(0..=1000).contains(&self.fix_lev) {
+            return Err("the fixed leverage is a whole number from 0 to 1000".into());
+        }
+        if self.text.len() > 1000 || self.text.chars().any(char::is_control) {
+            return Err("the Config line is too long or has a control character".into());
+        }
+        Ok(())
     }
 
     /// Whether there is anything to do at all.
@@ -206,9 +256,34 @@ pub fn save(path: &Path, payload: &[u8]) {
     }
 }
 
+/// What the last pass did, for the page.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Last {
+    /// A pass is running now.
+    pub running: bool,
+    /// When the last pass began (Unix ms; 0 = none yet) and why: start, applied, hourly.
+    pub at_ms: i64,
+    pub why: String,
+    pub markets: usize,
+    pub read: usize,
+    pub with_brackets: usize,
+    pub to_change: usize,
+    pub margin_set: usize,
+    pub leverage_set: usize,
+    pub left_alone: usize,
+    pub failed: usize,
+    /// Why the pass ended early, if it did.
+    pub stopped: Option<String>,
+    /// The first markets left alone or failed, with the reason.
+    pub notes: Vec<String>,
+}
+
+/// The worker's state as the page reads it.
+pub type Shared = Arc<Mutex<Last>>;
+
 /// A message to the worker.
 pub enum Msg {
-    /// The terminal applied these settings: act at once and keep them.
+    /// The terminal (or the page's Leverage tab) applied these settings: act at once.
     Config(Config),
 }
 
@@ -221,12 +296,13 @@ const CHUNK: usize = 60;
 /// Starts the worker. With `initial` (the settings of the previous run) the first pass is made
 /// at once, as MoonBot checks at a restart. The sender is the engine's; dropping it ends the
 /// thread.
-pub fn start(rest: Rest, signer: Signer, initial: Option<Config>) -> Sender<Msg> {
+pub fn start(rest: Rest, signer: Signer, initial: Option<Config>, status: Shared) -> Sender<Msg> {
     let (tx, rx) = mpsc::channel::<Msg>();
     let mut worker = Worker {
         rest,
         signer,
         config: initial,
+        status,
     };
     thread::Builder::new()
         .name("aster-levman".into())
@@ -244,7 +320,13 @@ pub fn start(rest: Rest, signer: Signer, initial: Option<Config>) -> Sender<Msg>
                             continue;
                         }
                         Ok(None) => {}
-                        Err(_) => log::error!("leverage: a pass panicked, the next is in an hour"),
+                        Err(_) => {
+                            log::error!("leverage: a pass panicked, the next is in an hour");
+                            let mut last =
+                                worker.status.lock().unwrap_or_else(PoisonError::into_inner);
+                            last.running = false;
+                            last.stopped = Some("the pass panicked".into());
+                        }
                     }
                 }
                 match rx.recv_timeout(PERIOD) {
@@ -273,6 +355,7 @@ struct Worker {
     rest: Rest,
     signer: Signer,
     config: Option<Config>,
+    status: Shared,
 }
 
 impl Worker {
@@ -282,68 +365,120 @@ impl Worker {
     fn pass(&mut self, why: &str, rx: &Receiver<Msg>) -> Option<Config> {
         let Some(config) = self.config.clone().filter(Config::is_active) else {
             log::info!("leverage: {why}: nothing to manage");
+            self.publish(Last {
+                at_ms: crate::engine::now_ms(),
+                why: why.into(),
+                stopped: Some(
+                    "nothing to manage: no limit, fixed leverage or margin is switched on".into(),
+                ),
+                ..Last::default()
+            });
             return None;
         };
+        let mut last = Last {
+            running: true,
+            at_ms: crate::engine::now_ms(),
+            why: why.into(),
+            ..Last::default()
+        };
+        self.publish(last.clone());
         let (markets, brackets) = match self.markets_and_brackets() {
             Ok(read) => read,
             Err(e) => {
                 log::warn!("leverage: {why}: not made: {e}");
+                last.running = false;
+                last.stopped = Some(e);
+                self.publish(last);
                 return None;
             }
         };
-        let with_brackets = markets
+        last.markets = markets.len();
+        last.with_brackets = markets
             .iter()
             .filter(|(s, _)| brackets.contains_key(s))
             .count();
         let mut total = setup::Report::default();
-        let (mut todo, mut done) = (0, 0);
+        let mut stopped = None;
         for chunk in markets.chunks(CHUNK) {
             if let Ok(Msg::Config(c)) = rx.try_recv() {
                 log::info!(
-                    "leverage: {why}: new settings arrived, the pass is dropped after {done} markets \
+                    "leverage: {why}: new settings arrived, the pass is dropped after {} markets \
                      (margin set {}, leverage set {}, failed {})",
+                    last.read,
                     total.margin_set,
                     total.leverage_set,
                     total.failed.len()
                 );
+                last.running = false;
+                last.stopped = Some("dropped: new settings arrived".into());
+                Self::fill(&mut last, &total);
+                self.publish(last);
                 return Some(newest(rx, c));
             }
             let plans = match self.plans(&config, chunk, &brackets) {
                 Ok(p) => p,
                 Err(e) => {
-                    log::warn!("leverage: {why}: stopped after {done} markets: {e}");
+                    log::warn!("leverage: {why}: stopped after {} markets: {e}", last.read);
+                    stopped = Some(e);
                     break;
                 }
             };
-            todo += plans.iter().filter(|p| !p.is_noop()).count();
-            done += chunk.len();
+            last.to_change += plans.iter().filter(|p| !p.is_noop()).count();
+            last.read += chunk.len();
             let part = setup::apply(&mut self.rest, &mut self.signer, &plans);
             total.margin_set += part.margin_set;
             total.leverage_set += part.leverage_set;
             total.skipped.extend(part.skipped);
             total.failed.extend(part.failed);
+            Self::fill(&mut last, &total);
+            self.publish(last.clone());
             if part.aborted.is_some() {
-                total.aborted = part.aborted;
+                stopped = part.aborted;
                 break;
             }
         }
         log::info!(
-            "leverage: {why}: {done} of {} markets read ({with_brackets} with brackets), {todo} to \
-             change — margin set {}, leverage set {}, left alone {}, failed {}{}",
+            "leverage: {why}: {} of {} markets read ({} with brackets), {} to change — margin set \
+             {}, leverage set {}, left alone {}, failed {}{}",
+            last.read,
             markets.len(),
+            last.with_brackets,
+            last.to_change,
             total.margin_set,
             total.leverage_set,
             total.skipped.len(),
             total.failed.len(),
-            total
-                .aborted
+            stopped
                 .as_ref()
                 .map_or(String::new(), |a| format!(", stopped: {a}")),
         );
         for (symbol, reason) in total.skipped.iter().chain(&total.failed).take(20) {
             log::info!("leverage: {symbol}: {reason}");
         }
+        Self::fill(&mut last, &total);
+        last.running = false;
+        last.stopped = stopped;
+        self.publish(last);
         None
+    }
+
+    /// The counts and the first reasons of `total`, into what the page reads.
+    fn fill(last: &mut Last, total: &setup::Report) {
+        last.margin_set = total.margin_set;
+        last.leverage_set = total.leverage_set;
+        last.left_alone = total.skipped.len();
+        last.failed = total.failed.len();
+        last.notes = total
+            .skipped
+            .iter()
+            .chain(&total.failed)
+            .take(20)
+            .map(|(symbol, reason)| format!("{symbol}: {reason}"))
+            .collect();
+    }
+
+    fn publish(&self, last: Last) {
+        *self.status.lock().unwrap_or_else(PoisonError::into_inner) = last;
     }
 
     /// The trading markets (symbol, base coin) in symbol order, listed now, and their brackets.

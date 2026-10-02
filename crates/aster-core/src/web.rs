@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api_meter::ApiMeter;
-use crate::control::{self, AskError, ControlCmd};
+use crate::control::{self, AskError, ControlCmd, LevEdit};
 use crate::engine::now_ms;
 use crate::settings::{self, Settings};
 use crate::stderr_log;
@@ -616,6 +616,18 @@ fn route(web: &Web, req: &Request) -> Response {
                     Err(e) => busy(&e),
                 }
             }
+        },
+        ("POST", "/api/leverage") => match parse::<LevEdit>(&req.body) {
+            Err(e) => Response::json(400, &json!({ "error": e })),
+            Ok(edit) => match control::ask(
+                &web.control,
+                |reply| ControlCmd::Leverage { edit, reply },
+                ASK_WAIT,
+            ) {
+                Ok(Ok(())) => Response::json(200, &json!({ "applied": true })),
+                Ok(Err(e)) => Response::json(400, &json!({ "error": e })),
+                Err(e) => busy(&e),
+            },
         },
         ("POST", "/api/settings") => settings_edit(web, req),
         ("GET" | "POST", _) => Response::plain(404, "no such page"),
@@ -1237,6 +1249,30 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[test]
+    fn the_leverage_form_reaches_the_loop_and_a_stray_field_does_not() {
+        let (web, rx) = web("");
+        let body = r#"{"auto_max_order":true,"auto_lev_up":true,"lev_control":"200 def"}"#;
+        let answer = thread::scope(|s| {
+            let sent = s.spawn(|| route(&web, &post("/api/leverage", body, "")));
+            match rx.recv().unwrap() {
+                ControlCmd::Leverage { edit, reply } => {
+                    assert!(edit.auto_max_order && edit.auto_lev_up && !edit.auto_isolated);
+                    assert_eq!(edit.lev_control, "200 def");
+                    reply.send(Ok(())).unwrap();
+                }
+                other => panic!("not Leverage: {}", name_of(&other)),
+            }
+            sent.join().unwrap()
+        });
+        assert_eq!(answer.code, 200);
+        assert_eq!(
+            route(&web, &post("/api/leverage", r#"{"nope":1}"#, "")).code,
+            400
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
     fn name_of(cmd: &ControlCmd) -> &'static str {
         match cmd {
             ControlCmd::Status(_) => "Status",
@@ -1246,6 +1282,7 @@ mod tests {
             ControlCmd::Restart(_) => "Restart",
             ControlCmd::Chart { .. } => "Chart",
             ControlCmd::Screen { .. } => "Screen",
+            ControlCmd::Leverage { .. } => "Leverage",
             ControlCmd::SettingsEdit { .. } => "SettingsEdit",
             ControlCmd::Text { .. } => "Text",
             ControlCmd::Talk(_) => "Talk",

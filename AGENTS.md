@@ -145,7 +145,8 @@
 9. **Telegram** (M4): токен бота и привязка чата PIN-кодом — на странице, вкладка Telegram. Для
    проверки без Telegram — `ASTER_TELEGRAM_API=http://127.0.0.1:<порт>` на заглушку Bot API.
 
-10. **Плечи** (поток `aster-levman`): в журнале `leverage: settings received — limit config …`
+10. **Плечи** (поток `aster-levman`; вкладка `Leverage` на странице — настройки и итог последнего
+    прохода, `/api/status` → `leverage`): в журнале `leverage: settings received — limit config …`
     на Apply терминала, затем `leverage: <причина>: N of M markets read …, margin set …, leverage set
     …, left alone …, failed …` и построчно `setup: BTCUSDT leverage -> 50x`. Проверка живьём без
     риска: настройка на один рынок (`200 BTC` — Config с лимитом только у BTC), зонд — отдельный

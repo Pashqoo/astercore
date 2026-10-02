@@ -308,6 +308,8 @@ pub struct CoreHandler {
     /// Where `lev_manage` is kept, and the worker that acts on it (an account is needed for it).
     lev_file: Option<std::path::PathBuf>,
     levman: Option<Sender<levman::Msg>>,
+    /// What the last leverage pass did, written by the worker, read by the page.
+    lev_status: levman::Shared,
     order_store: Option<OrderStore>,
     /// Why the previous run's orders could not be restored (`order_store::Saved::lost`), until
     /// the account has been compared with the empty list.
@@ -432,6 +434,7 @@ impl CoreHandler {
             lev_manage: Vec::new(),
             lev_file: None,
             levman: None,
+            lev_status: levman::Shared::default(),
             order_store: None,
             orders_lost: None,
             pending_actions: Vec::new(),
@@ -555,6 +558,11 @@ impl CoreHandler {
         self.replay_guards();
         self.order_store = Some(store);
         self
+    }
+
+    /// The leverage worker's report, for `levman::start`.
+    pub fn lev_status(&self) -> levman::Shared {
+        Arc::clone(&self.lev_status)
     }
 
     /// Keeps the terminal's leverage management in `file` (`saved` is what the previous run
@@ -1434,42 +1442,10 @@ impl CoreHandler {
             }
             // «Настройка плеча» → Apply: the whole snapshot. Kept, echoed like the client
             // settings, and acted on at once by the leverage worker.
-            ui::CMD_LEV_MANAGE => {
-                let Some(lev) = ui::lev_manage(payload) else {
-                    log::warn!(
-                        "leverage: a TLevManageCommand that does not parse ({} bytes)",
-                        payload.len()
-                    );
-                    return;
-                };
-                let config = levman::Config::from_wire(&lev);
-                log::info!(
-                    "leverage: settings received — limit config {:?}, by max order {}, up {}, fixed {} {}, \
-                     isolated {}, cross {}",
-                    lev.lev_control,
-                    config.auto_max_order,
-                    config.auto_lev_up,
-                    config.auto_fix_lev,
-                    config.fix_lev,
-                    config.auto_isolated,
-                    config.auto_cross,
-                );
-                self.lev_manage = payload.to_vec();
-                if let Some(file) = &self.lev_file {
-                    levman::save(file, payload);
-                }
-                match &self.levman {
-                    Some(tx) => {
-                        if tx.send(levman::Msg::Config(config)).is_err() {
-                            log::error!("leverage: the worker is gone, nothing is applied");
-                        }
-                    }
-                    None => {
-                        log::warn!("leverage: no account, the settings are kept but not applied")
-                    }
-                }
-                session.send_encrypted(UI, &ui::with_uid(payload, rand_uid()), true);
-            }
+            ui::CMD_LEV_MANAGE => match self.lev_manage_set(payload) {
+                Ok(_) => session.send_encrypted(UI, &ui::with_uid(payload, rand_uid()), true),
+                Err(e) => log::warn!("leverage: {e}"),
+            },
             // MoonBot's guarded shutdown: refused while the core holds a
             // position — its exit, or the want of one, needs a core to watch
             // it. Otherwise the core leaves (`main`), withdrawing its entries.
@@ -1660,6 +1636,44 @@ impl CoreHandler {
         self.outbox
             .push((STRAT, strat::runtime_state(rand_uid(), false)));
         true
+    }
+
+    /// New leverage settings, from a terminal's Apply or from the page: kept, saved and handed
+    /// to the worker, which acts on them at once. Without an account they are kept and not acted on.
+    fn lev_manage_set(&mut self, payload: &[u8]) -> Result<levman::Config, String> {
+        let lev = ui::lev_manage(payload).ok_or_else(|| {
+            format!(
+                "a TLevManageCommand that does not parse ({} bytes)",
+                payload.len()
+            )
+        })?;
+        let config = levman::Config::from_wire(&lev);
+        config.check()?;
+        log::info!(
+            "leverage: settings received — limit config {:?}, by max order {}, up {}, fixed {} {}, \
+             isolated {}, cross {}",
+            config.text,
+            config.auto_max_order,
+            config.auto_lev_up,
+            config.auto_fix_lev,
+            config.fix_lev,
+            config.auto_isolated,
+            config.auto_cross,
+        );
+        self.lev_manage = payload.to_vec();
+        if let Some(file) = &self.lev_file {
+            levman::save(file, payload);
+        }
+        match &self.levman {
+            Some(tx) => {
+                if tx.send(levman::Msg::Config(config.clone())).is_err() {
+                    log::error!("leverage: the worker is gone, nothing is applied");
+                    return Err("the leverage worker is gone, nothing is applied".into());
+                }
+            }
+            None => log::warn!("leverage: no account, the settings are kept but not applied"),
+        }
+        Ok(config)
     }
 
     /// Rewrite the kept `TClientSettings` with the temporary black list as it

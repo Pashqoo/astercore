@@ -119,6 +119,7 @@
     <button type="button" data-tab="screen">Screener</button>
     <button type="button" data-tab="telegram">Telegram</button>
     <button type="button" data-tab="autostop">Auto-stop</button>
+    <button type="button" data-tab="leverage">Leverage</button>
     <button type="button" data-tab="engine">Engine</button>
     <button type="button" data-tab="api">API</button>
     <button type="button" data-tab="access">Access</button>
@@ -328,6 +329,50 @@
 </div>
 </form>
 
+<!-- Outside the settings form, like the screener: this tab has its own Apply, which is the
+     terminal's «Настройка плеча» window — the same fields, the same effect — and must not raise
+     the Save bar of the settings. -->
+<main class="panel" id="tab-leverage" hidden>
+  <div class="card">
+    <h2>Leverage management</h2>
+    <p class="note">
+      The terminal's «Настройка плеча», served by the core. <b>Apply</b> saves these settings, shows
+      them to the connected terminals and starts a pass over every trading market at once; the
+      core repeats it every hour. A market with an open position or a resting order is never
+      touched.
+    </p>
+    <div class="fields">
+      <label>Config — a position limit, $
+        <input id="lev_control" placeholder="5000 def" spellcheck="false"></label>
+      <label>Fixed leverage (Auto Leverage N)
+        <input id="lev_fix" inputmode="numeric" placeholder="20"></label>
+    </div>
+    <p class="note">
+      <code>(number) (coins or def)</code>, the number first: <code>5000 def</code>,
+      <code>10k def 30k BTC ETH</code>, <code>0 def 5k TRX LRC</code> (0 — not managed by the
+      limit). <code>def</code> is every market the line does not name; <code>k</code>, <code>m</code>
+      and the <code>*</code>, <code>?</code> patterns work.
+    </p>
+    <div class="checks" style="margin: 8px 0">
+      <label><input type="checkbox" id="lev_max"> Auto leverage by the max order (the Config limit)</label>
+      <label><input type="checkbox" id="lev_up"> Allow leverage Up</label>
+      <label><input type="checkbox" id="lev_fix_on"> Auto Leverage N (fixed)</label>
+      <label><input type="checkbox" id="lev_iso"> Auto Isolated</label>
+      <label><input type="checkbox" id="lev_cross"> Auto Cross</label>
+    </div>
+    <div class="row">
+      <button type="button" id="lev_apply" class="go">Apply and run now</button>
+      <span id="lev_msg" class="note"></span>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Last pass</h2>
+    <div class="row" id="lev_state"></div>
+    <div id="lev_table"></div>
+    <pre id="lev_notes" style="margin-top:8px"></pre>
+  </div>
+</main>
+
 <!-- Outside the settings form, and that is not a layout accident: every
      control inside it marks the page dirty and raises the Save bar, and none
      of these is a setting. Nothing on this tab is saved anywhere — the
@@ -412,7 +457,7 @@ const $ = (id) => document.getElementById(id);
 const HEAD = { 'Content-Type': 'application/json', 'X-Astercore': '1' };
 const STATUS_NAMES = ['—', 'buy failed', 'buy set', 'buy cancelled', 'bought',
                       'sell failed', 'sell set', 'sell cancelled', 'sold'];
-const TABS = ['trading', 'screen', 'telegram', 'autostop', 'engine', 'api', 'access', 'journal'];
+const TABS = ['trading', 'screen', 'telegram', 'autostop', 'leverage', 'engine', 'api', 'access', 'journal'];
 /* The form is only filled from the core while nobody is typing in it: a poll
    every two seconds would otherwise take the field out from under the hand.
    `dirty` holds the keys that were actually touched, because a Save must send
@@ -527,6 +572,7 @@ function render(s) {
   if (tab === 'trading') renderTrading(s);
   if (tab === 'autostop') renderAutoStop(s);
   if (tab === 'engine') renderEngine(s);
+  if (tab === 'leverage') renderLeverage(s);
   if (tab === 'telegram') renderShotsSource(s);
   if (!editing) fill(s.settings);
 }
@@ -567,6 +613,73 @@ function renderTrading(s) {
         : '<span class="note">—</span>']),
   );
 }
+
+/* The form is filled from the core only until a hand has touched it, like the other forms: a
+   poll in flight must not take the field from under somebody typing. */
+let levTouched = false;
+let levBusy = false;
+function renderLeverage(s) {
+  const v = s.leverage;
+  if (!levTouched && v.config) {
+    const c = v.config;
+    $('lev_control').value = c.lev_control;
+    $('lev_fix').value = c.fix_lev || '';
+    $('lev_max').checked = c.auto_max_order;
+    $('lev_up').checked = c.auto_lev_up;
+    $('lev_fix_on').checked = c.auto_fix_lev;
+    $('lev_iso').checked = c.auto_isolated;
+    $('lev_cross').checked = c.auto_cross;
+  }
+  $('lev_apply').disabled = !v.applies || levBusy;
+  if (!v.applies) say($('lev_msg'), 'no account: this core only emulates, nothing is managed', 'err');
+  const l = v.last;
+  const state = !v.config ? chip('no settings yet — Apply here or in the terminal', 'idle')
+    : l.running ? chip('pass running', 'idle')
+    : l.at_ms ? chip('last pass ' + new Date(l.at_ms).toLocaleTimeString() + ' · ' + l.why, 'on')
+    : chip('no pass yet', 'idle');
+  $('lev_state').replaceChildren(state);
+  if (v.limits.length) $('lev_state').append(chip('limits: ' + v.limits.join(', '), 'idle'));
+  $('lev_table').innerHTML = l.at_ms ? table(['', 'markets'], [
+    ['trading markets', l.markets],
+    ['read so far / with brackets', l.read + ' / ' + l.with_brackets],
+    ['to change', l.to_change],
+    ['margin set', l.margin_set],
+    ['leverage set', l.leverage_set],
+    ['left alone (position, order, no row)', l.left_alone],
+    ['failed', l.failed ? '<span class="err">' + l.failed + '</span>' : 0],
+    ['ended early', l.stopped ? '<span class="warn">' + esc(l.stopped) + '</span>' : '—'],
+  ]) : '';
+  $('lev_notes').textContent = l.notes.join('\n');
+}
+
+for (const id of ['lev_control', 'lev_fix', 'lev_max', 'lev_up', 'lev_fix_on', 'lev_iso', 'lev_cross']) {
+  $(id).addEventListener('input', () => { levTouched = true; });
+}
+$('lev_apply').addEventListener('click', async () => {
+  const fix = Number($('lev_fix').value.trim() || 0);
+  if (!Number.isInteger(fix) || fix < 0 || fix > 1000) { say($('lev_msg'), 'the fixed leverage is a whole number from 0 to 1000', 'err'); return; }
+  if (!confirm('Apply now? The core will change leverage and margin on the exchange for every market without a position or order.')) return;
+  levBusy = true;
+  $('lev_apply').disabled = true;
+  try {
+    await call('/api/leverage', {
+      auto_max_order: $('lev_max').checked, auto_lev_up: $('lev_up').checked,
+      auto_isolated: $('lev_iso').checked, auto_cross: $('lev_cross').checked,
+      auto_fix_lev: $('lev_fix_on').checked, fix_lev: fix, lev_control: $('lev_control').value,
+    });
+    const acts = $('lev_max').checked || ($('lev_fix_on').checked && fix > 0)
+      || $('lev_iso').checked || $('lev_cross').checked;
+    say($('lev_msg'), acts ? 'applied — the pass is running'
+      : 'saved — nothing is switched on, so nothing is sent', acts ? 'ok' : 'warn');
+    await poll();
+    levTouched = false;
+  } catch (e) {
+    say($('lev_msg'), String(e.message || e), 'err');
+  } finally {
+    levBusy = false;
+    $('lev_apply').disabled = false;
+  }
+});
 
 function renderEngine(s) {
   $('streams').replaceChildren(...(s.streams.length

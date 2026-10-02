@@ -90,6 +90,12 @@ pub enum ControlCmd {
         edit: Box<settings::Edit>,
         reply: Reply<Result<Applied, String>>,
     },
+    /// The page's «Leverage» tab: the same settings the terminal's «Настройка плеча» sends,
+    /// applied at once. `Err` — nothing was changed and why.
+    Leverage {
+        edit: LevEdit,
+        reply: Reply<Result<(), String>>,
+    },
     /// The page's strategy helper: screen the whole catalog with one
     /// strategy's settings, `fields` moved as the operator moved them. Read
     /// only — nothing of this reaches the strategy, the file or the terminal;
@@ -297,6 +303,42 @@ pub fn ask<T>(
     })
 }
 
+/// The leverage settings as the page sends them: the terminal's window, field for field.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LevEdit {
+    pub auto_max_order: bool,
+    pub auto_lev_up: bool,
+    pub auto_isolated: bool,
+    pub auto_cross: bool,
+    pub auto_fix_lev: bool,
+    pub fix_lev: i32,
+    pub lev_control: String,
+}
+
+/// The leverage management as the page shows it.
+#[derive(Debug, Default, Serialize)]
+pub struct LeverageView {
+    /// An account is there to act on the settings.
+    pub applies: bool,
+    /// The settings the core holds (from the terminal or the page); `None` before the first.
+    pub config: Option<LevEditView>,
+    /// The Config line read the way the core reads it: `def` and the explicit rules.
+    pub limits: Vec<String>,
+    pub last: crate::levman::Last,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LevEditView {
+    pub auto_max_order: bool,
+    pub auto_lev_up: bool,
+    pub auto_isolated: bool,
+    pub auto_cross: bool,
+    pub auto_fix_lev: bool,
+    pub fix_lev: i32,
+    pub lev_control: String,
+}
+
 /// What the page shows: the whole core in one answer, so a reader never has to
 /// stitch two states from two moments together.
 #[derive(Debug, Serialize)]
@@ -328,6 +370,7 @@ pub struct Status {
     /// over `settings.telegram_shots` (Ф4), so the page can say which ones
     /// actually decide instead of showing a form that does not.
     pub terminal_shots: Option<Shots>,
+    pub leverage: LeverageView,
 }
 
 /// The terminal's auto-stop and panic rules as the page states them.
