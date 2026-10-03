@@ -6322,6 +6322,64 @@ mod tests {
         }
     }
 
+    /// Off-session, a stock perp's MARKET fills only within 5 % of the mark and the rest
+    /// EXPIRES (docs.asterdex.com, stock perpetuals). The panic sells the remainder at MARKET
+    /// again after `PANIC_CHASE_MS`, and only the remainder, until the position is gone.
+    #[test]
+    fn a_panic_market_exit_cut_short_by_the_exchange_sells_the_rest_again() {
+        let mut model = sber_model();
+        model.get_mut("u-sber").unwrap().mark_price = Some(300.0);
+        let m = model.get("u-sber").unwrap();
+        let mut os = Orders::new();
+        let fx = os.start(42, &start(9000.0, 300.0, 0.0), m, 1000);
+        os.apply(
+            &update(&post_key(&fx), "1001", ExecStatus::Filled, 3, 3, 300.0),
+            1100,
+        );
+        let fx = os.set_panic(42, true, m, 1200);
+        let key = post_key(&fx);
+        assert!(matches!(
+            fx.actions[0],
+            Action::Post {
+                lots: 3,
+                price: None,
+                sell: true,
+                ..
+            }
+        ));
+        // One lot inside the cap, the other two expired.
+        let mut cut = update(&key, "2001", ExecStatus::Cancelled, 3, 1, 285.0);
+        cut.is_market = true;
+        cut.sell = true;
+        os.apply(&cut, 1300);
+        assert_eq!(os.get(42).unwrap().status, status::BUY_DONE);
+        let fx = os.watch(&model, 1200 + PANIC_CHASE_MS);
+        let again = fx
+            .actions
+            .iter()
+            .find(|a| matches!(a, Action::Post { leg: Leg::Sell, .. }))
+            .unwrap_or_else(|| panic!("no second exit: {:?}", fx.actions));
+        assert!(
+            matches!(
+                again,
+                Action::Post {
+                    lots: 2,
+                    price: None,
+                    sell: true,
+                    ..
+                }
+            ),
+            "{again:?}"
+        );
+        // The rest fills: the order is done, nothing more is sent.
+        let mut rest = update(&post_key(&fx), "2002", ExecStatus::Filled, 2, 2, 284.0);
+        rest.is_market = true;
+        rest.sell = true;
+        os.apply(&rest, 3500);
+        assert_eq!(os.get(42).unwrap().status, status::SELL_DONE);
+        assert!(os.watch(&model, 9000).actions.is_empty());
+    }
+
     #[test]
     fn independent_foreign_exits_preserve_each_fill_and_remaining_position() {
         for reverse in [false, true] {
