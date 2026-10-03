@@ -185,6 +185,53 @@ impl Rest {
         self.get("/fapi/v1/exchangeInfo", &[])
     }
 
+    /// Whether [`Self::leverage_oi_remaining`] has a source on this network.
+    pub fn has_open_interest_feed(&self) -> bool {
+        self.network == Network::Mainnet
+    }
+
+    /// The site's own public read of what is left of the open interest at each leverage of one
+    /// symbol (`/bapi/futures/v1/public/future/common/symbol/leverageoi/remaining`): the number
+    /// behind «Remaining openable notional value» in its leverage dialog, which the signed API
+    /// does not carry (NEAR at 50x: `maxNotional` 1 000 000 there, 0 on the site). Not the
+    /// exchange's API: another host, outside the weight meter, and no testnet counterpart (an
+    /// empty answer). Ascending (leverage, remaining USDT); empty when the site knows no figures.
+    pub fn leverage_oi_remaining(&mut self, symbol: &str) -> Result<Vec<(i32, f64)>, Error> {
+        if self.network != Network::Mainnet {
+            return Ok(Vec::new());
+        }
+        // A symbol goes into the query as it is: only what exchangeInfo spells like one does
+        // (`B-MONEYUSDT` has a hyphen).
+        if symbol.is_empty()
+            || !symbol
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(Error::Decode(format!("leverageoi: odd symbol {symbol:?}")));
+        }
+        let url = format!(
+            "https://www.asterdex.com/bapi/futures/v1/public/future/common/symbol/leverageoi/remaining?symbol={symbol}"
+        );
+        let resp = self
+            .agent
+            .get(&url)
+            .header("Accept", "application/json")
+            .call()?;
+        // The agent hands back any status as an answer: a 429 or a WAF page is not a figure.
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(Error::Transport(format!(
+                "leverageoi {symbol}: HTTP {status}"
+            )));
+        }
+        let text = resp
+            .into_body()
+            .read_to_string()
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        super::json::parse_leverage_oi(&text)
+            .map_err(|e| Error::Decode(format!("leverageoi {symbol}: {e}")))
+    }
+
     /// `GET /fapi/v1/ticker/24hr` for every symbol at once.
     ///
     /// One call carries the 24-hour USDT turnover of the whole catalog, which is

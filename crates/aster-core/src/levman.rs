@@ -27,13 +27,13 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use moonproto::server::codec::ui;
 use moonproto::LevManage;
 
 use crate::aster::json::{PositionRisk, SymbolBrackets};
-use crate::aster::rest::Rest;
+use crate::aster::rest::{self, Rest};
 use crate::aster::sign::Signer;
 use crate::model::Catalog;
 use crate::setup::{self, Want};
@@ -214,7 +214,13 @@ impl Config {
     }
 
     /// What is wanted of one market, given its brackets (`None` brackets: no leverage wanted).
-    pub fn want(&self, symbol: &str, base: &str, brackets: Option<&SymbolBrackets>) -> Want {
+    pub fn want(
+        &self,
+        symbol: &str,
+        base: &str,
+        brackets: Option<&SymbolBrackets>,
+        oi: Option<&[(i32, f64)]>,
+    ) -> Want {
         let mut want = Want {
             margin: self.margin(),
             ..Want::default()
@@ -229,10 +235,14 @@ impl Config {
         };
         let by_limit = brackets
             .filter(|_| limit > 0)
-            .and_then(|b| b.leverage_for_limit(limit as f64));
+            .and_then(|b| b.leverage_for_limit_within(limit as f64, oi.unwrap_or(&[])));
         if by_limit.is_some() {
             want.leverage = by_limit;
-            want.raise = self.auto_lev_up;
+            // `oi`: `None` is a network without the site's figures (the table rules); `Some`
+            // and empty is a market whose figures were wanted and are missing (a failed read, an
+            // unknown symbol): the table may be wrong in either direction, so it lowers a
+            // leverage and does not raise one.
+            want.raise = self.auto_lev_up && oi.is_none_or(|o| !o.is_empty());
         } else if self.auto_fix_lev && self.fix_lev > 0 {
             want.leverage = Some(self.fix_lev.min(max));
             want.raise = true;
@@ -292,6 +302,15 @@ pub enum Msg {
 /// closed: a leverage change on a live position is not known to be refused on Aster (only
 /// Binance's margin refusals are assumed, `setup.rs`).
 const CHUNK: usize = 60;
+/// Between two reads of the site's open interest: ~5 a second, one host, no weight.
+const OI_PACE: Duration = Duration::from_millis(200);
+/// How long the site's figures of a symbol are reused.
+const OI_TTL: Duration = Duration::from_secs(600);
+/// Failed reads in a row after which the pass stops asking the site.
+const OI_GIVE_UP: u32 = 3;
+/// A `429` on the clock read is waited out this many times, this long each.
+const CLOCK_WAITS: u32 = 3;
+const CLOCK_WAIT: Duration = Duration::from_secs(20);
 
 /// Starts the worker. With `initial` (the settings of the previous run) the first pass is made
 /// at once, as MoonBot checks at a restart. The sender is the engine's; dropping it ends the
@@ -303,6 +322,9 @@ pub fn start(rest: Rest, signer: Signer, initial: Option<Config>, status: Shared
         signer,
         config: initial,
         status,
+        oi_down: false,
+        oi_failures: 0,
+        oi_cache: HashMap::new(),
     };
     thread::Builder::new()
         .name("aster-levman".into())
@@ -356,6 +378,13 @@ struct Worker {
     signer: Signer,
     config: Option<Config>,
     status: Shared,
+    /// The site's open-interest read failed in this pass: the rest of it goes by the table.
+    oi_down: bool,
+    /// Site reads that failed in a row, after their retry.
+    oi_failures: u32,
+    /// The site's figures by symbol and when they were read: a second pass minutes after the
+    /// first (an Apply) does not read them all again.
+    oi_cache: HashMap<String, (Instant, Vec<(i32, f64)>)>,
 }
 
 impl Worker {
@@ -375,6 +404,8 @@ impl Worker {
             });
             return None;
         };
+        self.oi_down = false;
+        self.oi_failures = 0;
         let mut last = Last {
             running: true,
             at_ms: crate::engine::now_ms(),
@@ -477,6 +508,37 @@ impl Worker {
             .collect();
     }
 
+    /// The clock measured again; a `429` (the IP's weight, mostly the core's own warm-up after a
+    /// restart) is waited out [`CLOCK_WAITS`] times instead of ending the pass. A ban (`418`) is not.
+    fn sync_clock(&mut self) -> Result<i64, rest::Error> {
+        for waited in 0..=CLOCK_WAITS {
+            match self.rest.sync_clock() {
+                Err(rest::Error::Api { status: 429, .. }) if waited < CLOCK_WAITS => {
+                    log::info!(
+                        "leverage: the exchange says 429, waiting {} s",
+                        CLOCK_WAIT.as_secs()
+                    );
+                    thread::sleep(CLOCK_WAIT);
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the last round returns")
+    }
+
+    /// One symbol's figures from the site, [`OI_PACE`] after the last call; a transport failure
+    /// is tried once more after a second.
+    fn read_oi(&mut self, symbol: &str) -> Result<Vec<(i32, f64)>, rest::Error> {
+        thread::sleep(OI_PACE);
+        match self.rest.leverage_oi_remaining(symbol) {
+            Err(rest::Error::Transport(_)) => {
+                thread::sleep(Duration::from_secs(1));
+                self.rest.leverage_oi_remaining(symbol)
+            }
+            other => other,
+        }
+    }
+
     fn publish(&self, last: Last) {
         *self.status.lock().unwrap_or_else(PoisonError::into_inner) = last;
     }
@@ -487,7 +549,7 @@ impl Worker {
         &mut self,
     ) -> Result<(Vec<(String, String)>, HashMap<String, SymbolBrackets>), String> {
         let err = |what: &'static str| move |e| format!("{what}: {e}");
-        self.rest.sync_clock().map_err(err("clock"))?;
+        self.sync_clock().map_err(err("clock"))?;
         let info = self.rest.exchange_info().map_err(err("exchangeInfo"))?;
         let catalog = Catalog::build(&info);
         let mut markets: Vec<(String, String)> = catalog
@@ -519,7 +581,50 @@ impl Worker {
     ) -> Result<Vec<setup::Plan>, String> {
         let err = |what: &'static str| move |e| format!("{what}: {e}");
         // The clock is measured again for every chunk: a pass is minutes of writes.
-        self.rest.sync_clock().map_err(err("clock"))?;
+        self.sync_clock().map_err(err("clock"))?;
+        // What the site says is left of the open interest at each leverage, for the markets the
+        // limit manages (read before the account, so the snapshot `plan_for` decides on is not older
+        // than the paced reads): the table alone puts NEAR on 50x where the site allows an order of 0.
+        let feed = self.rest.has_open_interest_feed();
+        let managed =
+            |symbol: &str, base: &str| config.auto_max_order && config.limits.of(symbol, base) > 0;
+        let mut oi: HashMap<&str, Vec<(i32, f64)>> = HashMap::new();
+        for (symbol, base) in chunk {
+            if self.oi_down || !feed || !managed(symbol, base) {
+                continue;
+            }
+            if let Some((at, figures)) = self.oi_cache.get(symbol.as_str()) {
+                if at.elapsed() < OI_TTL {
+                    oi.insert(symbol.as_str(), figures.clone());
+                    continue;
+                }
+            }
+            match self.read_oi(symbol) {
+                Ok(figures) => {
+                    self.oi_failures = 0;
+                    self.oi_cache
+                        .insert(symbol.clone(), (Instant::now(), figures.clone()));
+                    oi.insert(symbol.as_str(), figures);
+                }
+                // One answer that does not read: that market gets no figures, so it is not raised.
+                Err(e @ rest::Error::Decode(_)) => {
+                    log::warn!("leverage: {symbol}: open interest by leverage not read ({e})");
+                }
+                // The site does not answer: a few in a row and the rest of the pass does not ask
+                // again; the markets without figures are lowered by the table but not raised.
+                Err(e) => {
+                    self.oi_failures += 1;
+                    log::warn!(
+                        "leverage: {symbol}: open interest by leverage not read ({e}), {} in a row",
+                        self.oi_failures
+                    );
+                    if self.oi_failures >= OI_GIVE_UP {
+                        log::warn!("leverage: the rest of the pass raises nothing");
+                        self.oi_down = true;
+                    }
+                }
+            }
+        }
         let wanted: HashSet<&str> = chunk.iter().map(|(s, _)| s.as_str()).collect();
         let rows = self
             .rest
@@ -542,7 +647,14 @@ impl Worker {
         Ok(chunk
             .iter()
             .map(|(symbol, base)| {
-                let want = config.want(symbol, base, brackets.get(symbol));
+                let site = oi.get(symbol.as_str()).map(Vec::as_slice);
+                let wanted = managed(symbol, base) && feed;
+                let want = config.want(
+                    symbol,
+                    base,
+                    brackets.get(symbol),
+                    wanted.then(|| site.unwrap_or(&[])),
+                );
                 let row = by_symbol.get(symbol.as_str()).copied();
                 let mut plan =
                     setup::plan_for(symbol, row, &want, ordered.contains(symbol.as_str()));
@@ -644,14 +756,14 @@ mod tests {
         let mut c = cfg("20000 def");
         c.auto_fix_lev = true;
         c.fix_lev = 10;
-        let w = c.want("BTCUSDT", "BTC", Some(&b));
+        let w = c.want("BTCUSDT", "BTC", Some(&b), None);
         assert_eq!((w.leverage, w.raise), (Some(50), true));
         c.limits = Limits::parse("0 def");
-        let w = c.want("BTCUSDT", "BTC", Some(&b));
+        let w = c.want("BTCUSDT", "BTC", Some(&b), None);
         assert_eq!((w.leverage, w.raise), (Some(10), true));
         // The fixed leverage is clamped to what the brackets allow.
         c.fix_lev = 500;
-        assert_eq!(c.want("BTCUSDT", "BTC", Some(&b)).leverage, Some(125));
+        assert_eq!(c.want("BTCUSDT", "BTC", Some(&b), None).leverage, Some(125));
     }
 
     #[test]
@@ -673,14 +785,14 @@ mod tests {
         let b = brackets(&[(125, 10_000.0), (50, 50_000.0)]);
         let mut c = cfg("200 def");
         c.auto_lev_up = false;
-        let w = c.want("BTCUSDT", "BTC", Some(&b));
+        let w = c.want("BTCUSDT", "BTC", Some(&b), None);
         assert_eq!((w.leverage, w.raise), (Some(125), false));
         assert!(!cfg("0 def").is_active());
         assert!(cfg("1k def").is_active());
         let mut off = cfg("1k def");
         off.auto_max_order = false;
         assert!(!off.is_active(), "the box is the switch");
-        assert_eq!(off.want("BTCUSDT", "BTC", Some(&b)).leverage, None);
+        assert_eq!(off.want("BTCUSDT", "BTC", Some(&b), None).leverage, None);
     }
 
     #[test]
@@ -698,12 +810,15 @@ mod tests {
     fn a_market_without_brackets_keeps_its_leverage_and_its_margin_wish() {
         let mut c = cfg("200 def");
         c.auto_isolated = true;
-        let w = c.want("NEWUSDT", "NEW", None);
+        let w = c.want("NEWUSDT", "NEW", None, None);
         assert_eq!((w.leverage, w.margin), (None, Some(setup::ISOLATED)));
         // Brackets that state no cap name no leverage for a limit: the fixed one stands in.
         let uncapped = brackets(&[(125, 0.0), (50, 0.0)]);
         c.auto_fix_lev = true;
         c.fix_lev = 20;
-        assert_eq!(c.want("BTCUSDT", "BTC", Some(&uncapped)).leverage, Some(20));
+        assert_eq!(
+            c.want("BTCUSDT", "BTC", Some(&uncapped), None).leverage,
+            Some(20)
+        );
     }
 }

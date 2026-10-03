@@ -585,6 +585,49 @@ fn leverage_of<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error>
     .filter(|&l| l > 0))
 }
 
+/// The remaining open interest at `leverage`: the value at the smallest key not below it, or the
+/// last key's when it is above them all. `oi` is not empty.
+fn remaining_at(oi: &[(i32, f64)], leverage: i32) -> f64 {
+    oi.iter()
+        .find(|(k, _)| *k >= leverage)
+        .or_else(|| oi.last())
+        .map_or(0.0, |(_, v)| *v)
+}
+
+/// The site's `.../symbol/leverageoi/remaining` answer for one symbol, `{"code":"000000",
+/// "data":{"leverageOiRemainingMap":{"10":"3734518.49","20":"0"}}}`, as (leverage, remaining USDT)
+/// ascending. A symbol the site does not know has an empty map: no figures, not an error.
+pub fn parse_leverage_oi(text: &str) -> Result<Vec<(i32, f64)>, String> {
+    #[derive(Deserialize)]
+    struct Reply {
+        code: String,
+        data: Option<Data>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        #[serde(default, rename = "leverageOiRemainingMap")]
+        map: std::collections::HashMap<String, String>,
+    }
+    let reply: Reply = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if reply.code != "000000" {
+        return Err(format!("code {}", reply.code));
+    }
+    let data = reply.data.ok_or("no data")?;
+    let mut out = Vec::with_capacity(data.map.len());
+    for (k, v) in data.map {
+        let lev: i32 = k
+            .trim()
+            .parse()
+            .map_err(|_| format!("leverage key {k:?}"))?;
+        let rest: f64 = v.trim().parse().map_err(|_| format!("remaining {v:?}"))?;
+        if lev > 0 && rest.is_finite() {
+            out.push((lev, rest.max(0.0)));
+        }
+    }
+    out.sort_by_key(|(l, _)| *l);
+    Ok(out)
+}
+
 /// `POST /fapi/v3/leverage`: `{"leverage": 21, "maxNotionalValue": "1000000", "symbol": "BTCUSDT"}`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LeverageSet {
@@ -646,6 +689,38 @@ impl SymbolBrackets {
         out.sort_unstable_by(|a, b| b.cmp(a));
         out.dedup();
         out
+    }
+
+    /// [`Self::leverage_for_limit`] checked against the exchange's remaining open interest per
+    /// leverage (`oi`, ascending: see [`parse_leverage_oi`]): the table promises 1 000 000 $ at
+    /// NEAR's 50x while the site allows 0. A leverage holds the limit when its bracket's cap and
+    /// its remaining open interest both do; the leverage between two keys of `oi` is read at the
+    /// next key up, as the site reads it. No `oi` is the table alone.
+    pub fn leverage_for_limit_within(&self, limit: f64, oi: &[(i32, f64)]) -> Option<i32> {
+        let some_cap_holds = self.brackets.iter().any(|b| b.notional_cap >= limit);
+        if oi.is_empty() || !some_cap_holds {
+            return self.leverage_for_limit(limit);
+        }
+        let holds = |lev: i32| remaining_at(oi, lev) >= limit;
+        self.brackets
+            .iter()
+            .filter(|b| b.initial_leverage > 0 && b.notional_cap >= limit && b.notional_cap > 0.0)
+            .map(|b| b.initial_leverage)
+            .filter(|&l| holds(l))
+            .max()
+            .or_else(|| {
+                // No leverage holds the limit: the table's top would be the one the site shows
+                // as 0. The most room there is, the lower leverage on a tie.
+                self.brackets
+                    .iter()
+                    .map(|b| b.initial_leverage)
+                    .filter(|&l| l > 0)
+                    .max_by(|&a, &b| {
+                        remaining_at(oi, a)
+                            .total_cmp(&remaining_at(oi, b))
+                            .then(b.cmp(&a))
+                    })
+            })
     }
 
     /// The highest leverage that still holds a position of `limit` USDT: a bracket's leverage
@@ -1220,6 +1295,69 @@ mod stream_tests {
             "the highest, whatever the order"
         );
         assert_eq!(b[1].max_leverage(), None);
+    }
+
+    #[test]
+    fn the_site_remaining_open_interest_caps_the_leverage_the_table_allows() {
+        let near = parse_leverage_oi(
+            r#"{"code":"000000","data":{"symbol":"NEARUSDT","leverageOiRemainingMap":
+               {"50":"0","1":"992997924.1","10":"3734518.49","20":"0","5":"13495184.6"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            near.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            [1, 5, 10, 20, 50]
+        );
+        let b: SymbolBrackets = serde_json::from_str(
+            r#"{"symbol":"NEARUSDT","brackets":[
+               {"initialLeverage":50,"notionalCap":1000000},{"initialLeverage":20,"notionalCap":5000000},
+               {"initialLeverage":10,"notionalCap":10000000},{"initialLeverage":5,"notionalCap":20000000}]}"#,
+        )
+        .unwrap();
+        assert_eq!(b.leverage_for_limit(200.0), Some(50), "the table alone");
+        assert_eq!(b.leverage_for_limit_within(200.0, &near), Some(10));
+        assert_eq!(b.leverage_for_limit_within(5_000_000.0, &near), Some(5));
+        assert_eq!(
+            b.leverage_for_limit_within(200.0, &[]),
+            Some(50),
+            "no figures: the table"
+        );
+        assert_eq!(remaining_at(&near, 11), 0.0, "11x is read at the 20x key");
+        assert_eq!(remaining_at(&near, 7), 3734518.49);
+        assert!(parse_leverage_oi(r#"{"code":"100001001","data":null}"#).is_err());
+        assert!(
+            parse_leverage_oi(r#"{"code":"000000","data":{"leverageOiRemainingMap":{}}}"#)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn when_nothing_holds_the_limit_the_most_room_is_taken_and_a_limit_above_every_cap_keeps_the_table(
+    ) {
+        let b: SymbolBrackets = serde_json::from_str(
+            r#"{"symbol":"X","brackets":[{"initialLeverage":50,"notionalCap":1000000},
+               {"initialLeverage":10,"notionalCap":5000000}]}"#,
+        )
+        .unwrap();
+        let none_holds = [(10, 100.0), (50, 0.0)];
+        assert_eq!(
+            b.leverage_for_limit_within(200.0, &none_holds),
+            Some(10),
+            "most room"
+        );
+        let all_zero = [(10, 0.0), (50, 0.0)];
+        assert_eq!(
+            b.leverage_for_limit_within(200.0, &all_zero),
+            Some(10),
+            "a tie: the lower"
+        );
+        let above = [(10, 1e9), (50, 1e9)];
+        assert_eq!(
+            b.leverage_for_limit_within(9e6, &above),
+            b.leverage_for_limit(9e6),
+            "above every cap: the table's rule"
+        );
     }
 
     #[test]
