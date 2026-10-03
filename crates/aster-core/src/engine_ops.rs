@@ -586,6 +586,7 @@ impl CoreHandler {
                     lo: finite(Some(c.lo)),
                     hi: finite(Some(c.hi)),
                     turnover: c.turnover(),
+                    leverage: c.leverage(),
                 })
                 .collect(),
             markets,

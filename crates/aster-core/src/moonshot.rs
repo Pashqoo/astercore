@@ -909,6 +909,8 @@ enum Gate {
     Delta { what: &'static str, hundredths: i64 },
     /// Filters / Volume: `what` turnover of turnover is outside its range.
     Volume { what: &'static str, turnover: i64 },
+    /// Filters / Base: the market's leverage is outside `MinLeverage..MaxLeverage`.
+    Leverage { leverage: i32 },
     /// `GlobalFilterPenalty` after a failed BTC / market filter, until `until`.
     FilterPenalty { until: i64 },
     /// `PenaltyTime`: 3 losing trades in a row (or a manual order, `manual`)
@@ -951,6 +953,7 @@ impl Gate {
             Self::Filter { .. }
                 | Self::Delta { .. }
                 | Self::Volume { .. }
+                | Self::Leverage { .. }
                 | Self::FilterPenalty { .. }
         )
     }
@@ -988,6 +991,9 @@ impl Gate {
                 format!("{what} {:.2}% is out of range", hundredths as f64 / 100.0)
             }
             Self::Volume { what, turnover } => format!("{what} {turnover} USDT is out of range"),
+            Self::Leverage { leverage } => {
+                format!("Leverage {leverage}x of {market} is out of range")
+            }
             Self::FilterPenalty { until } => format!(
                 "GlobalFilterPenalty: {} sec. left",
                 (until - now).max(0) / 1000
@@ -3310,6 +3316,8 @@ pub enum Metric {
     /// Signed % of the price at the start of a `minutes` window
     /// (`Windows::delta`).
     Delta(i64),
+    /// The market's highest leverage ([`Market::max_leverage`]).
+    Leverage,
     /// The hourly delta of `BTCUSDT`, in %.
     BtcDelta,
     /// The traded markets' mean hourly delta, in % ([`market_delta`]).
@@ -3356,9 +3364,14 @@ impl Check {
     pub fn turnover(&self) -> bool {
         match self.metric {
             Metric::Vol24 | Metric::Turnover(_) => true,
-            Metric::Delta(_) | Metric::BtcDelta | Metric::MarketDelta => false,
+            Metric::Delta(_) | Metric::Leverage | Metric::BtcDelta | Metric::MarketDelta => false,
             Metric::Key(k) => k.turnover(),
         }
+    }
+
+    /// A leverage in `x`, which is neither of the other two readings.
+    pub fn leverage(&self) -> bool {
+        matches!(self.metric, Metric::Leverage)
     }
 
     /// The market's value for this check. `Ok(None)` = not measurable yet —
@@ -3374,6 +3387,13 @@ impl Check {
             // zero turnover, the same reading the screener's keys take.
             Metric::Vol24 => Some(cx.win.vol24(idx, cx.now)),
             Metric::Turnover(minutes) => Some(cx.win.turnover(idx, cx.now, minutes)),
+            // A market's leverage is known from the catalog; an index outside it
+            // reads 0, which a `MinLeverage` refuses and no `MaxLeverage` does.
+            Metric::Leverage => Some(
+                cx.model
+                    .at(idx)
+                    .map_or(0.0, |m| f64::from(m.max_leverage())),
+            ),
             Metric::Delta(minutes) => cx
                 .win
                 .covers(idx, cx.now, minutes)
@@ -3408,7 +3428,11 @@ impl Check {
 
     /// The gate for a value outside the corridor, in the metric's own unit.
     fn refuse(&self, v: f64) -> Gate {
-        if self.turnover() {
+        if self.leverage() {
+            Gate::Leverage {
+                leverage: v.round() as i32,
+            }
+        } else if self.turnover() {
             Gate::Volume {
                 what: self.what,
                 turnover: v.round() as i64,
@@ -3426,8 +3450,8 @@ impl Check {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeltaFilters {
     /// In the order they are asked, which is the order they are declared in
-    /// [`DeltaFilters::read`]: the volume bounds, the market's own deltas,
-    /// BTC and the market, `FilterBy`. The order decides the log line, because the
+    /// [`DeltaFilters::read`]: the volume bounds, the leverage corridor, the
+    /// market's own deltas, BTC and the market, `FilterBy`. The order decides the log line, because the
     /// FIRST check a market fails is the reason it gets no entry — so the
     /// coarsest question ("is this market traded at all") comes before the
     /// finest ("is its two-hour move inside the corridor").
@@ -3443,8 +3467,8 @@ impl DeltaFilters {
         text: &dyn Fn(&str) -> String,
         flag: &dyn Fn(&str) -> bool,
     ) -> Option<Self> {
-        // `IgnoreFilters` is the whole tab; `IgnoreVolume` and `IgnoreDelta`
-        // are its two halves, as in MoonBot. They used to share one `if`, so
+        // `IgnoreFilters` is the whole tab; `IgnoreVolume`, `IgnoreBase` (the
+        // leverage corridor only) and `IgnoreDelta` are its boxes, as in MoonBot. They used to share one `if`, so
         // switching the deltas off switched the volume bounds off with them —
         // which nobody asked for and nothing said.
         if flag("IgnoreFilters") {
@@ -3493,6 +3517,25 @@ impl DeltaFilters {
                         hi,
                     });
                 }
+            }
+        }
+        // Filters / Base: the market's leverage. `MinLeverage` 1 is MoonBot's
+        // default and means every market (a leverage is never under 1), and
+        // `MaxLeverage` 0 is «not limited», so neither default makes a check.
+        // The figure is the account's own highest leverage once the brackets
+        // have been read, the instrument's ceiling before (and without an
+        // account), which is what the terminal shows for the market too — so a
+        // market can change sides when the brackets land, and, as for every
+        // filter, a standing entry is not withdrawn for it (`Gate::withdraws`).
+        if !flag("IgnoreBase") {
+            let (lo, hi) = (num("MinLeverage"), num("MaxLeverage"));
+            if lo.is_finite() && hi.is_finite() && (lo > 1.0 || hi > 0.0) {
+                checks.push(Check {
+                    what: "Leverage",
+                    metric: Metric::Leverage,
+                    lo: if lo > 1.0 { lo } else { f64::NEG_INFINITY },
+                    hi: if hi > 0.0 { hi } else { f64::INFINITY },
+                });
             }
         }
         // Filters / Delta, `FilterBy` included: it lives in the same box of
@@ -7688,6 +7731,44 @@ mod tests {
         assert_eq!(judged[2], Judged::Waiting);
         // A market with no turnover at all reads an honest zero, never a wait.
         assert!(matches!(f.judge_all(3, &cx)[0], Judged::Refused(v) if v == 0.0));
+    }
+
+    /// MoonBot's `MinLeverage` / `MaxLeverage` (Filters / Base): a market whose
+    /// leverage is outside the corridor is refused, the defaults (1 and 0) and
+    /// `IgnoreBase` / `IgnoreFilters` make no check at all.
+    #[test]
+    fn leverage_corridor_refuses_markets_outside_it() {
+        use FieldValue::{Bool, Int32};
+        let mut model = model();
+        model.at_mut(1).unwrap().bracket_leverage = Some(50);
+        model.at_mut(2).unwrap().bracket_leverage = Some(10);
+        let win = Windows::default();
+        let cx = Ctx::new(&model, &win, 9_000_000_000, None);
+        let checks = |fields: &[(&str, FieldValue)]| {
+            let st = strategies(fields, true);
+            Params::from_snapshot(&st.list()[0], st.schema()).deltas
+        };
+        assert!(checks(&[]).is_none(), "the defaults filter nothing");
+        let min20 = checks(&[("MinLeverage", Int32(20))]).expect("a floor is a check");
+        assert_eq!(min20.checks.len(), 1);
+        assert!(min20.refused(1, &cx).is_none(), "50x clears a floor of 20");
+        let (gate, i, global) = min20.refused(2, &cx).expect("10x is under 20");
+        assert_eq!(
+            (gate, i, global),
+            (Gate::Leverage { leverage: 10 }, Some(0), false)
+        );
+        assert!(!gate.withdraws());
+        let max30 = checks(&[("MaxLeverage", Int32(30))]).expect("a ceiling is a check");
+        assert!(matches!(
+            max30.refused(1, &cx),
+            Some((Gate::Leverage { leverage: 50 }, _, _))
+        ));
+        assert!(
+            max30.refused(2, &cx).is_none(),
+            "0 is no ceiling, 10x is under 30"
+        );
+        assert!(checks(&[("MinLeverage", Int32(20)), ("IgnoreBase", Bool(true))]).is_none());
+        assert!(checks(&[("MinLeverage", Int32(20)), ("IgnoreFilters", Bool(true))]).is_none());
     }
 
     #[test]

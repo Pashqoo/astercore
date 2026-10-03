@@ -582,6 +582,8 @@ pub struct ScreenCheck {
     pub hi: Option<f64>,
     /// USDT of turnover, against a signed per cent.
     pub turnover: bool,
+    /// A leverage in `x` (neither of the two).
+    pub leverage: bool,
 }
 
 /// One market of the catalog under these settings.

@@ -1342,16 +1342,16 @@ function money(v) {
   return v.toFixed(0);
 }
 
-function cell(v, usdt) {
+function cell(v, usdt, lev) {
   if (v === null || v === undefined) return '—';
-  return usdt ? money(v) : pct(v);
+  return lev ? v + 'x' : usdt ? money(v) : pct(v);
 }
 
 /* A corridor with the sides it actually has: an open one is null from the
    core, and «0» would read as a bound at zero. */
 function corridor(c) {
-  const lo = c.lo === null ? '−∞' : cell(c.lo, c.turnover);
-  const hi = c.hi === null ? '+∞' : cell(c.hi, c.turnover);
+  const lo = c.lo === null ? '−∞' : cell(c.lo, c.turnover, c.leverage);
+  const hi = c.hi === null ? '+∞' : cell(c.hi, c.turnover, c.leverage);
   return lo + ' … ' + hi;
 }
 
@@ -1523,7 +1523,7 @@ function drawScreen() {
   $('scr_more').hidden = shown.length >= rows.length;
 
   const head = ['market', 'class', 'seat', 'rank', s.sort_by || 'key']
-    .concat(s.checks.map((c) => c.what + (c.turnover ? ', USDT' : ', %') + '<br><span class="note">'
+    .concat(s.checks.map((c) => c.what + (c.leverage ? ', x' : c.turnover ? ', USDT' : ', %') + '<br><span class="note">'
       + esc(corridor(c)) + '</span>'));
   const body = shown.map((m) => {
     const cls = m.entered ? 'enters' : m.seat === 'pool' ? 'held' : 'out';
@@ -1534,7 +1534,7 @@ function drawScreen() {
     m.values.forEach((v, i) => {
       const st = m.states[i];
       const klass = st === 'r' || st === 'b' ? ' class="refused"' : st === 'w' ? ' class="waits"' : '';
-      tds.push('<td' + klass + '>' + (st === 'b' ? 'cannot ask' : st === 'w' ? 'waiting' : cell(v, s.checks[i].turnover)) + '</td>');
+      tds.push('<td' + klass + '>' + (st === 'b' ? 'cannot ask' : st === 'w' ? 'waiting' : cell(v, s.checks[i].turnover, s.checks[i].leverage)) + '</td>');
     });
     return '<tr class="' + cls + '">' + tds.join('') + '</tr>';
   });

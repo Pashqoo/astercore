@@ -74,6 +74,10 @@ pub const SCREEN_FIELDS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "Filters / Base",
+        &["IgnoreBase", "MinLeverage", "MaxLeverage"],
+    ),
+    (
         "Filters / Delta",
         &[
             "IgnoreDelta",
@@ -251,6 +255,18 @@ fn schema_fields() -> Vec<SchemaField> {
         f("MaxVolume", Double(0.0), ui::EDIT, None),
         f("MinHourlyVolume", Double(0.0), ui::EDIT, None),
         f("MaxHourlyVolume", Double(0.0), ui::EDIT, None),
+        // MoonBot's Filters / Base, the part this core reads: the market's
+        // leverage corridor. `MinLeverage` 1 and `MaxLeverage` 0 (no limit) are
+        // MoonBot's defaults and filter nothing. The box's other fields
+        // (`BinanceTokenTags`, `MarkPriceMin`, …) are not read here.
+        f(
+            "IgnoreBase",
+            Bool(false),
+            ui::CHECKBOX,
+            Some("Filters / Base"),
+        ),
+        f("MinLeverage", Int32(1), ui::EDIT, None),
+        f("MaxLeverage", Int32(0), ui::EDIT, None),
         // MoonBot's dynamic lists, and with the volume bounds gone from the
         // screener they ARE the pool of a class strategy: sort the class by
         // one key and keep the first `DynWL_Count` markets, take
