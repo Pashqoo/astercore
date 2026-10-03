@@ -722,8 +722,9 @@ fn unary_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
                 // waited out after the answer is sent, as the books' worker does. The weight is
                 // read only from an answer: a failed call leaves the figure of an earlier one.
                 match &result {
-                    Err(rest::Error::Api { status: 418, .. }) => {
-                        banned_until = Some(Instant::now() + HISTORY_BAN_PAUSE);
+                    Err(e @ rest::Error::Api { status: 418, .. }) => {
+                        let wait = e.retry_after().unwrap_or_default().max(HISTORY_BAN_PAUSE);
+                        banned_until = Some(Instant::now() + wait);
                     }
                     Err(rest::Error::Api { status: 429, .. }) => pause = true,
                     Ok(_) => {
@@ -809,7 +810,8 @@ fn depth_worker(rx: Receiver<FeedCommand>, tx: Sender<FeedEvent>) {
                     log::warn!("book {symbol}: snapshot failed: {e}");
                     match e {
                         rest::Error::Api { status: 418, .. } => {
-                            banned_until = Some(Instant::now() + BAN_PAUSE);
+                            let wait = e.retry_after().unwrap_or_default().max(BAN_PAUSE);
+                            banned_until = Some(Instant::now() + wait);
                         }
                         rest::Error::Api { status: 429, .. } => pause = true,
                         _ => {}

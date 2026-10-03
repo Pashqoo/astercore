@@ -39,21 +39,53 @@ use crate::windows::Windows;
 
 /// The market whose moves drive `MShotAddBTC*Delta` and `Delta_BTC_*`.
 pub const BTC_SYMBOL: &str = "BTCUSDT";
-/// No entries on a market this long after one was refused (-2019…). (-4140/-4141 are not a
-/// cooldown: the market is closed to entries for `CLOSED_MARKET_MS`, `engine.rs`.)
+/// No entries of a strategy on a market this long after one was refused. (-4140/-4141 are not
+/// a cooldown: the market is closed to entries for `CLOSED_MARKET_MS`, `engine.rs`.) A refusal
+/// that repeats until someone changes something — precision, the minimum notional, leverage —
+/// is asked again a minute on.
 const REJECT_COOLDOWN_MS: i64 = 60_000;
-/// No entries anywhere this long after the exchange's rate limit answer.
+/// The same after a refusal for margin (`-2019`, `-2018`, `-4051`): on Aster margin is free
+/// again the moment an order is cancelled or filled, and MoonBot tries again in ~5.6 s (its
+/// 12.09 log). Until 03.10 it was the minute above, TInvestCore's, for T-Invest's error budget.
+const MARGIN_COOLDOWN_MS: i64 = 10_000;
+
+/// How long a refused entry keeps its strategy off the market ([`REJECT_COOLDOWN_MS`],
+/// [`MARGIN_COOLDOWN_MS`]).
+fn reject_cooldown_ms(msg: &str) -> i64 {
+    use crate::aster::rest::msg_has_code;
+    if [-2019, -2018, -4051].iter().any(|&c| msg_has_code(msg, c)) {
+        MARGIN_COOLDOWN_MS
+    } else {
+        REJECT_COOLDOWN_MS
+    }
+}
+/// Entry halts after a rate refusal that names no `Retry-After`: a ban (418) is two minutes at
+/// least (API docs, «IP Limits»), `-1015` is the `ORDERS` 300 / 10 s window, a 429 or `-1003`
+/// the `REQUEST_WEIGHT` minute.
+const BAN_HALT_MS: i64 = 120_000;
+const ORDER_BURST_HALT_MS: i64 = 10_000;
 const RATE_HALT_MS: i64 = 60_000;
 
-/// The exchange refused a call for its rate: HTTP 429 or 418,
-/// `-1003 TOO_MANY_REQUESTS` or `-1015` (too many new orders) —
-/// `rest::Error` reads `api {status}/{code}: …`.
+/// How long the exchange's rate refusal halts entries: its `Retry-After` when the answer named
+/// one, else by the refusal — HTTP 418, `-1015` (too many new orders), HTTP 429 or `-1003
+/// TOO_MANY_REQUESTS`. `None`: not a rate refusal. `rest::Error` reads `api {status}/{code}: …`.
+pub fn rate_halt_ms(msg: &str) -> Option<i64> {
+    use crate::aster::rest::{msg_has_code, msg_has_status, msg_retry_after_ms};
+    let fallback = if msg_has_status(msg, 418) {
+        BAN_HALT_MS
+    } else if msg_has_code(msg, -1015) {
+        ORDER_BURST_HALT_MS
+    } else if msg_has_status(msg, 429) || msg_has_code(msg, -1003) {
+        RATE_HALT_MS
+    } else {
+        return None;
+    };
+    Some(msg_retry_after_ms(msg).map_or(fallback, |ms| ms.max(1_000)))
+}
+
+/// The exchange refused a call for its rate ([`rate_halt_ms`]).
 pub fn rate_limited(msg: &str) -> bool {
-    use crate::aster::rest::{msg_has_code, msg_has_status};
-    msg_has_status(msg, 429)
-        || msg_has_status(msg, 418)
-        || msg_has_code(msg, -1003)
-        || msg_has_code(msg, -1015)
+    rate_halt_ms(msg).is_some()
 }
 const CANCEL_RETRY_MS: i64 = 5_000;
 /// After a restart, entries restored on a market wait this long for its
@@ -726,6 +758,9 @@ pub struct MoonShot {
     /// A manual order's loss penalizes no strategy, and one strategy's loss
     /// neither holds nor takes off another's entries.
     loss_at: HashMap<(u64, u16), i64>,
+    /// Refused orders: when, and how long the refusal keeps the strategy off
+    /// the market (`reject_cooldown_ms`). Kept no longer than the longest.
+    refusals: HashMap<u64, (i64, i64)>,
     /// `CheckFreeBalance` / `MinFreeBalance` budget.
     funds: Funds,
     /// The auto-start tab's work window (`set_work_window`).
@@ -1287,6 +1322,8 @@ impl MoonShot {
             })
             .collect();
         self.memo.retain(|id, _| live.contains(id));
+        self.refusals
+            .retain(|_, &mut (at, _)| now - at < REJECT_COOLDOWN_MS);
         self.rt
             .retain(|id, _| st.list().iter().any(|s| s.strategy_id == *id));
         let ping = self.ping_median(now);
@@ -1757,18 +1794,21 @@ impl MoonShot {
     /// An exchange call for `order` failed: back the order off; a rate limit
     /// halts entries everywhere.
     pub fn on_failed(&mut self, order: u64, msg: &str, now: i64) {
-        if rate_limited(msg) {
-            self.on_error_budget(now);
+        if let Some(halt) = rate_halt_ms(msg) {
+            self.on_error_budget(now, halt);
         }
         let memo = self.memo.entry(order).or_default();
         memo.fails += 1;
         memo.fail_at = now;
+        // Kept apart from the memo, which goes with the order once it is
+        // final — and a refused entry is final at once.
+        self.refusals.insert(order, (now, reject_cooldown_ms(msg)));
     }
 
-    /// The exchange's rate limit: no entries anywhere for `RATE_HALT_MS`, so
+    /// The exchange's rate limit: no entries anywhere for `halt_ms` ([`rate_halt_ms`]), so
     /// the calls waiting out the window are not joined by new ones.
-    pub fn on_error_budget(&mut self, now: i64) {
-        self.rate_halt_until = self.rate_halt_until.max(now + RATE_HALT_MS);
+    pub fn on_error_budget(&mut self, now: i64, halt_ms: i64) {
+        self.rate_halt_until = self.rate_halt_until.max(now.saturating_add(halt_ms));
     }
 
     /// Round-trip time of one API call.
@@ -1919,8 +1959,14 @@ impl MoonShot {
         let refused = os
             .iter()
             .filter(|o| o.status == status::BUY_FAIL)
+            .filter(|o| {
+                let cooldown = self
+                    .refusals
+                    .get(&o.id)
+                    .map_or(REJECT_COOLDOWN_MS, |&(_, ms)| ms);
+                now - o.record().buy.close_ms < cooldown
+            })
             .map(|o| o.record().buy.close_ms)
-            .filter(|&at| now - at < REJECT_COOLDOWN_MS)
             .max();
         let penalized = self
             .loss_at
@@ -4191,16 +4237,50 @@ mod tests {
         st
     }
 
-    /// The exchange's rate limit halts entries a minute and a later,
-    /// shorter signal never cuts a halt in force.
+    /// A refusal for margin keeps the strategy off the market 10 s — margin
+    /// frees the moment an order goes — any other refusal a minute, since it
+    /// repeats until someone changes something.
+    #[test]
+    fn a_margin_refusal_cools_down_shorter_than_the_rest() {
+        assert_eq!(
+            reject_cooldown_ms("api 400/-2019: Margin is insufficient."),
+            MARGIN_COOLDOWN_MS
+        );
+        assert_eq!(reject_cooldown_ms("api 400/-4051: x"), MARGIN_COOLDOWN_MS);
+        assert_eq!(
+            reject_cooldown_ms("api 400/-4164: Order's notional must be no smaller than 5"),
+            REJECT_COOLDOWN_MS
+        );
+        assert_eq!(reject_cooldown_ms("order rejected"), REJECT_COOLDOWN_MS);
+    }
+
+    /// The exchange's rate limit halts entries as long as it says, and a
+    /// later, shorter signal never cuts a halt in force.
     #[test]
     fn error_budget_halts_entries_without_shortening() {
         let mut shot = MoonShot::default();
-        shot.on_error_budget(1_000);
+        shot.on_failed(7, "api 429/-1003: Too many requests.", 1_000);
         assert_eq!(shot.rate_halt_until, 1_000 + RATE_HALT_MS);
         shot.rate_halt_until = 200_000;
-        shot.on_error_budget(2_000);
+        shot.on_failed(7, "api 400/-1015: Too many new orders.", 2_000);
         assert_eq!(shot.rate_halt_until, 200_000);
+        // A ban names its length, and it is waited out to the end.
+        let mut shot = MoonShot::default();
+        shot.on_failed(
+            7,
+            "api 418/-1003: Way too many requests. (retry after 600 s)",
+            1_000,
+        );
+        assert_eq!(shot.rate_halt_until, 601_000);
+        let mut shot = MoonShot::default();
+        shot.on_failed(7, "api 418/-1003: banned", 1_000);
+        assert_eq!(shot.rate_halt_until, 1_000 + BAN_HALT_MS);
+        let mut shot = MoonShot::default();
+        shot.on_failed(7, "api 400/-1015: Too many new orders.", 1_000);
+        assert_eq!(shot.rate_halt_until, 1_000 + ORDER_BURST_HALT_MS);
+        let mut shot = MoonShot::default();
+        shot.on_failed(7, "api 400/-2019: Margin is insufficient.", 1_000);
+        assert_eq!(shot.rate_halt_until, 0, "a refusal is not a rate limit");
     }
 
     /// An exit move cancels the live exit `old`: its final report posts the
@@ -5394,17 +5474,25 @@ mod tests {
         assert_eq!(starts(&cmds).len(), 2);
         assert_eq!(starts(&cmds)[0].0, 285.12);
 
-        // A refused entry keeps the market quiet for a minute.
+        // An entry refused for margin keeps the market quiet for
+        // `MARGIN_COOLDOWN_MS`, and no longer.
         apply(&mut shot, &mut orders, &model, &cmds, t);
         let failed = orders
             .iter()
             .find(|o| o.status == status::BUY_SET)
             .unwrap()
             .id;
-        orders.fail(failed, Leg::Buy, crate::orders::Op::Post, "30079 x", t);
-        shot.on_failed(failed, "30079 x", t);
+        let margin = "api 400/-2019: Margin is insufficient.";
+        orders.fail(failed, Leg::Buy, crate::orders::Op::Post, margin, t);
+        shot.on_failed(failed, margin, t);
+        let refused = t;
         t += 1000;
         assert!(shot.tick(&st, &orders, &model, &win, sched, t).is_empty());
+        t = refused + MARGIN_COOLDOWN_MS - 1;
+        assert!(starts(&shot.tick(&st, &orders, &model, &win, sched, t)).is_empty());
+        t = refused + MARGIN_COOLDOWN_MS;
+        let cmds = shot.tick(&st, &orders, &model, &win, sched, t);
+        assert!(!starts(&cmds).is_empty(), "{cmds:?}");
     }
 
     /// LONG8-like settings of the 13.09 log: `MShotReplaceDelay` 1 s waits
@@ -6568,7 +6656,7 @@ mod tests {
         shot.on_trade(1, now + 1, 303.2, 1_000.0, true);
         shot.tick(&st, &orders, &model, &win, sched, now + 10);
         assert_eq!(shot.signals.len(), 1);
-        shot.on_error_budget(now + 20);
+        shot.on_error_budget(now + 20, RATE_HALT_MS);
         shot.on_trade(1, now + 200, 303.0, 1_000.0, true);
         shot.tick(&st, &orders, &model, &win, sched, now + 11_000);
         assert!(shot.signals.is_empty());

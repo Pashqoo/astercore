@@ -103,10 +103,15 @@ use crate::trading::{ExecStatus, OrderUpdate};
 const KEEP_DONE_MS: i64 = 120_000;
 /// `-2013 NO_SUCH_ORDER`: the exchange does not know the order.
 pub(crate) const CODE_ORDER_NOT_FOUND: i64 = -2013;
-/// «Not found» answers to one request key after which the request is taken
-/// as never having reached the exchange. The pause after each doubles from
-/// `RESOLVE_PERIOD_MS` (10 + 20 + … + 160 s: about 5 minutes).
-const REQUEST_GIVE_UP: u32 = 6;
+/// How long after the first «not found» to one request key a further one
+/// proves the request never reached the exchange: Aster v3 takes a request's
+/// nonce only within 60 s of its own clock (API docs, «V3 Nonce Mechanism»),
+/// so a request older than that can no longer be executed; 5 s more cover the
+/// core's clock offset. The pause between the asks doubles from
+/// `RESOLVE_PERIOD_MS` (asks at 0, 10, 30, 70 s). Until 03.10 it was six asks
+/// over ~5 min — TInvestCore's, for T-Invest's minute error budget and its
+/// stream aliases.
+const REQUEST_GIVE_UP_MS: i64 = 65_000;
 /// Pause between reconciliations of an uncertain request.
 const RESOLVE_PERIOD_MS: i64 = 10_000;
 /// Spread a panic / close limit crosses the book when the order carries none
@@ -855,6 +860,13 @@ pub struct Resting {
     pub immune: bool,
 }
 
+/// «Not found» answers to one request key being reconciled: how many, and when the first came.
+#[derive(Debug, Clone, Copy)]
+struct RequestMisses {
+    count: u32,
+    first_ms: i64,
+}
+
 #[derive(Default)]
 pub struct Orders {
     map: HashMap<u64, CoreOrder>,
@@ -864,7 +876,7 @@ pub struct Orders {
     next_id: u64,
     keys: RandomState,
     /// «Not found» answers so far per request key being reconciled.
-    request_misses: HashMap<String, u32>,
+    request_misses: HashMap<String, RequestMisses>,
     /// Exchange ids and request keys of account orders left to the account
     /// (`adopt`): their later reports stay theirs whatever the positions say.
     /// Kept across restarts (`left_ids`), so bounded to the newest
@@ -3147,8 +3159,8 @@ impl Orders {
             // hold the identity and ask again with backoff. A fill, an
             // exchange id or a later status from the stream proves the order
             // exists.
-            // After `REQUEST_GIVE_UP` misses the request is not on the
-            // exchange. Exits hold on any id or status, as before: a wrong
+            // A miss `REQUEST_GIVE_UP_MS` after the first one: the request is
+            // not on the exchange. Exits hold on any id or status, as before: a wrong
             // give-up there posts a second exit.
             ex.resolve_at = now_ms + 10_000;
             let last = ex.executions.last().unwrap();
@@ -3160,16 +3172,24 @@ impl Orders {
             {
                 return fx;
             }
-            let misses = self.request_misses.entry(request.to_owned()).or_default();
-            *misses += 1;
-            if *misses < REQUEST_GIVE_UP {
-                ex.resolve_at = now_ms + (RESOLVE_PERIOD_MS << (*misses - 1));
+            let misses = self
+                .request_misses
+                .entry(request.to_owned())
+                .or_insert(RequestMisses {
+                    count: 0,
+                    first_ms: now_ms,
+                });
+            misses.count += 1;
+            if now_ms - misses.first_ms < REQUEST_GIVE_UP_MS {
+                ex.resolve_at = now_ms + (RESOLVE_PERIOD_MS << (misses.count - 1).min(4));
                 return fx;
             }
+            let count = misses.count;
             self.request_misses.remove(request);
             fx.logs.push(format!(
-                "{market}: request {request} not found {REQUEST_GIVE_UP} times: \
-                 it never reached the exchange"
+                "{market}: request {request} not found {count} times over \
+                 {} s: it never reached the exchange",
+                REQUEST_GIVE_UP_MS / 1000
             ));
             if ex.executions.len() >= 2 {
                 fall_back(ex, now_ms);
@@ -5900,20 +5920,20 @@ mod tests {
             leg: Leg::Buy,
             key,
         };
-        for i in 0..REQUEST_GIVE_UP {
+        for i in 0..6 {
             os.failed(
                 &query,
                 true,
                 "api 400/-2013: Order does not exist.",
-                2000 + i as i64,
+                2000 + i * 20_000,
             );
         }
         assert_eq!(os.get(id).unwrap().status, status::BUY_SET);
     }
 
     /// The same ghost in memory: BuySet, a stream NEW, the request unknown to
-    /// REST. It gives up after `REQUEST_GIVE_UP` misses instead of asking
-    /// every 10 s forever.
+    /// REST. It gives up once a miss comes `REQUEST_GIVE_UP_MS` after the
+    /// first — past the nonce window — instead of asking every 10 s forever.
     #[test]
     fn restored_new_entry_unknown_by_request_gives_up() {
         let m = sber_model();
@@ -5935,21 +5955,17 @@ mod tests {
             leg: Leg::Buy,
             key: key.clone(),
         };
-        for i in 0..REQUEST_GIVE_UP {
+        // The asks `watch` makes: 0, 10, 30 and 70 s after the first.
+        for at in [2_000, 12_000, 32_000, 72_000] {
             assert_eq!(os.get(id).unwrap().status, status::BUY_SET);
-            os.failed(
-                &query,
-                true,
-                "api 400/-2013: Order does not exist.",
-                2000 + i as i64,
-            );
+            os.failed(&query, true, "api 400/-2013: Order does not exist.", at);
         }
         assert_eq!(os.get(id).unwrap().status, status::BUY_FAIL);
     }
 
     /// A real 21.09 ghost (NNSB) as the old core saved it: uncertain, a stream
     /// NEW under two UUID aliases, no broker number. Restored, it is asked
-    /// `REQUEST_GIVE_UP` times with backoff and fails.
+    /// with backoff until a miss lands past the nonce window, and fails.
     #[test]
     fn phantom_restored_from_orders_json_gives_up() {
         let saved: Vec<CoreOrder> =
@@ -5969,7 +5985,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(asked, REQUEST_GIVE_UP);
+        assert_eq!(asked, 4);
         assert_eq!(os.get(id).unwrap().status, status::BUY_FAIL);
     }
 
@@ -6014,7 +6030,8 @@ mod tests {
                 }
             }
         }
-        assert!(asked > REQUEST_GIVE_UP, "keeps asking: {asked}");
+        // An entry gives up on its fourth ask; this exit is past that and still asking.
+        assert!(asked > 6, "keeps asking: {asked}");
         assert_eq!(back.get(id).unwrap().status, before);
     }
 
@@ -6805,7 +6822,7 @@ mod tests {
     /// their keys never reached the exchange and were asked every 10 s with
     /// `50005` forever, spending the token's error budget (`80006` on the
     /// cancels at the session end) and holding a filled entry without exit.
-    /// A request not found `REQUEST_GIVE_UP` times never arrived: the leg
+    /// A request still not found `REQUEST_GIVE_UP_MS` after the first miss never arrived: the leg
     /// falls back to the generation before it and reads its real state.
     #[test]
     fn a_request_lost_in_a_restart_is_given_up() {
@@ -6833,10 +6850,10 @@ mod tests {
         }
         for key in lost {
             let times: Vec<i64> = asked.iter().filter(|a| a.1 == key).map(|a| a.0).collect();
-            assert_eq!(times.len(), REQUEST_GIVE_UP as usize);
+            assert_eq!(times.len(), 4, "{times:?}");
             assert!(
-                times[times.len() - 1] - times[0] >= 300_000,
-                "backs off: {times:?}"
+                times[times.len() - 1] - times[0] >= REQUEST_GIVE_UP_MS,
+                "past the nonce window: {times:?}"
             );
         }
         assert!(os.request_misses.is_empty());

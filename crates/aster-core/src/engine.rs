@@ -2576,6 +2576,10 @@ impl CoreHandler {
                 fx.extend(self.market_closed(&action, &msg));
                 if !fx.logs.is_empty() || !fx.changed.is_empty() {
                     self.shots.on_failed(order, &msg, now);
+                } else if let Some(halt) = moonshot::rate_halt_ms(&msg) {
+                    // A rate refusal of a call that changed nothing (a cancel, a
+                    // query) halts the entries all the same.
+                    self.shots.on_error_budget(now, halt);
                 }
                 self.shots_due = true;
                 fx

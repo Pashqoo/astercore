@@ -177,8 +177,10 @@ fn run<T>(
                 if throttled(&e) {
                     // Said at warn even on the first one: this is the core
                     // being told it asks too often, and the next call waits.
-                    log::warn!("prices: {name} throttled ({e}), backing off {THROTTLED_BACKOFF:?}");
-                    due = Instant::now() + THROTTLED_BACKOFF;
+                    // The exchange's own `Retry-After` when it is the longer.
+                    let wait = e.retry_after().unwrap_or_default().max(THROTTLED_BACKOFF);
+                    log::warn!("prices: {name} throttled ({e}), backing off {wait:?}");
+                    due = Instant::now() + wait;
                 } else {
                     // One refusal costs a period of staleness. At debug because
                     // a blip at this cadence would otherwise fill the journal;

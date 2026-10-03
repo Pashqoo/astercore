@@ -551,12 +551,13 @@ impl Worker {
     fn sync_clock(&mut self) -> Result<i64, rest::Error> {
         for waited in 0..=CLOCK_WAITS {
             match self.rest.sync_clock() {
-                Err(rest::Error::Api { status: 429, .. }) if waited < CLOCK_WAITS => {
+                Err(e @ rest::Error::Api { status: 429, .. }) if waited < CLOCK_WAITS => {
+                    let wait = e.retry_after().unwrap_or_default().max(CLOCK_WAIT);
                     log::info!(
                         "leverage: the exchange says 429, waiting {} s",
-                        CLOCK_WAIT.as_secs()
+                        wait.as_secs()
                     );
-                    thread::sleep(CLOCK_WAIT);
+                    thread::sleep(wait);
                 }
                 other => return other,
             }

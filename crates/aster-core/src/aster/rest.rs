@@ -64,6 +64,17 @@ pub fn msg_has_code(msg: &str, code: i64) -> bool {
     msg.contains(&code_marker(code))
 }
 
+/// How `Retry-After` of a 418/429 rides in an [`Error::Api`]'s text: written once by
+/// `check_status`, read by [`msg_retry_after_ms`].
+const RETRY_AFTER_MARK: &str = " (retry after ";
+
+/// The exchange's `Retry-After` carried in `msg`, in ms; `None` when the answer had none.
+pub fn msg_retry_after_ms(msg: &str) -> Option<i64> {
+    let rest = &msg[msg.rfind(RETRY_AFTER_MARK)? + RETRY_AFTER_MARK.len()..];
+    let secs: i64 = rest.split(" s)").next()?.parse().ok()?;
+    (secs >= 0).then(|| secs.saturating_mul(1000))
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -77,6 +88,18 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Error {
+    /// The `Retry-After` a 418/429 named (`check_status`); `None` for any other error.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Api { msg, .. } => msg_retry_after_ms(msg)
+                .and_then(|ms| u64::try_from(ms).ok())
+                .map(Duration::from_millis),
+            _ => None,
+        }
+    }
+}
 
 impl From<ureq::Error> for Error {
     fn from(e: ureq::Error) -> Self {
@@ -706,14 +729,26 @@ impl Rest {
         if (200..300).contains(&status) {
             return Ok(resp);
         }
+        // 429 and 418 name how long to wait; the order worker passes failures on as text, so
+        // the wait rides in it (`msg_retry_after_ms`) to the entry gate that honours it.
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|_| matches!(status, 418 | 429));
         let text = resp.into_body().read_to_string().unwrap_or_default();
         let err: ApiError = serde_json::from_str(&text).unwrap_or_default();
+        // Not the exchange's JSON (a gateway's HTML 502), or a message of unknown length:
+        // this text goes to the journal and to Telegram, so it is cut.
+        let mut msg = shorten(if err.msg.is_empty() { &text } else { &err.msg });
+        if let Some(secs) = retry_after {
+            msg.push_str(&format!("{RETRY_AFTER_MARK}{secs} s)"));
+        }
         Err(Error::Api {
             status,
             code: err.code,
-            // Not the exchange's JSON (a gateway's HTML 502), or a message of unknown length:
-            // this text goes to the journal and to Telegram, so it is cut.
-            msg: shorten(if err.msg.is_empty() { &text } else { &err.msg }),
+            msg,
         })
     }
 }
@@ -800,6 +835,28 @@ fn leverage_oi_url(symbol: &str) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 429/418's `Retry-After` rides in the error's text (`check_status`) and is read back
+    /// from it; a refusal that named none reads `None`.
+    #[test]
+    fn retry_after_rides_in_the_error_text() {
+        let e = Error::Api {
+            status: 418,
+            code: -1003,
+            msg: format!("Way too many requests.{RETRY_AFTER_MARK}120 s)"),
+        };
+        let text = e.to_string();
+        assert!(msg_has_status(&text, 418) && msg_has_code(&text, -1003));
+        assert_eq!(msg_retry_after_ms(&text), Some(120_000));
+        assert_eq!(
+            msg_retry_after_ms("api 429/-1003: Too many requests."),
+            None
+        );
+        assert_eq!(
+            msg_retry_after_ms("api 429/-1003: x (retry after soon s)"),
+            None
+        );
+    }
 
     /// A Chinese symbol reaches the site encoded, and nothing a symbol holds can cut the query.
     #[test]
