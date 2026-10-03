@@ -861,9 +861,13 @@ impl CoreHandler {
                     self.trades.push(idx, time_ms, price as f32, qty as f32);
                     self.candles.push(idx, time_ms, price, qty);
                     self.catalog.set_last(&symbol, price);
-                    self.windows.push(idx, time_ms, price, qty);
-                    let turnover = price * qty.abs();
                     let now = now_ms();
+                    // A trade stamped ahead of the clock would prune the
+                    // day's buckets behind it and sit in every window: it
+                    // counts no later than a minute from now.
+                    self.windows
+                        .push(idx, time_ms.min(now + 60_000), price, qty);
+                    let turnover = price * qty.abs();
                     self.tape.push(idx, now, time_ms, price as f32, qty as f32);
                     if self.shots.on_trade(idx, now, price, turnover, qty > 0.0) {
                         self.shots_due = true;
@@ -2760,9 +2764,8 @@ impl CoreHandler {
 
     /// The 5m warm-up bars of one market into the strategies' windows: each
     /// bar a bucket of its own (the windows read 5-minute resolution in the
-    /// history and minutes from the start on), and its turnover into the hour
-    /// ledger. Only bars that ended before the core started: the live tape
-    /// covers everything after, and the bar running at the start would be
+    /// history and minutes from the start on). Only bars that ended before the
+    /// core started: the live tape covers everything after, and the bar running at the start would be
     /// counted twice. The minutes between that bar's open and the start are
     /// lost to the windows — at most five, one twelfth of the first hour.
     fn seed_windows(&mut self, idx: u16, bars: &[crate::aster::json::Kline]) {
@@ -2781,7 +2784,6 @@ impl CoreHandler {
         {
             self.windows
                 .seed(idx, b.open_ms, b.open, b.low, b.high, b.quote_volume);
-            self.windows.seed_hour(idx, b.open_ms, b.quote_volume);
         }
     }
 

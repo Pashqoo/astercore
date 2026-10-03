@@ -8,8 +8,10 @@
 //! the book cannot cross Aster's `PERCENT_PRICE` band of a few percent, and
 //! TInvestCore's deep limit would sit pinned to it. A `ClosePosition` by limit
 //! moves the exit to a limit `PANIC_SPREAD` through the book and follows it,
-//! as TInvestCore did; so does every exit of the emulator, which fills a
-//! limit at its own price. Quantities are lots: whole `stepSize` steps.
+//! as TInvestCore did. The emulator takes the same MARKET and fills it at the
+//! best quote (since 03.10; before, an emulated panic was a limit pinned to the
+//! band, so the emulator showed another execution than the real account would
+//! get). Quantities are lots: whole `stepSize` steps.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -477,7 +479,7 @@ pub struct CoreOrder {
     /// (0 included), not the stop-loss spread.
     trail_fired: bool,
     /// The exit goes at market: panic, stop-loss, trailing, or the
-    /// terminal's «market» close. Never set on an emulated order.
+    /// terminal's «market» close — the emulator's as well as the account's.
     market_exit: bool,
     /// The strategy's own stop as `(price, spread %)`, shown in the image only
     /// (SL:ON and the chart line): the strategy watches it itself, `watch`
@@ -1925,10 +1927,8 @@ impl Orders {
             .filter(|o| o.holds_position())
             .map(|o| o.id)
             .collect();
-        // The emulator fills a limit at its own price: an emulated close keeps
-        // the panic spread.
         for id in &ids {
-            self.map.get_mut(id).expect("order").market_exit = at_market && !emulator;
+            self.map.get_mut(id).expect("order").market_exit = at_market;
         }
         if ids.is_empty() {
             fx.logs.push(format!(
@@ -2359,18 +2359,18 @@ impl Orders {
     }
 
     /// A strategy's fired stop (`moonshot::Cmd::Move` with `market`): the exit goes
-    /// at MARKET — a limit through the book when emulated — and `watch`
-    /// follows it as a panic exit from here on.
+    /// at MARKET, emulated or not, and `watch` follows it as a panic exit from
+    /// here on.
     pub fn stop_out(&mut self, id: u64, code: u8, m: &Market, now_ms: i64) -> Effects {
         self.set_sell_reason(id, code);
         self.at_market(id);
         self.panic_exit(id, m, now_ms)
     }
 
-    /// The exit of `id` goes at market — unless the order is emulated.
+    /// The exit of `id` goes at market, emulated or not.
     fn at_market(&mut self, id: u64) {
         if let Some(o) = self.map.get_mut(&id) {
-            o.market_exit = !o.emulator;
+            o.market_exit = true;
         }
     }
 
@@ -2422,7 +2422,7 @@ impl Orders {
             return fx;
         }
         let sells = o.sells(Leg::Sell);
-        let at_market = o.market_exit && !o.emulator;
+        let at_market = o.market_exit;
         let spread = o.panic_spread();
         // For a MARKET exit, the price it is shown at until it fills.
         let Some(price) = m
@@ -3886,8 +3886,7 @@ mod tests {
             "{:?}",
             fx.actions
         );
-        // The emulated twin leaves as a limit through the book: `at_market` keeps `market_exit`
-        // off for an emulated order, so the exit is priced with the panic spread.
+        // The emulated twin leaves at MARKET too: the emulator fills it at the best quote.
         let fx = orders.start(2, &start(7000.0, 310.0, 0.0), sber, 40);
         let key = post_key(&fx);
         orders.set_emulator(2);
@@ -3898,7 +3897,7 @@ mod tests {
                 &fx.actions[..],
                 [Action::Post {
                     sell: true,
-                    price: Some(_),
+                    price: None,
                     ..
                 }]
             ),
@@ -6315,13 +6314,11 @@ mod tests {
         }
     }
 
-    /// A real order's panic is one MARKET exit, not chased while it is live;
-    /// an emulated one keeps TInvestCore's limit through the book, pinned to
-    /// the `PERCENT_PRICE` bound of its side (mark 300 × 0.99 / 1.01 = 297 / 303:
-    /// a long's sell stands at 297, a short's buy at 303) and not repriced there
-    /// again and again.
+    /// A panic is one MARKET exit, not chased while it is live — an emulated
+    /// one as well (until 03.10 it was TInvestCore's limit pinned to the
+    /// `PERCENT_PRICE` bound, 297 / 303 here, not what the account would get).
     #[test]
-    fn panic_goes_at_market_and_an_emulated_one_stays_at_the_band() {
+    fn panic_goes_at_market_in_the_emulator_as_well() {
         for (short, emulated) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut model = sber_model();
             {
@@ -6344,16 +6341,14 @@ mod tests {
                 1100,
             );
             let fx = os.set_panic(42, true, m, 1200);
-            let capped = if short { 303.0 } else { 297.0 };
             let key = post_key(&fx);
             match fx.actions[0] {
-                Action::Post { price: None, .. } if !emulated => {}
-                Action::Post { price: Some(p), .. } if emulated && p == capped => {}
+                Action::Post { price: None, .. } => {}
                 ref other => panic!("short {short} emulated {emulated}: {other:?}"),
             }
             let mut report = update(&key, "2001", ExecStatus::New, 1, 0, 0.0);
-            report.price = capped;
-            report.is_market = !emulated;
+            report.price = if short { 303.0 } else { 297.0 };
+            report.is_market = true;
             os.apply(&report, 1300);
             assert!(os.watch(&model, 4000).actions.is_empty());
             assert!(os.watch(&model, 7000).actions.is_empty());

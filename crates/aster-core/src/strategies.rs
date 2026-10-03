@@ -237,8 +237,8 @@ fn schema_fields() -> Vec<SchemaField> {
         // what the pool is (`moonshot::DeltaFilters`, `screener`): a market
         // that goes quiet for an hour keeps its place, its subscription and
         // its detect, and only stops being entered. `MinVolume`/`MaxVolume`
-        // read the last 24 hours the market traded, the hourly pair the last
-        // hour of the clock.
+        // read the clock's last 24 hours, the hourly pair the last hour of
+        // the clock.
         // The Filters tab's two halves have a switch each, as in MoonBot:
         // `IgnoreVolume` opens this box, `IgnoreDelta` the delta one above.
         // They shared one switch before, so turning the deltas off turned the

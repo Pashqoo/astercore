@@ -57,8 +57,11 @@ pub fn rate_limited(msg: &str) -> bool {
 }
 const CANCEL_RETRY_MS: i64 = 5_000;
 /// After a restart, entries restored on a market wait this long for its
-/// first live trade of this run (`Market::live_price`; the startup ticker's price is not one);
-/// a market still without one (halted, feed lost) withdraws them.
+/// first live trade of this run (`Market::live_price`; the startup ticker's price is not one)
+/// or a fresh book (`Market::book_fresh`); a market with neither (halted, feed
+/// lost) withdraws them. Before 03.10 only a trade counted — TInvestCore's rule,
+/// where the broker's quotes outlived a halt — and a thin coin's restored ladder
+/// came off and went back on at its first trade.
 const RESTORE_PRICE_WAIT_MS: i64 = 5 * 60_000;
 /// A fired stop's exit follows the book at most this often.
 const STOP_CHASE_MS: i64 = 2_000;
@@ -1537,7 +1540,7 @@ impl MoonShot {
                     || (!(p.emulator || self.emulator) && self.closed.contains(&m.symbol))
                 {
                     Some(Gate::NotTrading)
-                } else if !(m.live_price() || now < self.price_wait_until) {
+                } else if !(m.live_price() || m.book_fresh(now) || now < self.price_wait_until) {
                     Some(Gate::NoPrice)
                 } else if self.bvsv_holds(&p, idx, now) {
                     Some(Gate::BvSv)
@@ -2073,7 +2076,9 @@ impl MoonShot {
         };
         // No trade yet since the start: the ladder waits with what it has
         // (entries restored from the previous run stay put, see
-        // `RESTORE_PRICE_WAIT_MS`); withdrawals above and below need no price.
+        // `RESTORE_PRICE_WAIT_MS`, for as long as the book is fresh); the
+        // startup ticker's price would move it on nothing new. Withdrawals
+        // above and below need no price.
         let priced = m.live_price();
         if commits.is_empty() {
             if !priced {
@@ -3064,15 +3069,15 @@ impl MoonShot {
                         s, o, p, m, &t, side, base, price, spread,
                     )));
                     // A live stop that only has to cross the book goes at
-                    // MARKET (`PLAN.md`, «Открытые решения» п. 2): Orders
-                    // follows it as a panic from here on. One that must stay
-                    // a limit, and every emulated one, is chased as before.
+                    // MARKET (`PLAN.md`, «Открытые решения» п. 2), in the
+                    // emulator too: Orders follows it as a panic from here on.
+                    // One that must stay a limit is chased as before.
                     cmds.push(Cmd::Move {
                         order: o.id,
                         leg: Leg::Sell,
                         price,
                         reason: t.fired.reason(),
-                        market: !(limit || o.emulator),
+                        market: !limit,
                     });
                 }
                 return;
@@ -3314,7 +3319,7 @@ fn sold_in_profit(o: &CoreOrder, since: i64, pct: f64) -> bool {
 /// What one entry filter reads off the market.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Metric {
-    /// USDT turnover of the last 24 hours the market traded (`vol24`).
+    /// USDT turnover of the clock's last 24 hours (`vol24`).
     Vol24,
     /// USDT turnover of the last `minutes` of the clock.
     Turnover(i64),
@@ -7015,16 +7020,18 @@ mod tests {
             .tick(&st, &orders, &model, &win, sched, t + 2000)
             .is_empty());
 
-        // A market still without a trade after the wait withdraws them.
+        // Past the wait, a market the exchange still quotes keeps them: a thin
+        // coin may go minutes without a trade.
         model.at_mut(1).unwrap().last_price = Some(0.0);
-        let cmds = shot.tick(
-            &st,
-            &orders,
-            &model,
-            &win,
-            sched,
-            t + 1000 + RESTORE_PRICE_WAIT_MS,
-        );
+        let after = t + 1000 + RESTORE_PRICE_WAIT_MS;
+        let m = model.at_mut(1).unwrap();
+        (m.bid, m.ask, m.book_ms) = (Some(299.0), Some(301.0), after - 1000);
+        assert!(shot
+            .tick(&st, &orders, &model, &win, sched, after)
+            .is_empty());
+        // A market with neither a trade nor a fresh book withdraws them.
+        model.at_mut(1).unwrap().book_ms = after - 20_000;
+        let cmds = shot.tick(&st, &orders, &model, &win, sched, after);
         assert_eq!(cancels(&cmds).len(), 3);
     }
 
@@ -9244,8 +9251,9 @@ mod tests {
 
     /// Aster: a fired stop of a live order goes at MARKET (`PLAN.md`,
     /// «Открытые решения» п. 2) — unless its exit is held back by the
-    /// allowed drop, which only a limit can keep, or the order is emulated,
-    /// whose exit the emulator fills at its own limit. The price beside it is
+    /// allowed drop, which only a limit can keep. An emulated order goes at
+    /// MARKET as well (since 03.10; before, it was a limit the emulator
+    /// filled at its own price). The price beside it is
     /// the limit TInvestCore would have placed: the band check and the image
     /// read it, and the chase falls back to it.
     #[test]
@@ -9263,7 +9271,7 @@ mod tests {
             exit_kinds(&fx.at(3_000, 293.0))
         };
         assert_eq!(fire(&[], false), [true], "a live stop crosses at market");
-        assert_eq!(fire(&[], true), [false], "the emulator fills its limit");
+        assert_eq!(fire(&[], true), [true], "and so does an emulated one");
         assert_eq!(
             fire(&[("AllowedDrop", Double(-2.0))], false),
             [false],

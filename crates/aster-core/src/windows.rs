@@ -6,38 +6,14 @@
 //! opening price of a window drives its sort keys (`screener`): MoonBot counts
 //! every delta from the price at the window's start.
 //!
-//! Beside them an hour ledger, reaching days back rather than one day: the
-//! screener's 24 h volume ([`Windows::vol24`]) is the last 24 hours the market
-//! actually traded, not the last 24 hours of the clock.
+//! The screener's 24 h volume ([`Windows::vol24`]) is the same minute
+//! buckets over the clock's last day, as MoonBot reads `DailyVol` (`faqru`:
+//! «за 24ч»).
 
 use std::collections::VecDeque;
 
 const MINUTE_MS: i64 = 60_000;
-const HOUR_MS: i64 = 60 * MINUTE_MS;
 const KEEP_MINUTES: i64 = 24 * 60;
-/// Traded hours [`Windows::vol24`] sums.
-const VOL_HOURS: usize = 24;
-/// Turnover an hour needs to count as one of them. An hour nobody traded in
-/// takes no slot; an hour that turned over less than a USDT is not a traded
-/// hour either. On a crypto perpetual, which trades round the clock, the 24
-/// traded hours are the clock's 24; the rule matters for Aster's stock and
-/// forex perpetuals (`Market::has_sessions`), whose quiet hours would empty a
-/// clock-bound sum and take them off every strategy with a volume bound —
-/// the reason TInvestCore, on MOEX, made it (28.09).
-const HOUR_MIN_TURNOVER: f64 = 1.0;
-/// How far back a traded hour may sit and still count, in hours. A market
-/// silent for a week reads zero again, the way the old rolling day did, so
-/// `MinVolume` still drops an instrument that stopped trading; long enough that
-/// a long weekend never empties the window. The bound belongs to the reader
-/// ([`Windows::vol24`], which is given the clock), not to the writers: a
-/// timestamp from the far future must not be able to decide what counts as old.
-const HOUR_KEEP: i64 = 5 * 24;
-/// Hour buckets one market keeps. The window [`Windows::vol24`] reads is
-/// inclusive at both ends, so it spans `HOUR_KEEP + 1` distinct hours and the
-/// cap is that: it then drops only hours the reader has already stopped
-/// counting. A bucket stamped in the future is not dropped by it — the cap
-/// takes the oldest — it is simply never read while the clock is behind it.
-const HOUR_CAP: usize = HOUR_KEEP as usize + 1;
 
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
@@ -50,20 +26,9 @@ struct Bucket {
     turnover: f64,
 }
 
-/// One hour of USDT turnover. An hour the market did not trade in has no
-/// bucket at all — that absence is what keeps the night and the weekend out of
-/// [`Windows::vol24`].
-#[derive(Debug, Clone, Copy)]
-struct Hour {
-    hour: i64,
-    turnover: f64,
-}
-
 #[derive(Default)]
 pub struct Windows {
     by_idx: Vec<VecDeque<Bucket>>,
-    /// Hour buckets per market, oldest first, at most [`HOUR_CAP`] of them.
-    hours: Vec<VecDeque<Hour>>,
 }
 
 impl Windows {
@@ -98,72 +63,13 @@ impl Windows {
         while q.front().is_some_and(|b| b.minute < minute - KEEP_MINUTES) {
             q.pop_front();
         }
-        self.hour_mut(idx, time_ms).turnover += turnover;
     }
 
-    /// The hour bucket `time_ms` falls into, inserted in order when it is new.
-    /// Nothing is rejected here and nothing is aged out: how old an hour may be
-    /// is [`Windows::vol24`]'s call, which holds the clock. This only keeps the
-    /// deque bounded, dropping the oldest bucket past [`HOUR_CAP`].
-    fn hour_mut(&mut self, idx: u16, time_ms: i64) -> &mut Hour {
-        let i = usize::from(idx);
-        if self.hours.len() <= i {
-            self.hours.resize_with(i + 1, VecDeque::new);
-        }
-        let q = &mut self.hours[i];
-        let hour = time_ms.div_euclid(HOUR_MS);
-        let mut pos = match q.binary_search_by_key(&hour, |b| b.hour) {
-            Ok(pos) => return &mut q[pos],
-            Err(pos) => pos,
-        };
-        if q.len() >= HOUR_CAP && q.pop_front().is_some() {
-            pos = pos.saturating_sub(1);
-        }
-        q.insert(
-            pos,
-            Hour {
-                hour,
-                turnover: 0.0,
-            },
-        );
-        &mut q[pos]
-    }
-
-    /// Historical turnover (USDT) of the hour `time_ms` falls in — a warm-up
-    /// bar — added to whatever that hour already holds. The engine seeds only
-    /// bars that ended before the core started (`seed_windows`), so they and
-    /// the live ticks cover different slices of an hour and the sum is the
-    /// hour.
-    pub fn seed_hour(&mut self, idx: u16, time_ms: i64, turnover: f64) {
-        if turnover <= 0.0 {
-            return;
-        }
-        self.hour_mut(idx, time_ms).turnover += turnover;
-    }
-
-    /// USDT turnover of the last [`VOL_HOURS`] hours the market traded in —
-    /// the screener's `Vol.` and what `MinVolume`/`MaxVolume` and `DailyVol`
-    /// read. Hours without trades take no slot, so the sum survives a session
-    /// market's night and weekend; hours further back than [`HOUR_KEEP`]
-    /// are not counted, so a market that stopped trading still falls to zero.
-    ///
-    /// Both ends are cut against the clock this is given, which is the only
-    /// thing that knows the time: an hour still ahead of it — a trade or a bar
-    /// with a timestamp from the future — is not a traded hour yet, and would
-    /// otherwise stay in every sum for good, since nothing ages it out.
+    /// USDT turnover of the clock's last 24 hours — the screener's `Vol.`
+    /// and what `MinVolume`/`MaxVolume` and `DailyVol` read. A market silent
+    /// for a day reads zero, so `MinVolume` drops it.
     pub fn vol24(&self, idx: u16, now_ms: i64) -> f64 {
-        let current = now_ms.div_euclid(HOUR_MS);
-        let oldest = current - HOUR_KEEP;
-        self.hours
-            .get(usize::from(idx))
-            .into_iter()
-            .flat_map(|q| q.iter().rev())
-            .skip_while(|h| h.hour > current)
-            .take_while(|h| h.hour >= oldest)
-            .filter(|h| h.turnover > HOUR_MIN_TURNOVER)
-            .take(VOL_HOURS)
-            .map(|h| h.turnover)
-            .sum()
+        self.turnover(idx, now_ms, KEEP_MINUTES)
     }
 
     /// A historical minute (warm-up bar): merged into the bucket of that
@@ -447,14 +353,16 @@ mod tests {
         );
     }
 
-    /// The volume the screener filters on: the last 24 hours the market traded
-    /// in. The night between them holds no bucket, so it takes no slot — the
-    /// number no longer empties at Moscow midnight or over a weekend.
+    /// The volume the screener filters on is the clock's last 24 hours, as
+    /// MoonBot's `DailyVol`: a night of silence costs the hours it lasted, and
+    /// a market quiet for a day reads zero — no reaching days back for the
+    /// hours it did trade, which made a dead market pass `MinVolume`.
     #[test]
-    fn vol24_sums_the_traded_hours_and_skips_the_silent_ones() {
+    fn vol24_is_the_clocks_last_day() {
+        const HOUR_MS: i64 = 60 * MINUTE_MS;
         let mut w = Windows::default();
         let t0 = 500_000 * HOUR_MS;
-        // Three hours of a session, then 15 hours of night, then two more.
+        // Three hours of trading, then 15 hours of silence, then two more.
         for h in 0..3 {
             w.push(1, t0 + h * HOUR_MS, 100.0, 10.0);
         }
@@ -463,118 +371,32 @@ mod tests {
         }
         let now = t0 + 19 * HOUR_MS + 30 * MINUTE_MS;
         assert_eq!(w.vol24(1, now), 3.0 * 1000.0 + 2.0 * 2000.0);
-        // A day on, with the market silent since: the clock's own last 24 h
-        // hold nothing at all, and the traded hours still hold the session.
-        assert_eq!(w.turnover(1, t0 + 44 * HOUR_MS, KEEP_MINUTES), 0.0);
-        assert_eq!(w.vol24(1, t0 + 44 * HOUR_MS), 7000.0);
+        // The first three hours leave the day as the clock passes them (a
+        // window takes the minute its start falls into whole, as every
+        // window here does: `span`).
+        assert_eq!(w.vol24(1, t0 + 26 * HOUR_MS + MINUTE_MS), 2.0 * 2000.0);
+        assert_eq!(
+            w.vol24(1, t0 + 44 * HOUR_MS),
+            0.0,
+            "a silent day reads zero"
+        );
         assert_eq!(w.vol24(9, now), 0.0, "a market with no history");
     }
 
-    /// Only the newest 24 traded hours count, and an hour with a rouble of
-    /// turnover is not a traded hour.
+    /// Warm-up bars and live ticks fill the same day: the bars cover the
+    /// history up to the start, the ticks everything since, and a bar from
+    /// before the day does not count.
     #[test]
-    fn vol24_takes_twenty_four_hours_over_the_dust() {
+    fn vol24_adds_the_warm_up_bars_and_the_ticks() {
+        const BAR_MS: i64 = 5 * MINUTE_MS;
         let mut w = Windows::default();
-        let t0 = 600_000 * HOUR_MS;
-        // 30 hours in a row, 1000 turnover each.
-        for h in 0..30 {
-            w.push(2, t0 + h * HOUR_MS, 10.0, 100.0);
-        }
-        let now = t0 + 30 * HOUR_MS;
-        assert_eq!(w.vol24(2, now), 24.0 * 1000.0, "the oldest six fall out");
-        let mut w = Windows::default();
-        w.push(2, t0, 0.5, 1.0); // half a rouble: not a traded hour
-        w.push(2, t0 + HOUR_MS, 100.0, 10.0);
-        assert_eq!(w.vol24(2, now), 1000.0);
-    }
-
-    /// A market that stopped trading falls back to zero, so `MinVolume` drops
-    /// it the way the old rolling day did. The age is the reader's call: a
-    /// timestamp from the far future adds its own bucket and nothing else — it
-    /// cannot make the hours around it look old, which would blind the market
-    /// for as long as it sat there.
-    #[test]
-    fn vol24_forgets_hours_past_the_keep_window() {
-        let mut w = Windows::default();
-        let t0 = 700_000 * HOUR_MS;
-        w.push(3, t0, 100.0, 10.0);
-        assert_eq!(w.vol24(3, t0 + HOUR_KEEP * HOUR_MS), 1000.0);
-        assert_eq!(w.vol24(3, t0 + (HOUR_KEEP + 1) * HOUR_MS), 0.0);
-        // A tick stamped a year ahead: the hour it opens is read while the
-        // clock is there, and the real hour beside it is read as before.
-        let bogus = t0 + 365 * 24 * HOUR_MS;
-        w.push(3, bogus, 100.0, 1.0);
-        assert_eq!(
-            w.vol24(3, t0 + HOUR_MS),
-            1000.0,
-            "the real hour still reads"
-        );
-        w.push(3, t0 + HOUR_MS, 100.0, 2.0);
-        assert_eq!(
-            w.vol24(3, t0 + 2 * HOUR_MS),
-            1200.0,
-            "and still takes ticks"
-        );
-        assert_eq!(w.vol24(3, bogus), 100.0, "the bogus hour holds only itself");
-        // The deque stays bounded whatever arrives.
-        let mut w = Windows::default();
-        for h in 0..(HOUR_CAP as i64 + 10) {
-            w.push(3, t0 + h * HOUR_MS, 100.0, 1.0);
-        }
-        assert_eq!(w.hours[3].len(), HOUR_CAP);
-    }
-
-    /// The hour deque stays sorted whatever order the hours arrive in, at the
-    /// cap as well as below it: every later trade finds its bucket by binary
-    /// search, so a bucket out of order would go on collecting turnover of its
-    /// own under a neighbour's hour, and nothing would say so.
-    #[test]
-    fn hour_buckets_stay_in_order_at_the_cap() {
-        let mut w = Windows::default();
-        let t0 = 900_000 * HOUR_MS;
-        // Fill to the cap with every second hour, so there is room between them.
-        for h in 0..HOUR_CAP as i64 {
-            w.seed_hour(5, t0 + 2 * h * HOUR_MS, 100.0);
-        }
-        assert_eq!(w.hours[5].len(), HOUR_CAP);
-        // An hour between two buckets, one older than the front, one newer than
-        // the back — each of them insert past the front the cap has to drop.
-        w.seed_hour(5, t0 + 101 * HOUR_MS, 7.0);
-        w.seed_hour(5, t0 - 5 * HOUR_MS, 8.0);
-        w.seed_hour(5, t0 + 500 * HOUR_MS, 9.0);
-        let hours: Vec<i64> = w.hours[5].iter().map(|h| h.hour).collect();
-        assert_eq!(w.hours[5].len(), HOUR_CAP);
-        assert!(hours.windows(2).all(|p| p[0] < p[1]), "sorted and distinct");
-        // And the search still lands on the bucket it was given, not beside it.
-        w.seed_hour(5, t0 + 101 * HOUR_MS, 3.0);
-        let mid = w.hours[5]
-            .iter()
-            .find(|h| h.hour == (t0 + 101 * HOUR_MS) / HOUR_MS)
-            .expect("the hour is still there");
-        assert_eq!(mid.turnover, 10.0);
-    }
-
-    /// The warm-up's hourly bars carry the history, the live ticks carry the
-    /// minutes since the start, and the running hour is the two of them
-    /// together: the ISS bar ends ~15 min back, the ticks begin seconds ago.
-    #[test]
-    fn hourly_bars_seed_the_history_the_live_ticks_do_not_cover() {
-        let mut w = Windows::default();
-        let t0 = 800_000 * HOUR_MS;
-        let now = t0 + 2 * HOUR_MS + 40 * MINUTE_MS;
-        // Ticks of the running hour since the start, 300 turnover of them.
-        w.push(4, t0 + 2 * HOUR_MS + 30 * MINUTE_MS, 100.0, 3.0);
-        // The warm-up lands: two closed hours, and the part of the running one
-        // that had already happened before the core opened its stream.
-        w.seed_hour(4, t0, 1000.0);
-        w.seed_hour(4, t0 + HOUR_MS, 2000.0);
-        w.seed_hour(4, t0 + 2 * HOUR_MS, 500.0);
-        assert_eq!(w.vol24(4, now), 3800.0);
-        // Nothing to add, nothing to insert.
-        w.seed_hour(4, t0 + 3 * HOUR_MS, 0.0);
-        assert_eq!(w.hours[4].len(), 3);
-        // The hour ledger is the minute buckets' own business: seeded hours
-        // leave the minute windows (and the delta shifts) untouched.
-        assert_eq!(w.turnover(4, now, 60), 300.0);
+        let t0 = 800_000 * 60 * MINUTE_MS;
+        let now = t0 + 30 * 60 * MINUTE_MS;
+        w.push(4, now - MINUTE_MS, 100.0, 3.0);
+        w.seed(4, now - 25 * 60 * MINUTE_MS, 1.0, 1.0, 1.0, 5000.0);
+        w.seed(4, now - 2 * BAR_MS, 1.0, 1.0, 1.0, 1000.0);
+        w.seed(4, now - 3 * BAR_MS, 1.0, 1.0, 1.0, 2000.0);
+        assert_eq!(w.vol24(4, now), 3300.0);
+        assert_eq!(w.vol24(4, now), w.turnover(4, now, KEEP_MINUTES));
     }
 }

@@ -612,6 +612,16 @@ impl Market {
         self.last() > 0.0 && !self.price_seeded
     }
 
+    /// The exchange quotes the market right now: both sides of a book read
+    /// within `BOOK_STALE_MS`. Aster's `bookTicker` says the market is alive
+    /// as well as a trade does, and a thin one may go minutes without a trade.
+    pub fn book_fresh(&self, now_ms: i64) -> bool {
+        self.book_ms > 0
+            && now_ms - self.book_ms <= BOOK_STALE_MS
+            && self.bid_px() > 0.0
+            && self.ask_px() > 0.0
+    }
+
     /// The last trade price, 0 while none is known.
     pub fn last(&self) -> f64 {
         self.last_price.unwrap_or(0.0)
