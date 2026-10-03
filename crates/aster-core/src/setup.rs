@@ -18,6 +18,10 @@ pub const ISOLATED: &str = "ISOLATED";
 pub const CROSSED: &str = "CROSSED";
 /// `-4046`: the margin type already is the one asked for.
 const CODE_NO_NEED_TO_CHANGE: i64 = -4046;
+/// `-5018`: "maximum notional value limit for this symbol". The exchange's answer to a leverage
+/// whose real limit on the symbol is lower than its bracket table says (AVAX at 75x: the table
+/// holds 25 000 $, the exchange allows an order of 0): the next lower bracket leverage is tried.
+pub const CODE_NOTIONAL_LIMIT: i64 = -5018;
 /// `-1003`: too many requests.
 const CODE_TOO_MANY_REQUESTS: i64 = -1003;
 /// `-4047` (open orders) and `-4048` (open position): the exchange will not change the margin
@@ -63,6 +67,9 @@ pub struct Plan {
     pub margin: Option<&'static str>,
     /// Leverage to be set, to this figure.
     pub leverage: Option<i32>,
+    /// Lower leverages to try, highest first, when the exchange refuses `leverage` with
+    /// [`CODE_NOTIONAL_LIMIT`]: the brackets promise more than the symbol's real limit allows.
+    pub fallback: Vec<i32>,
 }
 
 impl Plan {
@@ -97,6 +104,7 @@ pub fn plan(symbol: &str, row: Option<&PositionRisk>, max: Option<i32>, orders: 
             block: Some(block),
             margin: None,
             leverage: None,
+            fallback: Vec::new(),
         };
     };
     let want = Want {
@@ -115,6 +123,7 @@ pub fn plan_for(symbol: &str, row: Option<&PositionRisk>, want: &Want, orders: b
         block: None,
         margin: None,
         leverage: None,
+        fallback: Vec::new(),
     };
     if want.margin.is_none() && want.leverage.is_none() {
         return out;
@@ -255,26 +264,64 @@ pub fn apply(rest: &mut Rest, signer: &mut Signer, plans: &[Plan]) -> Report {
             }
         }
         if let Some(max) = p.leverage {
-            pause();
-            match rest.set_leverage(signer, &p.symbol, max) {
-                Ok(done) if done.leverage == max => {
-                    log::info!("setup: {} leverage -> {max}x", p.symbol);
-                    report.leverage_set += 1;
+            let rungs: Vec<i32> = std::iter::once(max)
+                .chain(p.fallback.iter().copied())
+                .collect();
+            let mut refused: Vec<String> = Vec::new();
+            for &rung in &rungs {
+                pause();
+                match rest.set_leverage(signer, &p.symbol, rung) {
+                    Ok(done) if done.leverage == rung => {
+                        if rung == max {
+                            log::info!("setup: {} leverage -> {rung}x", p.symbol);
+                        } else {
+                            log::info!(
+                                "setup: {} leverage -> {rung}x (refused with {CODE_NOTIONAL_LIMIT}: {})",
+                                p.symbol,
+                                refused.join(" ")
+                            );
+                        }
+                        report.leverage_set += 1;
+                        refused.clear();
+                        break;
+                    }
+                    Ok(done) => {
+                        report.failed.push((
+                            p.symbol.clone(),
+                            format!(
+                                "leverage: asked {rung}x, the exchange holds {}x",
+                                done.leverage
+                            ),
+                        ));
+                        refused.clear();
+                        break;
+                    }
+                    Err(rest::Error::Api { code, .. }) if code == CODE_NOTIONAL_LIMIT => {
+                        refused.push(format!("{rung}x"));
+                    }
+                    Err(e) if is_limit(&e) => {
+                        report.aborted = Some(format!("{}: leverage: {e}", p.symbol));
+                        break 'symbols;
+                    }
+                    Err(e) => {
+                        refused.clear();
+                        report
+                            .failed
+                            .push((p.symbol.clone(), format!("leverage: {e}")));
+                        break;
+                    }
                 }
-                Ok(done) => report.failed.push((
+            }
+            // Every rung down to the market's own leverage was refused: the exchange's real
+            // limit is where the market already is, which is a settled market, not a failure.
+            if !refused.is_empty() {
+                report.skipped.push((
                     p.symbol.clone(),
                     format!(
-                        "leverage: asked {max}x, the exchange holds {}x",
-                        done.leverage
+                        "the exchange refuses a raise ({CODE_NOTIONAL_LIMIT} at {}), kept as it is",
+                        refused.join(" ")
                     ),
-                )),
-                Err(e) if is_limit(&e) => {
-                    report.aborted = Some(format!("{}: leverage: {e}", p.symbol));
-                    break 'symbols;
-                }
-                Err(e) => report
-                    .failed
-                    .push((p.symbol.clone(), format!("leverage: {e}"))),
+                ));
             }
         }
     }

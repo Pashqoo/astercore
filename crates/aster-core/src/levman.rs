@@ -543,12 +543,20 @@ impl Worker {
             .iter()
             .map(|(symbol, base)| {
                 let want = config.want(symbol, base, brackets.get(symbol));
-                setup::plan_for(
-                    symbol,
-                    by_symbol.get(symbol.as_str()).copied(),
-                    &want,
-                    ordered.contains(symbol.as_str()),
-                )
+                let row = by_symbol.get(symbol.as_str()).copied();
+                let mut plan =
+                    setup::plan_for(symbol, row, &want, ordered.contains(symbol.as_str()));
+                // The table can promise more than the exchange gives (-5018): a raise has the
+                // lower brackets to fall back on, never below the leverage the market has.
+                // A row that does not state its leverage gets no ladder: there is no floor to keep.
+                if let (Some(target), Some(now), Some(b)) = (
+                    plan.leverage,
+                    row.and_then(|r| r.leverage),
+                    brackets.get(symbol),
+                ) {
+                    plan.fallback = b.leverages_between(Some(now), target);
+                }
+                plan
             })
             .collect())
     }
@@ -644,6 +652,20 @@ mod tests {
         // The fixed leverage is clamped to what the brackets allow.
         c.fix_lev = 500;
         assert_eq!(c.want("BTCUSDT", "BTC", Some(&b)).leverage, Some(125));
+    }
+
+    #[test]
+    fn the_fallback_runs_down_the_brackets_but_not_below_the_current_leverage() {
+        let b = brackets(&[
+            (75, 25_000.0),
+            (50, 80_000.0),
+            (25, 800_000.0),
+            (15, 2e6),
+            (15, 3e6),
+        ]);
+        assert_eq!(b.leverages_between(Some(15), 75), vec![50, 25]);
+        assert_eq!(b.leverages_between(None, 50), vec![25, 15]);
+        assert!(b.leverages_between(Some(50), 75).is_empty());
     }
 
     #[test]

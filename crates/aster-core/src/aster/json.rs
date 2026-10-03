@@ -634,6 +634,20 @@ impl SymbolBrackets {
             .max()
     }
 
+    /// The bracket leverages strictly between `above` (exclusive; `None` = none) and `below`
+    /// (exclusive), highest first, each once.
+    pub fn leverages_between(&self, above: Option<i32>, below: i32) -> Vec<i32> {
+        let mut out: Vec<i32> = self
+            .brackets
+            .iter()
+            .map(|b| b.initial_leverage)
+            .filter(|&l| l > 0 && l < below && above.is_none_or(|a| l > a))
+            .collect();
+        out.sort_unstable_by(|a, b| b.cmp(a));
+        out.dedup();
+        out
+    }
+
     /// The highest leverage that still holds a position of `limit` USDT: a bracket's leverage
     /// holds up to its `notionalCap`, and the caps shrink as the leverage grows. When `limit`
     /// is above every cap, the leverage of the widest bracket (the lowest the exchange offers);
