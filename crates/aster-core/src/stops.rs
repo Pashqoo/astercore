@@ -583,7 +583,7 @@ impl State {
         } else {
             price.max(floor)
         };
-        Some((m.within_limits(price), spread, immediate || floored))
+        Some((m.within_limits(price, short), spread, immediate || floored))
     }
 }
 

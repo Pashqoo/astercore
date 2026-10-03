@@ -631,7 +631,7 @@ impl CoreOrder {
     }
 
     /// Exchange direction of a leg.
-    fn sells(&self, leg: Leg) -> bool {
+    pub fn sells(&self, leg: Leg) -> bool {
         (leg == Leg::Sell) != self.is_short
     }
 
@@ -1828,7 +1828,7 @@ impl Orders {
         fx
     }
 
-    /// The engine pinned a leg's price into the exchange band before the call.
+    /// The engine pinned a leg's price to the `PERCENT_PRICE` bound of its side before the call.
     pub fn reprice(&mut self, id: u64, leg: Leg, price: f64) -> bool {
         let Some(o) = self.map.get_mut(&id) else {
             return false;
@@ -1844,7 +1844,7 @@ impl Orders {
     }
 
     /// Planned exits the exchange refused before they opened get one more
-    /// try — the price band is known now and the engine pins them into it.
+    /// try. Not wired in this core (only tests call it): it is the MOEX port's answer to a band that arrived late.
     pub fn retry_exits(&mut self, uid: &str) -> Effects {
         let mut fx = Effects::default();
         let ids: Vec<u64> = self
@@ -2422,7 +2422,7 @@ impl Orders {
         // For a MARKET exit, the price it is shown at until it fills.
         let Some(price) = m
             .marketable_at(sells, spread, now_ms)
-            .map(|p| m.within_limits(p))
+            .map(|p| m.within_limits(p, !sells))
         else {
             if !armed {
                 fx.logs
@@ -6279,8 +6279,9 @@ mod tests {
 
     /// A real order's panic is one MARKET exit, not chased while it is live;
     /// an emulated one keeps TInvestCore's limit through the book, pinned to
-    /// the `PERCENT_PRICE` band (mark 300 × 0.99 / 1.01 = 297 / 303)
-    /// and not repriced there again and again.
+    /// the `PERCENT_PRICE` bound of its side (mark 300 × 0.99 / 1.01 = 297 / 303:
+    /// a long's sell stands at 297, a short's buy at 303) and not repriced there
+    /// again and again.
     #[test]
     fn panic_goes_at_market_and_an_emulated_one_stays_at_the_band() {
         for (short, emulated) in [(false, false), (true, false), (false, true), (true, true)] {

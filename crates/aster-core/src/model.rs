@@ -143,13 +143,14 @@ pub struct MarketTags {
 impl MarketTags {
     /// Choices of the terminal's `MarketTags` combo: one class per item,
     /// spelled the way [`Self::parse`] expects. A combination or a `!tag`
-    /// exclusion still parses when typed into a strategy file.
+    /// exclusion still parses when typed into a strategy file (`all` takes no `!`).
     pub const PICKLIST: &'static str =
-        "crypto|stock|forex|commodities|etf|meme|ai|top|rwa|prelaunch";
+        "all|crypto|stock|forex|commodities|etf|meme|ai|top|rwa|prelaunch";
 
     /// MoonBot tag-filter syntax, case-insensitive: `crypto`, `meme, ai` or
-    /// `!stock` (only exclusions start from every class). Empty text is the
-    /// empty set; an unknown tag is the error, so a typo never widens the set.
+    /// `!stock` (only exclusions start from every class); `all` is every class,
+    /// the editor's default. Empty text is the empty set; an unknown tag is the
+    /// error, so a typo never widens the set.
     pub fn parse(text: &str) -> Result<Self, String> {
         let (mut include, mut exclude) = (0u16, 0u16);
         for token in text.split([',', ' ', ';']).filter(|t| !t.is_empty()) {
@@ -157,6 +158,10 @@ impl MarketTags {
                 Some(rest) => (true, rest),
                 None => (false, token),
             };
+            if !negated && name.eq_ignore_ascii_case("all") {
+                include |= Tag::ALL.iter().fold(0, |acc, t| acc | t.bit());
+                continue;
+            }
             let Some(tag) = Tag::ALL
                 .iter()
                 .find(|t| t.name().eq_ignore_ascii_case(name))
@@ -217,8 +222,8 @@ pub struct Market {
     pub min_notional: f64,
     pub min_price: f64,
     pub max_price: f64,
-    /// `PERCENT_PRICE`, per symbol: an order price must sit within
-    /// `[mark × down, mark × up]`.
+    /// `PERCENT_PRICE`, per symbol: a BUY price must be `<= mark × up` and a
+    /// SELL price `>= mark × down` (one side per order, [`Market::within_limits`]).
     ///
     /// Measured 01.10 over all 596 USDT perpetuals, and NOT the "±2 %" the plan
     /// first recorded from BTCUSDT alone: 1.10/0.90 on 405 symbols, 1.05/0.95
@@ -642,9 +647,10 @@ impl Market {
         Some(self.snap(raw, !sell))
     }
 
-    /// The band `PERCENT_PRICE` allows a limit in: the mark price times
+    /// The band `PERCENT_PRICE` is drawn as: the mark price times
     /// `multiplierDown` / `multiplierUp`. `None` while the mark or the
-    /// multipliers are unknown.
+    /// multipliers are unknown. It is not a band an order must sit in: the
+    /// exchange bounds one side of each order only (see [`Market::within_limits`]).
     pub fn band(&self) -> Option<(f64, f64)> {
         let mark = self.mark_price.filter(|p| *p > 0.0)?;
         (self.multiplier_down > 0.0 && self.multiplier_up > 0.0).then(|| {
@@ -655,31 +661,35 @@ impl Market {
         })
     }
 
-    /// `price` pinned inside the band, unchanged while the band is unknown.
-    pub fn within_limits(&self, price: f64) -> f64 {
+    /// `price` pinned to what `PERCENT_PRICE` lets an order of this side
+    /// carry, unchanged while the band is unknown. The exchange bounds ONE
+    /// side per order (Aster futures API, `PERCENT_PRICE`): a BUY must be
+    /// `<= mark × multiplierUp`, a SELL `>= mark × multiplierDown`. A buy far
+    /// below the mark and a sell far above it are fine, and live orders sit
+    /// there (a BTCUSDT bid 4.7 % under the mark, 03.10). `buy` is the exchange
+    /// direction, not the leg: a short's entry is a SELL.
+    pub fn within_limits(&self, price: f64, buy: bool) -> f64 {
+        if price.is_nan() {
+            return price;
+        }
         match self.band() {
-            // `clamp` panics on `down > up` (a band a tick wide after snapping, a broken mark),
-            // and a NaN bound: the price stays as it is then.
-            Some((down, up)) if down <= up => price.clamp(down, up),
+            Some((_, up)) if buy && up.is_finite() => price.min(up),
+            Some((down, _)) if !buy && down.is_finite() => price.max(down),
             _ => price,
         }
     }
 
-    /// `price` when it lies inside the band (or the band is unknown), 0 past
-    /// it: a strategy entry beyond the band is not placed — pinned to the edge
-    /// it would sit nearer the market than the strategy asked (TInvestCore,
-    /// by request, 21.09). Exits and manual orders are pinned instead.
-    pub fn inside_limits(&self, price: f64) -> f64 {
+    /// `price` when an order of this side may carry it (or the band is
+    /// unknown), 0 past the bound: a strategy entry beyond it is not placed —
+    /// pinned to the edge it would sit nearer the market than the strategy
+    /// asked (TInvestCore, by request, 21.09). Exits and manual orders are
+    /// pinned instead. `buy` as in [`Market::within_limits`].
+    pub fn inside_limits(&self, price: f64, buy: bool) -> f64 {
+        let eps = self.tick_size.max(0.0) * 1e-6;
         match self.band() {
-            Some((down, up)) => {
-                let eps = self.tick_size.max(0.0) * 1e-6;
-                if price < down - eps || price > up + eps {
-                    0.0
-                } else {
-                    price
-                }
-            }
-            None => price,
+            Some((_, up)) if buy && price > up + eps => 0.0,
+            Some((down, _)) if !buy && price < down - eps => 0.0,
+            _ => price,
         }
     }
 
@@ -1666,16 +1676,37 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    /// A band a tick wide or inverted (a broken mark) leaves the price alone instead of
-    /// panicking `f64::clamp`.
+    /// `PERCENT_PRICE` bounds one side per order (Aster futures API: BUY
+    /// `<= mark × up`, SELL `>= mark × down`). Live 03.10: a BTCUSDT bid 4.7 %
+    /// under the mark stood on the exchange while the core, reading the band
+    /// as two-sided, refused every such entry.
     #[test]
-    fn a_degenerate_band_does_not_panic() {
+    fn percent_price_bounds_one_side_of_each_order() {
         let mut m = btc();
-        m.set_limits(10.0, 5.0, 0);
-        assert_eq!(m.within_limits(7.0), 7.0);
+        // A mark of 1 with the bounds as multipliers: 5..10.
         m.set_limits(5.0, 10.0, 0);
-        assert_eq!(m.within_limits(7.0), 7.0);
-        assert_eq!(m.within_limits(11.0), 10.0);
+        // BUY: capped above, free below.
+        assert_eq!(m.within_limits(11.0, true), 10.0);
+        assert_eq!(m.within_limits(1.0, true), 1.0, "a bid far under the mark");
+        assert_eq!(m.inside_limits(11.0, true), 0.0);
+        assert_eq!(m.inside_limits(1.0, true), 1.0);
+        // SELL: floored, free above.
+        assert_eq!(m.within_limits(4.0, false), 5.0);
+        assert_eq!(
+            m.within_limits(99.0, false),
+            99.0,
+            "an ask far over the mark"
+        );
+        assert_eq!(m.inside_limits(4.0, false), 0.0);
+        assert_eq!(m.inside_limits(99.0, false), 99.0);
+        // An inverted band (a broken mark) or a NaN price panics nothing.
+        m.set_limits(10.0, 5.0, 0);
+        assert_eq!(m.within_limits(7.0, true), 5.0);
+        assert!(m.within_limits(f64::NAN, true).is_nan());
+        // No mark, no band, no bound.
+        m.mark_price = None;
+        assert_eq!(m.within_limits(1e9, true), 1e9);
+        assert_eq!(m.inside_limits(0.5, false), 0.5);
     }
 
     use super::*;
@@ -1736,6 +1767,13 @@ mod tests {
         assert!(!t("crypto, !meme").matches(&doge), "an excluded tag wins");
         assert!(t("!meme").matches(&nvda) && !t("!meme").matches(&doge));
         assert!(t("").is_empty() && !t("").matches(&doge));
+        assert!(
+            t("ALL").matches(&doge)
+                && t("all").matches(&nvda)
+                && t("all").matches(&[Tag::PreLaunch])
+        );
+        assert!(!t("all, !meme").matches(&doge) && t("all, !meme").matches(&nvda));
+        assert!(MarketTags::parse("!all").is_err(), "all has no exclusion");
         assert_eq!(MarketTags::parse("crypto, fx"), Err("fx".to_string()));
         for name in MarketTags::PICKLIST.split('|') {
             assert!(MarketTags::parse(name).is_ok(), "{name}");

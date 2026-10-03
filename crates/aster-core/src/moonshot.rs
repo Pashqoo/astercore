@@ -768,7 +768,7 @@ pub struct MoonShot {
     /// over the budget: logged once, until an entry there starts again.
     over_lot: HashSet<(u64, String)>,
     /// (strategy, market uid) whose ladder entry was skipped past the
-    /// exchange band: logged once, until an entry there starts again.
+    /// exchange bound of its side: logged once, until an entry there starts again.
     past_band: HashSet<(u64, String)>,
     /// EMAs and strikes of the MoonStrike universes.
     tracks: Tracks,
@@ -2249,14 +2249,15 @@ impl MoonShot {
         let n = p.orders_count.max(1) as usize;
         let dist = |i: usize| i as f64 * p.step.abs() + c.dist * factor(c.expand, i);
         let width = |i: usize| c.width.max(0.0) * factor(c.expand, i);
-        // A tier beyond the exchange band prices nothing (0): it is not
-        // placed, and a placed one is not moved past the limit.
+        // A tier past the exchange bound of its side (a BUY above `mark × up`, a
+        // SELL below `mark × down`) prices nothing (0): it is not placed, and a
+        // placed one is not moved past the limit.
         let raw = |i: usize, reference: f64| m.nearest(entry_price(c.short, reference, dist(i)));
-        let target = |i: usize, reference: f64| m.inside_limits(raw(i, reference));
+        let target = |i: usize, reference: f64| m.inside_limits(raw(i, reference), !c.short);
         let tick = m.tick_size.max(f64::EPSILON);
 
         // Keep each order's original slot while other orders are cancelled,
-        // replaced or pinned to the exchange band. Rank only unbound entries
+        // replaced or pinned to the exchange bound. Rank only unbound entries
         // once (e.g. an entry started externally with a strategy id).
         let mut sorted = entries.to_vec();
         sorted.sort_by(|a, b| {
@@ -2299,7 +2300,7 @@ impl MoonShot {
             if price <= 0.0 {
                 let raw = raw(i, last);
                 if raw > 0.0 && self.past_band.insert(key) {
-                    cmds.push(past_band_log(s, m, c.kind, i, raw));
+                    cmds.push(past_band_log(s, m, c.kind, c.short, i, raw));
                 }
                 continue;
             }
@@ -2537,6 +2538,7 @@ impl MoonShot {
                 s,
                 m,
                 "Drops",
+                false,
                 i,
                 m.nearest(base * (1.0 + pct / 100.0)),
                 cmds,
@@ -2724,8 +2726,8 @@ impl MoonShot {
         let d = m.price_precision as usize;
         for i in 0..p.orders_count.max(1) as usize {
             let (take, _, depth, sell) = strike_prices(p, sig, i);
-            let price = band_entry(s, m, "MoonStrike", i, m.nearest(take), cmds);
-            // A level past −100 % or past the exchange band prices nothing
+            let price = band_entry(s, m, "MoonStrike", sig.short, i, m.nearest(take), cmds);
+            // A level past −100 % or past the exchange bound prices nothing
             // (`start_tier` skips it too).
             if price <= 0.0 {
                 continue;
@@ -3077,7 +3079,7 @@ impl MoonShot {
             }
         }
         if !has_exit {
-            let price = m.within_limits(m.nearest(exit_price(short, entry, sell_pct)));
+            let price = m.within_limits(m.nearest(exit_price(short, entry, sell_pct)), short);
             if price > 0.0 {
                 cmds.push(mv(price, reason::SELL_PRICE));
                 cmds.push(Cmd::Log(format!(
@@ -3119,7 +3121,10 @@ impl MoonShot {
                 floor.min(start)
             };
         }
-        let price = m.within_limits(price_down(p, m, short, entry, sell_pct, steps, floor));
+        let price = m.within_limits(
+            price_down(p, m, short, entry, sell_pct, steps, floor),
+            short,
+        );
         if price <= 0.0 || (price - exit).abs() < tick {
             return;
         }
@@ -3280,7 +3285,7 @@ fn hook_orders(
     for i in 0..p.orders_count.max(1) as usize {
         let dist = h.dist + i as f64 * p.step.abs();
         let raw = m.nearest(entry_price(h.short, anchor, dist));
-        let price = band_entry(s, m, "MoonHook", i, raw, cmds);
+        let price = band_entry(s, m, "MoonHook", h.short, i, raw, cmds);
         if price <= 0.0 {
             continue;
         }
@@ -3937,31 +3942,44 @@ fn over_lot_log(s: &StrategySnapshot, p: &Params, m: &Market, tier: usize, price
     ))
 }
 
-/// The entry of `tier` at `price` past the exchange band is not placed.
-fn past_band_log(s: &StrategySnapshot, m: &Market, kind: &str, tier: usize, price: f64) -> Cmd {
-    let band = m.band().unwrap_or_default();
+/// The entry of `tier` at `price` past what `PERCENT_PRICE` lets its side
+/// carry is not placed: a BUY above `mark × multiplierUp` (`limit`), a SELL
+/// below `mark × multiplierDown`.
+fn past_band_log(
+    s: &StrategySnapshot,
+    m: &Market,
+    kind: &str,
+    short: bool,
+    tier: usize,
+    price: f64,
+) -> Cmd {
+    let (down, up) = m.band().unwrap_or_default();
+    let (side, rule, limit) = if short {
+        ("SELL", "below", down)
+    } else {
+        ("BUY", "above", up)
+    };
     Cmd::Log(format!(
-        "{}: {kind} tier {tier} price {price} is outside the exchange band {}..{} \
+        "{}: {kind} tier {tier} {side} price {price} is {rule} the exchange limit {limit} \
          (strategy <{}>): no entry",
         m.symbol,
-        band.0,
-        band.1,
         label(s)
     ))
 }
 
-/// A signal entry at `price` inside the exchange band, else 0 and a log line.
+/// A signal entry at `price` that its side may carry, else 0 and a log line.
 fn band_entry(
     s: &StrategySnapshot,
     m: &Market,
     kind: &str,
+    short: bool,
     tier: usize,
     price: f64,
     cmds: &mut Vec<Cmd>,
 ) -> f64 {
-    let inside = m.inside_limits(price);
+    let inside = m.inside_limits(price, !short);
     if inside <= 0.0 && price > 0.0 {
-        cmds.push(past_band_log(s, m, kind, tier, price));
+        cmds.push(past_band_log(s, m, kind, short, tier, price));
     }
     inside
 }
@@ -4535,18 +4553,20 @@ mod tests {
 
     #[test]
     fn entries_past_the_band_wait_until_it_opens() {
+        // A BUY is bounded from above only (`mark × multiplierUp`): the ladder's
+        // tiers above the ceiling wait, the ones under it go.
         let mut model = model();
-        model.at_mut(1).unwrap().set_limits(299.0, 305.0, 0);
+        model.at_mut(1).unwrap().set_limits(250.0, 296.0, 0);
         let st = stepped_ladder(3);
         let (win, sched) = (Windows::default(), None::<f64>);
         let orders = Orders::new();
         let mut shot = MoonShot::default();
         let now = 1_000_000;
         assert!(starts(&shot.tick(&st, &orders, &model, &win, sched, now)).is_empty());
-        model.at_mut(1).unwrap().set_limits(297.0, 305.0, 0);
+        model.at_mut(1).unwrap().set_limits(250.0, 297.5, 0);
         assert_eq!(
             starts(&shot.tick(&st, &orders, &model, &win, sched, now + 1000)),
-            [(298.2, 6000.0), (297.3, 9000.0)]
+            [(297.3, 9000.0), (296.4, 12000.0)]
         );
         model.at_mut(1).unwrap().set_limits(250.0, 350.0, 0);
         assert_eq!(
@@ -7445,11 +7465,15 @@ mod tests {
                 &none(),
             )
         };
-        // A strategy without the field: the coins. STAR never traded, and
-        // with the volume bounds gone from the screener a silent market is
-        // still a market of the class — it is watched and simply not entered
-        // (`the_volume_bounds_are_an_and_not_a_choice`).
-        assert_eq!(pick(None, ""), [1, 3]);
+        // A strategy without the field: every class (`all`, the schema's
+        // default), so the stock perpetual is in beside the coins — three
+        // markets, a count of two. The coins alone are `crypto`: STAR never
+        // traded, and with the volume bounds gone from the screener a silent
+        // market is still a market of the class — it is watched and simply not
+        // entered (`the_volume_bounds_are_an_and_not_a_choice`).
+        assert_eq!(pick(None, ""), [2, 1]);
+        assert_eq!(pick(Some("all"), ""), [2, 1]);
+        assert_eq!(pick(Some("crypto"), ""), [1, 3]);
         assert_eq!(pick(Some("stock"), ""), [2]);
         assert_eq!(
             pick(Some("Crypto, STOCK"), ""),
@@ -8187,12 +8211,13 @@ mod tests {
     fn review_price_down_must_compare_exchange_capped_price() {
         let (mut m, st, mut os, mut shot, id) =
             review_live_position(&[("PriceDownTimer", FieldValue::Double(1.0))]);
-        m.at_mut(1).unwrap().set_limits(280.0, 301.0, 0);
-        os.reprice(id, Leg::Sell, 301.0);
+        // A SELL is floored by `mark × multiplierDown` and free above it.
+        m.at_mut(1).unwrap().set_limits(306.0, 400.0, 0);
+        os.reprice(id, Leg::Sell, 306.0);
         let cmds = shot.tick(&st, &os, &m, &Windows::default(), None, 1_002_000);
         assert!(
             moves(&cmds).is_empty(),
-            "target will be capped back to 301: {cmds:?}"
+            "target will be capped back to 306: {cmds:?}"
         );
     }
 
@@ -8667,6 +8692,7 @@ mod tests {
         // the cases below vary one thing at a time; `fields` wins over it.
         let pool = |fields: &[(&str, FieldValue)]| {
             let mut all: Vec<(&str, FieldValue)> = vec![
+                (MARKET_TAGS, Str("crypto".into())),
                 ("DynWL_SortBy", Str("DailyVol".into())),
                 ("DynWL_Count", Int32(9)),
             ];

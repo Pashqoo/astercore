@@ -156,10 +156,10 @@ fn schema_fields() -> Vec<SchemaField> {
         // Aster's taxonomy (`model::Tag`), `!tag` excludes. The combo offers
         // one class per item (`MarketTags::PICKLIST`) so the editor cannot
         // misspell a tag; a combination or a `!tag` still parses when a
-        // strategy file carries one. The default is the coins.
+        // strategy file carries one. The default is `all`.
         SchemaField {
             name: MARKET_TAGS,
-            default: s("crypto"),
+            default: s("all"),
             ui: ui::COMBO,
             section: None,
             picklist: Some(MarketTags::PICKLIST),

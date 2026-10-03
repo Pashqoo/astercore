@@ -2357,8 +2357,9 @@ impl CoreHandler {
             if !price.is_finite() || price <= 0.0 {
                 continue;
             }
-            // At a tick and inside the exchange band, as every other move.
-            let price = m.within_limits(m.nearest(price));
+            // At a tick and within the bound of its exchange side, as every other move.
+            let buy = !self.orders.get(id).is_some_and(|o| o.sells(leg));
+            let price = m.within_limits(m.nearest(price), buy);
             fx.extend(match leg {
                 Leg::Sell => self.orders.target(id, Leg::Sell, price, None),
                 Leg::Buy => self.orders.target_manual(id, Leg::Buy, price, None, now),
@@ -2620,8 +2621,9 @@ impl CoreHandler {
     }
 
     /// Queue order images and log lines for every session; hold the exchange
-    /// work for `flush_actions`. A limit outside the `PERCENT_PRICE` band is
-    /// pinned to it first, the image following (the gateway refuses it).
+    /// work for `flush_actions`. A limit past the `PERCENT_PRICE` bound of its
+    /// side (a BUY above `mark × up`, a SELL below `mark × down`) is pinned to
+    /// that bound first, the image following (the gateway refuses it).
     fn effects(&mut self, mut fx: Effects, now: i64) {
         self.cap_to_band(&mut fx);
         self.orders.note_moves(&fx.changed, now);
@@ -3207,18 +3209,23 @@ impl CoreHandler {
                 } => (*order, *leg, price),
                 _ => continue,
             };
-            let Some(m) = self
+            let Some((m, sells)) = self
                 .orders
                 .get(order)
-                .and_then(|o| self.catalog.get(&o.uid))
+                .and_then(|o| self.catalog.get(&o.uid).map(|m| (m, o.sells(leg))))
             else {
                 continue;
             };
-            let capped = m.within_limits(*price);
+            let capped = m.within_limits(*price, !sells);
             if capped != *price {
                 let (down, up) = m.band().unwrap_or_default();
+                let (rule, limit) = if sells {
+                    ("below", down)
+                } else {
+                    ("above", up)
+                };
                 fx.logs.push(format!(
-                    "{}: price {price} is outside the exchange band {down}..{up}, placed at {capped}",
+                    "{}: price {price} is {rule} the exchange limit {limit}, placed at {capped}",
                     m.symbol
                 ));
                 *price = capped;
