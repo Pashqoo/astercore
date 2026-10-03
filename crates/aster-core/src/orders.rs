@@ -506,8 +506,9 @@ pub struct CoreOrder {
     /// Earliest time of the next panic exit call.
     #[serde(skip)]
     panic_next: i64,
-    /// Panic/stop exits refused in a row: the retry waits longer each time (`panic_retry_ms`)
-    /// and starts over when an exit is live.
+    /// Panic/stop exits refused, or MARKET ones expired unfilled, in a row: the retry waits
+    /// longer each time (`panic_retry_ms`) and starts over when an exit is live (a MARKET one
+    /// once it fills) or a panic is asked for again.
     #[serde(skip)]
     panic_fails: u32,
     /// The planned exit was refused by the exchange (`-2022` with a rival order resting, a
@@ -2142,6 +2143,10 @@ impl Orders {
     /// off = leave the exit where it is.
     pub fn set_panic(&mut self, id: u64, on: bool, market: &Market, now_ms: i64) -> Effects {
         if on {
+            // A panic asked for now is not held back by the refusals of an earlier one.
+            if let Some(o) = self.map.get_mut(&id) {
+                o.panic_fails = 0;
+            }
             self.set_sell_reason(id, reason::PANIC_SELL);
             self.at_market(id);
             return self.panic_exit(id, market, now_ms);
@@ -2488,6 +2493,8 @@ impl Orders {
         let foreign_exit = leg == Leg::Sell && !ex.owned;
         // An exit move waits for the cancelled order's final report.
         let reprice = leg == Leg::Sell && ex.cancel_requested && ex.deferred.is_some();
+        // An end the core asked for is not the exchange giving up on the order.
+        let cancel_asked = ex.cancel_requested;
         let which = ex
             .executions
             .iter()
@@ -2513,6 +2520,7 @@ impl Orders {
             self.by_exchange.insert(u.exchange_id.clone(), (id, leg));
         }
         let (known, known_mean) = (e.filled, e.mean);
+        let was_final = e.status.is_some_and(ExecStatus::is_final);
         if u.price > 0.0 && u.lots_executed >= known {
             e.price = u.price;
         }
@@ -2536,6 +2544,7 @@ impl Orders {
             });
         }
         let current_status = e.status.unwrap_or(u.status);
+        let exec_filled = e.filled;
         if !current && !foreign_exit && e.filled == known && e.mean == known_mean {
             return fx;
         }
@@ -2639,13 +2648,42 @@ impl Orders {
             }
         } else if current
             && leg == Leg::Sell
+            && !foreign_exit
+            && o.panic
+            && u.is_market
+            && current_status == ExecStatus::Cancelled
+            && !was_final
+            && !cancel_asked
+        {
+            // A MARKET exit the exchange expired: off-session a stock perp fills only within
+            // 5 % of the mark. Some lots sold — the rest goes again after PANIC_CHASE_MS. None
+            // — nothing stands inside the cap, and asking every 2 s all night is a burst of
+            // orders against the exchange's limit (a panic over 40 stocks): it waits like a
+            // refusal does.
+            if exec_filled == 0 {
+                o.panic_fails = o.panic_fails.saturating_add(1);
+                let wait = panic_retry_ms(o.panic_fails);
+                o.panic_next = now_ms + wait;
+                fx.logs.push(format!(
+                    "{market}: the MARKET exit expired unfilled (nothing inside the exchange's \
+                     price cap); next try in {} s",
+                    wait / 1000
+                ));
+            } else {
+                o.panic_fails = 0;
+            }
+        } else if current
+            && leg == Leg::Sell
             && matches!(
                 u.status,
                 ExecStatus::New | ExecStatus::PartiallyFilled | ExecStatus::Filled
             )
         {
-            // The exit is live: the refusals before it are over.
-            o.panic_fails = 0;
+            // The exit is live: the refusals before it are over. A MARKET one counts for the
+            // panic only once it fills — it may still expire unfilled (above).
+            if u.status != ExecStatus::New || !u.is_market {
+                o.panic_fails = 0;
+            }
             (o.exit_refused, o.exit_fails, o.exit_retry_at) = (Some(false), 0, 0);
         }
         self.set_status(id, next, now_ms);
@@ -6378,6 +6416,73 @@ mod tests {
         os.apply(&rest, 3500);
         assert_eq!(os.get(42).unwrap().status, status::SELL_DONE);
         assert!(os.watch(&model, 9000).actions.is_empty());
+    }
+
+    /// A panic MARKET exit that expires with nothing sold (an empty book inside the cap, off
+    /// session) is tried again 10 s later, then 20 s — not every 2 s; its NEW report does not
+    /// reset that, the same expiry reported twice counts once, and a fill does reset it.
+    #[test]
+    fn a_panic_market_exit_that_expires_unfilled_waits_longer_each_time() {
+        let mut model = sber_model();
+        model.get_mut("u-sber").unwrap().mark_price = Some(300.0);
+        let m = model.get("u-sber").unwrap();
+        let mut os = Orders::new();
+        let fx = os.start(42, &start(9000.0, 300.0, 0.0), m, 1000);
+        os.apply(
+            &update(&post_key(&fx), "1001", ExecStatus::Filled, 3, 3, 300.0),
+            1100,
+        );
+        let market = |key: &str, ex: &str, st: ExecStatus, done: i64| {
+            let mut u = update(key, ex, st, 3, done, 0.0);
+            u.is_market = true;
+            u.sell = true;
+            u
+        };
+        let mut key = post_key(&os.set_panic(42, true, m, 1200));
+        let mut at = 1200;
+        for (n, wait) in [(1, 10_000), (2, 20_000)] {
+            os.apply(&market(&key, &format!("e{n}"), ExecStatus::New, 0), at + 50);
+            let mut gone = market(&key, &format!("e{n}"), ExecStatus::Cancelled, 0);
+            let fx = os.apply(&gone, at + 100);
+            assert!(
+                fx.logs.iter().any(|l| l.contains("expired unfilled")),
+                "{:?}",
+                fx.logs
+            );
+            // The same end, by the stream after the reply.
+            gone.unary = false;
+            os.apply(&gone, at + 150);
+            assert!(os
+                .watch(&model, at + 100 + PANIC_CHASE_MS)
+                .actions
+                .is_empty());
+            assert!(os.watch(&model, at + 100 + wait - 1).actions.is_empty());
+            let fx = os.watch(&model, at + 100 + wait);
+            key = post_key(&fx);
+            at += 100 + wait;
+        }
+        // A panic asked for again starts its count afresh.
+        assert_eq!(os.get(42).unwrap().panic_fails, 2);
+        os.set_panic(42, true, m, at + 10);
+        assert_eq!(os.get(42).unwrap().panic_fails, 0);
+        // Two of the three lots sell, the last expires: the rest goes again 2 s after the post.
+        let mut part = market(&key, "e3", ExecStatus::Cancelled, 2);
+        part.avg_price = 290.0;
+        os.apply(&part, at + 100);
+        assert_eq!(os.get(42).unwrap().panic_fails, 0);
+        let fx = os.watch(&model, at + PANIC_CHASE_MS);
+        assert!(
+            matches!(
+                fx.actions[0],
+                Action::Post {
+                    lots: 1,
+                    price: None,
+                    ..
+                }
+            ),
+            "{:?}",
+            fx.actions
+        );
     }
 
     #[test]
