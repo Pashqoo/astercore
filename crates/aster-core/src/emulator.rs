@@ -49,18 +49,14 @@ impl Emulator {
                 order,
                 leg,
                 exchange_id,
-                key,
-                uid,
                 lots,
                 price,
                 ..
-            } => match orders.emu_order(*order, *leg, exchange_id) {
-                // Same direction as the order it replaces.
-                Some(old) => {
-                    return self.place(key, uid, *lots, Some(*price), old.sell, market, now_ms)
-                }
-                None => None,
-            },
+            } => orders
+                .emu_order(*order, *leg, exchange_id)
+                // An order that has ended is not amended: the exchange does not know it.
+                .filter(|e| !e.status.is_some_and(ExecStatus::is_final))
+                .map(|e| amend(e, *lots, *price, market, now_ms)),
             Action::Cancel {
                 order,
                 leg,
@@ -197,6 +193,24 @@ fn best(m: &Market, sell: bool) -> f64 {
     }
 }
 
+/// An amend of the resting `e`: the same order at `price`, `lots` its whole size; filled at once
+/// at the best quote when the new price meets it, as a new order would be.
+fn amend(e: EmuOrder, lots: i64, price: f64, market: Option<&Market>, now_ms: i64) -> OrderUpdate {
+    let quote = market.map_or(0.0, |m| best(m, e.sell));
+    let fill = (quote > 0.0 && crosses(e.sell, quote, price)).then_some(quote);
+    let e = EmuOrder { lots, price, ..e };
+    match fill {
+        Some(at) => {
+            let mut u = report(&e, ExecStatus::Filled, now_ms);
+            u.lots_executed = lots;
+            // The lots filled before at the old limit and the rest at the quote.
+            u.avg_price = (e.filled as f64 * e.mean + (lots - e.filled) as f64 * at) / lots as f64;
+            u
+        }
+        None => report(&e, ExecStatus::New, now_ms),
+    }
+}
+
 /// The current state of `e` as a unary reply with `status`.
 fn report(e: &EmuOrder, status: ExecStatus, now_ms: i64) -> OrderUpdate {
     OrderUpdate {
@@ -319,12 +333,21 @@ mod tests {
         let (model, mut orders, mut emu) = (model(), Orders::new(), Emulator::starting_at(0));
         let (id, actions) = start(&mut orders, &model, 299.0);
         run(&mut emu, &mut orders, &model, actions);
-        // A move replaces the order: the new one rests, the old never fills.
+        // A move amends the order: the same one rests at the new price.
+        let placed = orders.emu_resting("u-sber")[0].exchange_id.clone();
         let fx = orders.target(id, Leg::Buy, 298.0, None);
         assert!(matches!(fx.actions[..], [Action::Replace { .. }]));
         run(&mut emu, &mut orders, &model, fx.actions);
         let resting = orders.emu_resting("u-sber");
         assert_eq!((resting.len(), resting[0].price), (1, 298.0));
+        assert_eq!(resting[0].exchange_id, placed, "the same order");
+        // Moved through the ask, it fills at the quote.
+        let fx = orders.target(id, Leg::Buy, 301.0, None);
+        run(&mut emu, &mut orders, &model, fx.actions);
+        assert_eq!(orders.get(id).unwrap().status, status::BUY_DONE);
+        assert!(orders.emu_resting("u-sber").is_empty());
+        let (id, actions) = start(&mut orders, &model, 299.0);
+        run(&mut emu, &mut orders, &model, actions);
         let fx = orders.cancel(id, Leg::Buy);
         run(&mut emu, &mut orders, &model, fx.actions);
         assert_eq!(orders.get(id).unwrap().status, status::BUY_CANCEL);

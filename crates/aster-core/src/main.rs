@@ -118,10 +118,10 @@ fn main() -> ExitCode {
     // Every REST call of the process counts into it from the first one on.
     let meter = ApiMeter::new(Some(API_METER_FILE.into()));
     // Aster prices one call by count: `ORDERS` 1200 a minute, the new orders
-    // (`exchangeInfo.rateLimits`, measured 01.10); the weight and the 10 s
-    // order window are the exchange's own gauges on the page.
+    // and the amends (`exchangeInfo.rateLimits`, measured 01.10); the weight
+    // and the 10 s order window are the exchange's own gauges on the page.
     meter.set_tariff(vec![api_meter::TariffGroup {
-        methods: vec!["POST /fapi/v3/order".into()],
+        methods: vec!["POST /fapi/v3/order".into(), "PUT /fapi/v3/order".into()],
         per_minute: 1200,
         per_second: None,
     }]);

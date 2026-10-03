@@ -165,6 +165,9 @@ pub enum Action {
         leg: Leg,
         exchange_id: String,
     },
+    /// Move the leg's live order: Aster's amend (`PUT /fapi/v3/order`), the
+    /// same order under the same `key`, to `price`, `lots` its whole size —
+    /// fills included.
     Replace {
         order: u64,
         leg: Leg,
@@ -173,10 +176,6 @@ pub enum Action {
         uid: String,
         lots: i64,
         price: f64,
-        /// Lots of the replaced order the model has counted as filled: more
-        /// in the exchange's answer to the cancel means fills the new `lots`
-        /// did not allow for (`trading::execute`).
-        filled: i64,
     },
     /// Resolve a request whose outcome is unknown, using its idempotency key.
     QueryRequest { order: u64, leg: Leg, key: String },
@@ -227,8 +226,11 @@ impl Effects {
     }
 }
 
-/// One exchange order. A Replace creates a new execution; late reports of
-/// retired executions may add fills but must never change the active order.
+/// One exchange order. An amend (`Action::Replace`) moves it in place; a leg
+/// re-posted after a cancel (an exit moved to MARKET, a refused exit tried
+/// again) is a new execution, and late reports of retired executions may add
+/// fills but must never change the active order. Orders saved before 03.10
+/// may still hold the generations TInvestCore's cancel-and-post replace made.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Execution {
@@ -299,8 +301,36 @@ struct ExLeg {
     #[serde(skip)]
     resolve_at: i64,
     resolve_key: String,
+    /// The amend in flight (`replacing`): what it asked for, and what the order was before, to
+    /// go back to when the exchange refuses it. Not persisted: a restart reads the order
+    /// (`restore` makes the leg uncertain), and that is the order's truth.
+    #[serde(skip)]
+    amend: Option<Amend>,
     #[serde(with = "LegStateDef")]
     state: LegState,
+}
+
+/// One amend of a leg's live order: what it asked for, and what the order was before.
+#[derive(Debug, Clone, Copy)]
+struct Amend {
+    price: f64,
+    /// The order's whole size it asked for, fills included.
+    lots: i64,
+    was_price: f64,
+    was_lots: i64,
+    was_reason: u8,
+    /// Its call failed with no answer: whether it landed is for the next read of the order to
+    /// say (`apply`), not for the amend's own answer, which will not come.
+    unsure: bool,
+}
+
+impl Amend {
+    /// A report of the order shows something else than this amend asked for — a price or a
+    /// size it carries (0 = the report says nothing of it).
+    fn differs(&self, price: f64, lots: i64, tick: f64) -> bool {
+        (price > 0.0 && (price - self.price).abs() >= tick.max(f64::EPSILON) * 0.5)
+            || (lots > 0 && lots != self.lots)
+    }
 }
 
 /// `LegState` (vendored side, no serde) as persisted by the order store.
@@ -1288,8 +1318,8 @@ impl Orders {
     }
 
     /// Emulated exchange orders resting on `uid`: each leg's current order,
-    /// placed and not final. A Replace or a re-post starts a new generation,
-    /// so an older one never rests.
+    /// placed and not final. An amend moves the order in place; a re-post
+    /// starts a new generation, so an older one never rests.
     pub fn emu_resting(&self, uid: &str) -> Vec<EmuOrder> {
         let mut out = Vec::new();
         for o in self.map.values().filter(|o| o.emulator && o.uid == uid) {
@@ -1704,7 +1734,6 @@ impl Orders {
         if !target.price.is_finite() || target.price <= 0.0 || !self.map.contains_key(&id) {
             return fx;
         }
-        let key = self.new_key();
         let o = self.map.get_mut(&id).expect("checked");
         let price = round_tick(target.price, o.tick);
         match (leg, o.status) {
@@ -1744,7 +1773,6 @@ impl Orders {
                     return fx;
                 }
                 ex.ensure_execution();
-                let filled_before = ex.executions.last().map_or(0, |e| e.filled);
                 let mut lots = if leg == Leg::Sell {
                     residual
                 } else {
@@ -1789,11 +1817,9 @@ impl Orders {
                 {
                     return fx;
                 }
-                // An exit is never replaced: `ReplaceOrder` re-places the full
-                // lots while the old order keeps filling, and fills reach the
-                // core seconds late (TMB SHU6 14.08, ETLN 17.08: oversold into
-                // a short). Cancel it; its final report posts the remainder.
-                if leg == Leg::Sell {
+                // An exit going to MARKET is not an amend (LIMIT only): it is
+                // cancelled, and its final report posts the remainder.
+                if leg == Leg::Sell && target.market {
                     ex.cancel_requested = true;
                     ex.deferred = Some(target);
                     ex.state.price = price;
@@ -1803,17 +1829,35 @@ impl Orders {
                     self.bump(id, &mut fx);
                     return fx;
                 }
-                ex.key = key.clone();
-                ex.owned = true;
-                ex.executions.push(Execution {
-                    key: key.clone(),
-                    lots,
+                // Aster's amend: the same order, its size the whole order's —
+                // its own fills and what is left to buy or to close. Fills that
+                // land while the amend is on its way count against that size,
+                // so an exit never sells past the position: the reason
+                // TInvestCore never moved one (its replace re-placed the full
+                // lots while the old order kept filling, TMB SHU6 14.08, ETLN
+                // 17.08) and why until 03.10 an exit move was a cancel, a window
+                // without an exit and a new post.
+                let e = ex.executions.last_mut().expect("ensured");
+                let amend = Amend {
                     price,
-                    awaiting_reply: true,
-                    ..Execution::default()
-                });
+                    lots: e.filled + lots,
+                    was_price: e.price,
+                    was_lots: e.lots,
+                    was_reason: e.reason,
+                    unsure: false,
+                };
+                e.lots = e.filled + lots;
+                e.price = price;
+                if leg == Leg::Sell {
+                    e.reason = why;
+                }
+                let (key, total) = (e.key.clone(), e.lots);
+                if leg == Leg::Sell {
+                    o.next_reason = 0;
+                }
+                let ex = o.leg(leg);
+                ex.amend = Some(amend);
                 ex.state.price = price;
-                ex.state.notional = (ex.filled_lots + lots) as f64 * lot * price;
                 ex.state.closed = false;
                 ex.state.canceled = false;
                 ex.replacing = true;
@@ -1823,16 +1867,14 @@ impl Orders {
                     order: id,
                     leg,
                     exchange_id: ex.exchange_id.clone(),
-                    key: key.clone(),
+                    key,
                     uid,
-                    lots,
+                    lots: total,
                     price,
-                    filled: filled_before,
                 });
-                if ratio > 0.0 {
+                if leg == Leg::Buy && ratio > 0.0 {
                     o.planned_sell = round_tick(price * ratio, tick);
                 }
-                self.bind(&key, id, leg);
             }
             (Leg::Sell, status::BUY_DONE) => {
                 fx.actions.extend(self.place_exit(id, price, target.market));
@@ -1852,6 +1894,9 @@ impl Orders {
         ex.state.price = price;
         if let Some(e) = ex.executions.last_mut() {
             e.price = price;
+        }
+        if let Some(a) = ex.amend.as_mut() {
+            a.price = price;
         }
         ex.state.notional = ex.state.quantity * price;
         o.rev += 1;
@@ -2499,7 +2544,7 @@ impl Orders {
             return fx;
         };
         let o = self.map.get_mut(&id).expect("located");
-        let lot = o.lot;
+        let (lot, tick) = (o.lot, o.tick);
         let ex = o.leg(leg);
         ex.ensure_execution();
         let foreign_exit = leg == Leg::Sell && !ex.owned;
@@ -2518,6 +2563,28 @@ impl Orders {
             })
             .unwrap_or(ex.executions.len() - 1);
         let current = which == ex.executions.len() - 1;
+        // An amend on its way: a report of the order as it stood before — the
+        // stream racing the amend, the answer to an earlier amend or to a read
+        // sent before it — brings its fills, but must not put the old price and
+        // size back or end the move. A report of what the amend asked for, the
+        // order's end, or, after the amend's call failed with no answer, the
+        // read of the order settle it.
+        let stale_amend = current
+            && !u.status.is_final()
+            && ex.amend.is_some_and(|a| {
+                a.differs(u.price, u.lots_requested, tick) && !(a.unsure && u.unary)
+            });
+        let patched;
+        let u = if stale_amend {
+            patched = OrderUpdate {
+                price: 0.0,
+                lots_requested: 0,
+                ..u.clone()
+            };
+            &patched
+        } else {
+            u
+        };
         let e = &mut ex.executions[which];
         // A stream rejection while the call is out: the call's own reply
         // settles the request. Wait for it before making the position retryable.
@@ -2568,8 +2635,19 @@ impl Orders {
                 ex.exchange_id = u.exchange_id.clone();
                 ex.state.exchange_id = wire_id(&u.exchange_id);
             }
-            ex.replacing = false;
-            ex.uncertain = false;
+            if !stale_amend {
+                // A read showing the amend never landed: the exit keeps the
+                // reason it was placed for.
+                if let Some(a) = ex.amend.take() {
+                    if a.differs(u.price, u.lots_requested, tick) {
+                        if let Some(e) = ex.executions.last_mut() {
+                            e.reason = a.was_reason;
+                        }
+                    }
+                }
+                ex.replacing = false;
+                ex.uncertain = false;
+            }
             if u.price > 0.0 && !u.is_market && u.lots_executed >= known {
                 ex.state.price = u.price;
             }
@@ -3082,7 +3160,8 @@ impl Orders {
         let Some(o) = self.map.get_mut(&id) else {
             return fx;
         };
-        let (market, uid, sells) = (o.market.clone(), o.uid.clone(), o.sells(leg));
+        let (market, uid, sells, lot, tick) =
+            (o.market.clone(), o.uid.clone(), o.sells(leg), o.lot, o.tick);
         let ex = o.leg(leg);
         ex.ensure_execution();
         if op == Op::Cancel {
@@ -3101,8 +3180,44 @@ impl Orders {
         {
             return fx;
         }
+        if let Action::Replace { price, lots, .. } = action {
+            // Every amend of an order goes under its one key: a late failure of
+            // an earlier one says nothing of the amend out now.
+            if ex.amend.is_some_and(|a| a.differs(*price, *lots, tick)) {
+                return fx;
+            }
+        }
         fx.logs.push(format!("{market}: {op:?} failed: {msg}"));
-        if matches!(op, Op::Post | Op::Replace) {
+        if op == Op::Replace {
+            // A refused amend leaves the order as it was (API docs, «Modify
+            // Order») — or the order is gone, filled or cancelled: the model
+            // goes back to it, and the Query below reads which. A call of
+            // unknown fate is reconciled by our key, again and again, until a
+            // read settles it (`apply`); the move stays in flight till then.
+            if !definitive {
+                if let Some(a) = ex.amend.as_mut() {
+                    a.unsure = true;
+                }
+                ex.uncertain = true;
+                ex.resolve_key = request.to_owned();
+                ex.resolve_at = now_ms + 5_000;
+                fx.actions.push(Action::QueryRequest {
+                    order: id,
+                    leg,
+                    key: request.to_owned(),
+                });
+            } else {
+                if let Some(a) = ex.amend.take() {
+                    let e = ex.executions.last_mut().unwrap();
+                    e.price = a.was_price;
+                    e.lots = a.was_lots.max(e.filled);
+                    e.reason = a.was_reason;
+                    ex.state.price = a.was_price;
+                    ex.aggregate(lot);
+                }
+                ex.replacing = false;
+            }
+        } else if op == Op::Post {
             let last = ex.executions.last_mut().unwrap();
             // The worker is done with this request: a stream REJECTED from
             // now on is the outcome.
@@ -3145,14 +3260,9 @@ impl Orders {
                 ));
                 return fx;
             }
-            if op == Op::Post {
-                let u = rejected_post(ex, request, uid, sells, msg, now_ms);
-                fx.extend(self.apply(&u, now_ms));
-                return fx;
-            }
-            if ex.replacing && ex.executions.len() >= 2 {
-                fall_back(ex, now_ms + 10_000);
-            }
+            let u = rejected_post(ex, request, uid, sells, msg, now_ms);
+            fx.extend(self.apply(&u, now_ms));
+            return fx;
         }
         if matches!(action, Action::QueryRequest { .. }) {
             // One «not found» cannot prove an in-flight submission never arrived:
@@ -3264,10 +3374,7 @@ impl Orders {
         // A refused Cancel/Replace may mean the order already finished: read
         // its state. A transport failure tells nothing and the caller retries
         // the Cancel itself, so a Query over the same dead link is only noise.
-        if matches!(op, Op::Cancel | Op::Replace)
-            && !ex.exchange_id.is_empty()
-            && (definitive || op == Op::Replace)
-        {
+        if matches!(op, Op::Cancel | Op::Replace) && !ex.exchange_id.is_empty() && definitive {
             fx.actions.push(Action::Query {
                 order: id,
                 leg,
@@ -3315,7 +3422,6 @@ impl Orders {
                 exchange_id: ex.exchange_id.clone(),
                 lots: 0,
                 price: 0.0,
-                filled: 0,
             },
             Op::Cancel => Action::Cancel {
                 order: id,
@@ -4036,40 +4142,36 @@ mod tests {
         assert!(fx.logs[0].contains("[actual buy]+3.23%"), "{:?}", fx.logs);
         let sell_key = post_key(&fx);
 
-        // Move the exit, then it fills.
+        // Move the exit: an amend of the same order under the same key, then
+        // it fills.
         let fx = orders.apply(&update(&sell_key, "9002", ExecStatus::New, 2, 0, 0.0), 30);
         assert!(fx.actions.is_empty());
         let fx = orders.target(0xAB, Leg::Sell, 325.0, None);
         assert!(
-            matches!(&fx.actions[..], [Action::Cancel { exchange_id, .. }] if exchange_id == "9002"),
+            matches!(&fx.actions[..], [Action::Replace { exchange_id, key, lots: 2, price, .. }]
+                if exchange_id == "9002" && *key == sell_key && *price == 325.0),
             "{fx:?}"
         );
         assert_eq!(orders.get(0xAB).unwrap().record().sell.price, 325.0);
-        let mut done = update(&sell_key, "9002", ExecStatus::Cancelled, 2, 0, 320.0);
-        done.unary = true;
-        let fx = orders.apply(&done, 34);
-        assert!(matches!(
-            &fx.actions[..],
-            [Action::Post { lots: 2, price: Some(p), .. }] if *p == 325.0
-        ));
-        let k2 = &post_key(&fx);
-        let fx = orders.apply(&update(k2, "9003", ExecStatus::New, 2, 0, 325.0), 35);
-        assert_eq!(fx.changed, [0xAB]);
-        // The cancelled order's stream report arrives late: not this leg.
-        let late = update(&sell_key, "9002", ExecStatus::Cancelled, 2, 0, 320.0);
-        assert!(orders.knows(&late));
-        assert!(orders.apply(&late, 36).changed.is_empty());
-        let late = update("", "9002", ExecStatus::Cancelled, 2, 0, 320.0);
-        assert!(orders.knows(&late));
-        assert_eq!(orders.get(0xAB).unwrap().status, status::SELL_SET);
-        let fx = orders.apply(&update(k2, "9003", ExecStatus::Filled, 2, 2, 325.0), 40);
+        // The order's stream report from before the amend raced it: the move stands.
+        let mut before = update(&sell_key, "9002", ExecStatus::New, 2, 0, 0.0);
+        (before.price, before.unary) = (319.48, false);
+        assert!(orders.apply(&before, 31).actions.is_empty());
+        assert_eq!(orders.get(0xAB).unwrap().record().sell.price, 325.0);
+        let mut amended = update(&sell_key, "9002", ExecStatus::New, 2, 0, 0.0);
+        amended.price = 325.0;
+        orders.apply(&amended, 34);
+        assert!(!orders.get(0xAB).unwrap().sell.replacing);
+        let fx = orders.apply(
+            &update(&sell_key, "9002", ExecStatus::Filled, 2, 2, 325.0),
+            40,
+        );
         assert_eq!(fx.changed, [0xAB]);
         let rec = orders.get(0xAB).unwrap().record();
         assert_eq!(
             (rec.status, rec.sell.filled, rec.sell.exchange_id),
-            (status::SELL_DONE, 20.0, wire_id("9003"))
+            (status::SELL_DONE, 20.0, wire_id("9002"))
         );
-        assert!(wire_id("9003") > 0 && wire_id("9003") != wire_id("9002"));
         assert_eq!(wire_id("84320505953"), 84320505953);
         assert_eq!(rec.sell.spent, 20.0 * 325.0);
         assert_eq!(orders.records(40).len(), 1);
@@ -4086,37 +4188,31 @@ mod tests {
         let (id, key) = (fx.changed[0], post_key(&fx));
         orders.apply(&update(&key, "9001", ExecStatus::New, 2, 0, 0.0), 2);
 
-        // Same size at a new price: lots unchanged.
+        // Same size at a new price: lots unchanged, the same order amended.
         let fx = orders.target(id, Leg::Buy, 290.0, Some(6000.0));
-        assert!(
-            matches!(&fx.actions[0], Action::Replace { lots: 2, price, .. } if *price == 290.0)
-        );
-        let Action::Replace { key: k2, .. } = &fx.actions[0] else {
-            panic!()
-        };
-        orders.apply(&update(k2, "9002", ExecStatus::New, 2, 0, 0.0), 3);
+        assert!(matches!(&fx.actions[0],
+            Action::Replace { lots: 2, price, key: k, exchange_id, .. }
+                if *price == 290.0 && *k == key && exchange_id == "9001"));
+        orders.apply(&update(&key, "9001", ExecStatus::New, 2, 0, 0.0), 3);
         // 9000 USDT at 290 -> 3 lots; image follows.
         let fx = orders.target(id, Leg::Buy, 290.0, Some(9000.0));
         assert!(matches!(&fx.actions[0], Action::Replace { lots: 3, .. }));
         let rec = orders.get(id).unwrap().record();
         assert_eq!((rec.buy.quantity, rec.buy.notional), (30.0, 8700.0));
-        let Action::Replace { key: k3, .. } = &fx.actions[0] else {
-            panic!()
-        };
-        let k3 = k3.clone();
-        orders.apply(&update(&k3, "9003", ExecStatus::New, 3, 0, 0.0), 4);
+        orders.apply(&update(&key, "9001", ExecStatus::New, 3, 0, 0.0), 4);
         // Below one lot: refused, no exchange call.
         let fx = orders.target(id, Leg::Buy, 290.0, Some(100.0));
         assert!(fx.actions.is_empty());
         assert!(fx.logs[0].contains("below"), "{:?}", fx.logs);
 
-        // Partial fill: the remainder can shrink to one lot but not below.
+        // Partial fill: the remainder can shrink to one lot but not below. The
+        // amend names the order's whole size: its 2 filled lots and the 1 left.
         orders.apply(
-            &update(&k3, "9003", ExecStatus::PartiallyFilled, 3, 2, 290.0),
+            &update(&key, "9001", ExecStatus::PartiallyFilled, 3, 2, 290.0),
             5,
         );
         let fx = orders.target(id, Leg::Buy, 285.0, Some(100.0));
-        assert!(matches!(&fx.actions[0], Action::Replace { lots: 1, .. }));
+        assert!(matches!(&fx.actions[0], Action::Replace { lots: 3, .. }));
         assert_eq!(orders.get(id).unwrap().record().buy.quantity, 30.0);
     }
 
@@ -4380,33 +4476,22 @@ mod tests {
         let sell_key = post_key(&fx);
         orders.apply(&update(&sell_key, "9002", ExecStatus::New, 1, 0, 0.0), 3);
         assert_eq!(orders.get(id).unwrap().status, status::SELL_SET);
-        // Close: the limit exit is cancelled to go 1.5 % below the bid.
+        // Close: the limit exit is amended to 1.5 % below the bid — the same
+        // order, never off the book — and carries the close's reason.
         let fx = orders.close_position(sber, false, None, false, 4);
         assert!(matches!(
             &fx.actions[..],
-            [Action::Cancel { exchange_id, .. }] if exchange_id == "9002"
+            [Action::Replace { exchange_id, price, .. }] if exchange_id == "9002" && *price == 294.51
         ));
         assert_eq!(orders.get(id).unwrap().heading(Leg::Sell), Some(294.51));
-        // The live exit keeps its reason until the new one goes out.
         let rec = orders.get(id).unwrap().record();
         assert_eq!(
             (rec.status, rec.sell.price, rec.panic, rec.sell_reason),
-            (status::SELL_SET, 294.51, true, reason::SELL_PRICE)
+            (status::SELL_SET, 294.51, true, reason::MANUAL_SELL)
         );
-        let mut done = update(&sell_key, "9002", ExecStatus::Cancelled, 1, 0, 310.0);
-        done.unary = true;
-        let fx = orders.apply(&done, 4);
-        assert!(
-            matches!(&fx.actions[..], [Action::Post { lots: 1, price: Some(p), .. }] if *p == 294.51)
-        );
-        assert_eq!(
-            orders.get(id).unwrap().record().sell_reason,
-            reason::MANUAL_SELL
-        );
-        orders.apply(
-            &update(&post_key(&fx), "9003", ExecStatus::New, 1, 0, 0.0),
-            4,
-        );
+        let mut amended = update(&sell_key, "9002", ExecStatus::New, 1, 0, 0.0);
+        amended.price = 294.51;
+        orders.apply(&amended, 4);
         // Already through the book: a second close does nothing.
         assert!(orders
             .close_position(sber, false, None, false, 5)
@@ -4905,10 +4990,19 @@ mod tests {
         assert_eq!(orders.get(id).unwrap().exit_reason(), reason::SELL_PRICE);
         orders.set_sell_reason(id, reason::STOP_LOSS);
         let fx = orders.target(id, Leg::Sell, 297.0, None);
-        assert!(matches!(&fx.actions[..], [Action::Cancel { .. }]));
-        assert_eq!(orders.get(id).unwrap().exit_reason(), reason::SELL_PRICE);
-        let fx = orders.fail(id, Leg::Sell, Op::Cancel, "30059", 4);
+        assert!(matches!(&fx.actions[..], [Action::Replace { .. }]));
+        assert_eq!(orders.get(id).unwrap().exit_reason(), reason::STOP_LOSS);
+        // The exchange refuses the amend: the order stands as it was, price
+        // and reason, and is read again.
+        let refusal = "api 400/-4014: Price not increased by tick size.";
+        let fx = orders.fail(id, Leg::Sell, Op::Replace, refusal, 4);
         assert!(matches!(&fx.actions[..], [Action::Query { .. }]));
+        let o = orders.get(id).unwrap();
+        assert_eq!(
+            (o.exit_reason(), o.record().sell.price),
+            (reason::SELL_PRICE, 306.0)
+        );
+        assert!(!o.sell.replacing);
         // The old exit had filled: the deferred move has nothing left to sell.
         let fx = orders.apply(&update(&exit_key, "s1", ExecStatus::Filled, 1, 1, 306.0), 5);
         assert!(fx.actions.is_empty());
@@ -5132,11 +5226,11 @@ mod tests {
         assert!(fx.actions.is_empty(), "{fx:?}");
     }
 
-    /// `ReplaceOrder` (entries only): the stream cancels the old order before
-    /// the REST reply names the new one — the leg lives on; a refused replace
-    /// keeps the old.
+    /// An amend moves the entry at the tick, the same order under the same
+    /// key; a refused one leaves the order as it was, and the read that
+    /// follows decides — here, that the order had ended.
     #[test]
-    fn replaced_order_cancel_before_the_reply_keeps_the_leg() {
+    fn an_amended_entry_keeps_its_order_and_a_refusal_puts_it_back() {
         let model = sber_model();
         let sber = model.get("u-sber").unwrap();
         let mut orders = Orders::new();
@@ -5145,30 +5239,33 @@ mod tests {
         orders.apply(&update(&key, "b1", ExecStatus::New, 1, 0, 0.0), 2);
         // The chart line comes unrounded; the order goes at the tick.
         let fx = orders.target(id, Leg::Buy, 297.0794, None);
-        let Action::Replace { key: k2, price, .. } = &fx.actions[0] else {
+        let Action::Replace {
+            key: k2,
+            price,
+            exchange_id,
+            ..
+        } = &fx.actions[0]
+        else {
             panic!("{fx:?}");
         };
-        assert_eq!(*price, 297.08);
-        let k2 = k2.clone();
-        let early = update(&key, "b1", ExecStatus::Cancelled, 1, 0, 0.0);
-        let fx = orders.apply(&early, 4);
-        assert!(fx.changed.is_empty(), "{fx:?}");
-        assert_eq!(orders.get(id).unwrap().status, status::BUY_SET);
-        orders.apply(&update(&k2, "b2", ExecStatus::New, 1, 0, 0.0), 5);
+        assert_eq!((*price, k2, exchange_id.as_str()), (297.08, &key, "b1"));
+        let mut amended = update(&key, "b1", ExecStatus::New, 1, 0, 0.0);
+        amended.price = 297.08;
+        orders.apply(&amended, 5);
         let rec = orders.get(id).unwrap().record();
         assert_eq!(
             (rec.status, rec.buy.price, rec.buy.exchange_id),
-            (status::BUY_SET, 297.08, wire_id("b2"))
+            (status::BUY_SET, 297.08, wire_id("b1"))
         );
-        // Keep retired identities for late fills; final cancel cannot close the new leg.
-        assert!(orders.knows(&early));
 
-        // Replace refused: the old order stays the leg's, its cancel counts.
+        // Amend refused: the order as it was, read again.
         let fx = orders.target(id, Leg::Buy, 296.0, None);
         assert!(matches!(&fx.actions[0], Action::Replace { .. }));
-        let fx = orders.fail(id, Leg::Buy, Op::Replace, "30059", 6);
-        assert!(matches!(&fx.actions[0], Action::Query { exchange_id, .. } if exchange_id == "b2"));
-        orders.apply(&update("", "b2", ExecStatus::Cancelled, 1, 0, 0.0), 7);
+        let gone = "api 400/-2013: Order does not exist.";
+        let fx = orders.fail(id, Leg::Buy, Op::Replace, gone, 6);
+        assert!(matches!(&fx.actions[0], Action::Query { exchange_id, .. } if exchange_id == "b1"));
+        assert_eq!(orders.get(id).unwrap().record().buy.price, 297.08);
+        orders.apply(&update("", "b1", ExecStatus::Cancelled, 1, 0, 0.0), 7);
         assert_eq!(orders.get(id).unwrap().status, status::BUY_CANCEL);
     }
 
@@ -5346,20 +5443,21 @@ mod tests {
             ),
             1_000_002,
         );
+        // The amend names the exit's whole size: the lot it sold and the one
+        // still to sell — never two more.
         let fx = orders.target(id, Leg::Sell, 305.0, None);
-        assert!(matches!(&fx.actions[..], [Action::Cancel { .. }]));
-        let mut done = update("", "s1", ExecStatus::Cancelled, 2, 1, 306.0);
-        done.unary = true;
-        let fx = orders.apply(&done, 1_000_003);
-        let [Action::Post { key, lots, .. }] = &fx.actions[..] else {
+        let [Action::Replace { lots, key, .. }] = &fx.actions[..] else {
             panic!("{fx:?}")
         };
-        assert_eq!(*lots, 1);
-        orders.apply(&update(key, "s2", ExecStatus::New, 1, 0, 0.0), 1_000_003);
+        assert_eq!(*lots, 2);
+        let mut amended = update(key, "s1", ExecStatus::PartiallyFilled, 2, 1, 306.0);
+        amended.price = 305.0;
+        orders.apply(&amended, 1_000_003);
+        let rec = orders.get(id).unwrap().record();
         assert_eq!(
-            orders.get(id).unwrap().record().sell.filled,
-            10.0,
-            "first exchange order already sold 10 units"
+            (rec.sell.filled, rec.sell.quantity, rec.sell.price),
+            (10.0, 20.0, 305.0),
+            "the order already sold 10 units"
         );
     }
 
@@ -5468,6 +5566,9 @@ mod tests {
         );
     }
 
+    /// An exit cancelled by hand after one lot sold, a new one placed for the
+    /// rest: a fill of the old order reported late cuts the new one to the
+    /// remainder (an amend), and the position closes at the mean of both.
     #[test]
     fn late_retired_exit_fill_resizes_the_live_remainder_and_keeps_mean() {
         let m = sber_model();
@@ -5488,34 +5589,38 @@ mod tests {
             &update(&old, "s1", ExecStatus::PartiallyFilled, 3, 1, 306.0),
             1002,
         );
-        let fx = os.target(id, Leg::Sell, 305.0, None);
-        assert!(matches!(&fx.actions[..], [Action::Cancel { .. }]));
+        let fx = os.cancel(id, Leg::Sell);
+        assert!(matches!(&fx.actions[..], [Action::Cancel { .. }]), "{fx:?}");
         // TMB ASTR 17.08: the state read after the Cancel lags the exchange.
         let mut stale = update(&old, "s1", ExecStatus::Cancelled, 3, 1, 306.0);
         stale.unary = true;
-        let fx = os.apply(&stale, 1003);
+        os.apply(&stale, 1003);
+        let fx = os.target(id, Leg::Sell, 305.0, None);
         let [Action::Post { key, lots: 2, .. }] = &fx.actions[..] else {
             panic!("{fx:?}");
         };
-        os.apply(&update(key, "s2", ExecStatus::New, 2, 0, 0.0), 1003);
+        let key = key.clone();
+        os.apply(&update(&key, "s2", ExecStatus::New, 2, 0, 0.0), 1003);
         // Another lot executed on s1 just before cancellation; its report
-        // reaches us after the new exit: that one is cut to the remainder.
+        // reaches us after the new exit: that one is amended to the remainder.
         let fx = os.apply(
             &update(&old, "s1", ExecStatus::Cancelled, 3, 2, 306.0),
             1004,
         );
         assert_eq!(os.get(id).unwrap().record().sell.filled, 20.0);
-        let [Action::Cancel { exchange_id, .. }] = &fx.actions[..] else {
+        let [Action::Replace {
+            exchange_id,
+            lots: 1,
+            ..
+        }] = &fx.actions[..]
+        else {
             panic!("{fx:?}");
         };
         assert_eq!(exchange_id, "s2");
-        let mut done = update("", "s2", ExecStatus::Cancelled, 2, 0, 305.0);
-        done.unary = true;
-        let fx = os.apply(&done, 1004);
-        let [Action::Post { key, lots: 1, .. }] = &fx.actions[..] else {
-            panic!("{fx:?}");
-        };
-        os.apply(&update(key, "s3", ExecStatus::Filled, 1, 1, 305.0), 1005);
+        let mut amended = update(&key, "s2", ExecStatus::New, 1, 0, 0.0);
+        amended.price = 305.0;
+        os.apply(&amended, 1004);
+        os.apply(&update(&key, "s2", ExecStatus::Filled, 1, 1, 305.0), 1005);
         let r = os.get(id).unwrap().record();
         assert_eq!((r.status, r.sell.filled), (status::SELL_DONE, 30.0));
         assert!((r.sell.mean_price - (306.0 * 2.0 + 305.0) / 3.0).abs() < 1e-9);
@@ -5524,12 +5629,13 @@ mod tests {
         assert_eq!(os.get(id).unwrap().status, status::SELL_DONE);
     }
 
-    /// TMB SHU6 14.08 / ETLN 17.08: `ReplaceOrder` re-places the full lots
-    /// while the old exit keeps filling and its fills reach the core seconds
-    /// late — the move oversold into a short. An exit is never replaced: it
-    /// is cancelled and the remainder of the final report goes out.
+    /// TMB SHU6 14.08 / ETLN 17.08: TInvestCore's `ReplaceOrder` re-placed the
+    /// full lots while the old exit kept filling, and its fills reached the
+    /// core seconds late — the move oversold into a short. Aster's amend names
+    /// the order's whole size, fills included: a lot sold that the core has
+    /// not seen yet counts against it, and nothing sells past the position.
     #[test]
-    fn exit_move_cancels_then_posts_the_final_remainder() {
+    fn an_exit_move_is_an_amend_of_its_whole_size() {
         let m = sber_model();
         let mut os = Orders::new();
         let fx = os.start(
@@ -5546,24 +5652,25 @@ mod tests {
         // s1 already sold one lot on the exchange; the core has not seen it.
         let fx = os.target(id, Leg::Sell, 304.0, None);
         assert!(
-            matches!(&fx.actions[..], [Action::Cancel { exchange_id, .. }] if exchange_id == "s1"),
+            matches!(&fx.actions[..], [Action::Replace { exchange_id, lots: 2, .. }] if exchange_id == "s1"),
             "{fx:?}"
         );
         assert_eq!(os.get(id).unwrap().heading(Leg::Sell), Some(304.0));
-        // A second step while the Cancel is in flight only moves the target.
+        // A second step while the amend is out only moves the target.
         assert!(os.target(id, Leg::Sell, 303.0, None).actions.is_empty());
-        let mut done = update(&old, "s1", ExecStatus::Cancelled, 2, 1, 306.0);
-        done.unary = true;
-        let fx = os.apply(&done, 1003);
+        let mut amended = update(&old, "s1", ExecStatus::PartiallyFilled, 2, 1, 306.0);
+        amended.price = 304.0;
+        let fx = os.apply(&amended, 1003);
         assert!(
-            matches!(&fx.actions[..], [Action::Post { lots: 1, price: Some(p), .. }] if *p == 303.0),
+            matches!(&fx.actions[..], [Action::Replace { lots: 2, price, .. }] if *price == 303.0),
             "{fx:?}"
         );
-        assert_eq!(os.get(id).unwrap().status, status::SELL_SET);
+        let o = os.get(id).unwrap();
+        assert_eq!((o.status, o.record().sell.filled), (status::SELL_SET, 10.0));
     }
 
-    /// A late entry fill while an exit move waits for its Cancel: the repost
-    /// covers the grown position at the latest target, not the older one.
+    /// A late entry fill while an exit amend is out: the next amend covers the
+    /// grown position at the latest target, not the older one.
     #[test]
     fn late_entry_fill_during_exit_move_keeps_the_latest_target() {
         let m = sber_model();
@@ -5575,35 +5682,37 @@ mod tests {
             1000,
         );
         let id = fx.changed[0];
-        let old = post_key(&fx);
-        os.apply(&update(&old, "b1", ExecStatus::New, 2, 0, 0.0), 1001);
-        let fx = os.target(id, Leg::Buy, 299.0, None);
-        let Action::Replace { key, .. } = &fx.actions[0] else {
-            panic!();
-        };
-        let fx = os.apply(&update(key, "b2", ExecStatus::Cancelled, 2, 1, 299.0), 1002);
+        let buy = post_key(&fx);
+        os.apply(&update(&buy, "b1", ExecStatus::New, 2, 0, 0.0), 1001);
+        // The entry ends with one of its two lots: the exit goes for that one.
+        let fx = os.apply(
+            &update(&buy, "b1", ExecStatus::Cancelled, 2, 1, 300.0),
+            1002,
+        );
         let exit = post_key(&fx);
         os.apply(&update(&exit, "s1", ExecStatus::New, 1, 0, 0.0), 1003);
         os.target(id, Leg::Sell, 304.0, None);
         assert!(os.target(id, Leg::Sell, 303.0, None).actions.is_empty());
+        // The second lot's fill, reported late.
         os.apply(
-            &update(&old, "b1", ExecStatus::Cancelled, 2, 1, 300.0),
+            &update(&buy, "b1", ExecStatus::Cancelled, 2, 2, 300.0),
             1004,
         );
         assert_eq!(os.get(id).unwrap().heading(Leg::Sell), Some(303.0));
-        let mut done = update(&exit, "s1", ExecStatus::Cancelled, 1, 0, 306.0);
-        done.unary = true;
-        let fx = os.apply(&done, 1005);
+        let mut amended = update(&exit, "s1", ExecStatus::New, 1, 0, 0.0);
+        amended.price = 304.0;
+        let fx = os.apply(&amended, 1005);
         assert!(
-            matches!(&fx.actions[..], [Action::Post { lots: 2, price: Some(p), .. }] if *p == 303.0),
+            matches!(&fx.actions[..], [Action::Replace { lots: 2, price, .. }] if *price == 303.0),
             "{fx:?}"
         );
     }
 
-    /// A Cancel lost to the transport is sent again by the next move instead
-    /// of leaving the exit parked at its old price.
+    /// An amend of unknown fate (the transport failed) is read by our key
+    /// before the next move goes, again if the read fails too; the read
+    /// settles it — here, that it never landed, so the exit keeps its reason.
     #[test]
-    fn exit_move_resends_a_failed_cancel() {
+    fn an_amend_of_unknown_fate_is_read_before_the_next_move() {
         let m = sber_model();
         let mut os = Orders::new();
         let fx = os.start(
@@ -5617,17 +5726,85 @@ mod tests {
             &update(&post_key(&fx), "b", ExecStatus::Filled, 2, 2, 300.0),
             1001,
         );
-        os.apply(
-            &update(&post_key(&fx), "s1", ExecStatus::New, 2, 0, 0.0),
-            1002,
-        );
+        let exit = post_key(&fx);
+        os.apply(&update(&exit, "s1", ExecStatus::New, 2, 0, 0.0), 1002);
+        os.set_sell_reason(id, reason::STOP_LOSS);
         let fx = os.target(id, Leg::Sell, 304.0, None);
-        os.failed(&fx.actions[0], false, "transport", 1003);
-        let fx = os.target(id, Leg::Sell, 303.0, None);
+        let fx = os.failed(&fx.actions[0], false, "transport", 1003);
+        let [read @ Action::QueryRequest { key, .. }] = &fx.actions[..] else {
+            panic!("{fx:?}");
+        };
+        assert_eq!(*key, exit);
+        assert!(os.target(id, Leg::Sell, 303.0, None).actions.is_empty());
+        // The read fails as well: asked again, not forgotten.
+        assert!(os.failed(read, false, "transport", 1004).actions.is_empty());
+        assert!(os
+            .watch(&m, 1004 + RESOLVE_PERIOD_MS)
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::QueryRequest { key, .. } if *key == exit)));
+        // The read: the amend never landed.
+        let mut read = update(&exit, "s1", ExecStatus::New, 2, 0, 0.0);
+        read.price = 306.0;
+        let fx = os.apply(&read, 15_000);
         assert!(
-            matches!(&fx.actions[..], [Action::Cancel { exchange_id, .. }] if exchange_id == "s1"),
+            matches!(&fx.actions[..], [Action::Replace { price, .. }] if *price == 303.0),
             "{fx:?}"
         );
+        let mut answer = update(&exit, "s1", ExecStatus::New, 2, 0, 0.0);
+        answer.price = 303.0;
+        os.apply(&answer, 15_001);
+        let o = os.get(id).unwrap();
+        assert_eq!((o.record().sell.price, o.sell.uncertain), (303.0, false));
+    }
+
+    /// Every amend of an order goes under its one key, so only a report of
+    /// what the amend asked for settles it: not the stream racing it with the
+    /// order as it stood (a size-only amend included), not the late answer or
+    /// the late refusal of an earlier amend.
+    #[test]
+    fn an_amend_is_settled_only_by_what_it_asked_for() {
+        let m = sber_model();
+        let mut os = Orders::new();
+        let fx = os.start(
+            0,
+            &start(6000.0, 300.0, 0.0),
+            m.get("u-sber").unwrap(),
+            1000,
+        );
+        let (id, key) = (fx.changed[0], post_key(&fx));
+        os.apply(&update(&key, "b1", ExecStatus::New, 2, 0, 0.0), 1001);
+        let report = |lots: i64, price: f64, unary: bool| {
+            let mut u = update(&key, "b1", ExecStatus::New, lots, 0, 0.0);
+            (u.price, u.unary) = (price, unary);
+            u
+        };
+        // A resize at the same price.
+        let fx = os.target(id, Leg::Buy, 300.0, Some(9000.0));
+        assert!(
+            matches!(&fx.actions[..], [Action::Replace { lots: 3, .. }]),
+            "{fx:?}"
+        );
+        os.apply(&report(2, 300.0, false), 1002);
+        let o = os.get(id).unwrap();
+        assert!(o.buy.replacing);
+        assert_eq!(o.record().buy.quantity, 30.0);
+        os.apply(&report(3, 300.0, true), 1003);
+        assert!(!os.get(id).unwrap().buy.replacing);
+        // A1 to 299, settled by the stream first; A2 to 298 goes out.
+        let a1 = os.target(id, Leg::Buy, 299.0, None).actions[0].clone();
+        os.apply(&report(3, 299.0, false), 1004);
+        let fx = os.target(id, Leg::Buy, 298.0, None);
+        assert!(matches!(&fx.actions[..], [Action::Replace { price, .. }] if *price == 298.0));
+        // A1's own answer and a refusal of A1 come late: A2 stands.
+        os.apply(&report(3, 299.0, true), 1005);
+        let refusal = "api 400/-4014: Price not increased by tick size.";
+        assert!(os.failed(&a1, true, refusal, 1006).actions.is_empty());
+        let o = os.get(id).unwrap();
+        assert!(o.buy.replacing);
+        assert_eq!(o.record().buy.price, 298.0);
+        os.apply(&report(3, 298.0, true), 1007);
+        assert!(!os.get(id).unwrap().buy.replacing);
     }
 
     #[test]
@@ -5674,8 +5851,10 @@ mod tests {
             .is_empty());
     }
 
+    /// Amends go one at a time: a move asked while one is out waits for its
+    /// answer, and a cancel asked meanwhile wins over the move still waiting.
     #[test]
-    fn replaces_are_serialized_and_cancellation_wins_over_deferred_target() {
+    fn amends_are_serialized_and_cancellation_wins_over_deferred_target() {
         let m = sber_model();
         let mut os = Orders::new();
         let fx = os.start(
@@ -5685,38 +5864,28 @@ mod tests {
             1000,
         );
         let id = fx.changed[0];
-        os.apply(
-            &update(&post_key(&fx), "b1", ExecStatus::New, 1, 0, 0.0),
-            1001,
-        );
+        let key = post_key(&fx);
+        os.apply(&update(&key, "b1", ExecStatus::New, 1, 0, 0.0), 1001);
         let fx = os.target(id, Leg::Buy, 299.0, None);
-        let first = fx.actions[0].clone();
-        let Action::Replace { key, .. } = &first else {
-            panic!();
-        };
+        assert!(matches!(&fx.actions[..], [Action::Replace { .. }]));
         assert!(os.target(id, Leg::Buy, 298.0, None).actions.is_empty());
-        let fx = os.apply(&update(key, "b2", ExecStatus::New, 1, 0, 0.0), 1002);
-        let Action::Replace {
-            key: second,
-            exchange_id,
-            price: 298.0,
-            ..
-        } = &fx.actions[0]
-        else {
-            panic!("{fx:?}");
+        let answer = |price: f64| {
+            let mut u = update(&key, "b1", ExecStatus::New, 1, 0, 0.0);
+            u.price = price;
+            u
         };
-        assert_eq!(exchange_id, "b2");
-        let second = second.clone();
-        assert!(os
-            .failed(&first, true, "api 400/-4024: Price over max price.", 1003)
-            .actions
-            .is_empty());
+        let fx = os.apply(&answer(299.0), 1002);
+        assert!(
+            matches!(&fx.actions[..], [Action::Replace { exchange_id, price, .. }]
+                if exchange_id == "b1" && *price == 298.0),
+            "{fx:?}"
+        );
         assert!(os.target(id, Leg::Buy, 297.0, None).actions.is_empty());
         assert!(os.cancel(id, Leg::Buy).actions.is_empty());
-        let fx = os.apply(&update(&second, "b3", ExecStatus::New, 1, 0, 0.0), 1004);
-        assert_eq!(fx.actions.len(), 1);
+        let fx = os.apply(&answer(298.0), 1004);
         assert!(
-            matches!(&fx.actions[0], Action::Cancel { exchange_id, .. } if exchange_id == "b3")
+            matches!(&fx.actions[..], [Action::Cancel { exchange_id, .. }] if exchange_id == "b1"),
+            "{fx:?}"
         );
     }
 
@@ -5748,8 +5917,11 @@ mod tests {
         assert!(os.watch(&m, 25_000).actions.is_empty());
     }
 
+    /// An amend of unknown fate on a partly filled entry: the order is read,
+    /// its fills stay counted, and a cancel asked meanwhile goes once the read
+    /// has settled the amend.
     #[test]
-    fn timeout_during_replace_keeps_retiring_fill_until_new_order_resolves() {
+    fn timeout_during_amend_keeps_the_fills_until_the_read_settles() {
         let m = sber_model();
         let mut os = Orders::new();
         let fx = os.start(
@@ -5759,28 +5931,36 @@ mod tests {
             1000,
         );
         let id = fx.changed[0];
-        let old = post_key(&fx);
+        let key = post_key(&fx);
         os.apply(
-            &update(&old, "b1", ExecStatus::PartiallyFilled, 2, 1, 300.0),
+            &update(&key, "b1", ExecStatus::PartiallyFilled, 2, 1, 300.0),
             1001,
         );
+        // The whole order: its filled lot and the one still to buy.
         let fx = os.target(id, Leg::Buy, 299.0, None);
         let action = fx.actions[0].clone();
-        let Action::Replace { key, lots: 1, .. } = &action else {
-            panic!();
-        };
-        os.failed(&action, false, "transport timeout", 1002);
-        os.apply(
-            &update(&old, "b1", ExecStatus::Cancelled, 2, 1, 300.0),
-            1003,
+        assert!(
+            matches!(&action, Action::Replace { lots: 2, .. }),
+            "{action:?}"
+        );
+        let fx = os.failed(&action, false, "transport timeout", 1002);
+        assert!(
+            matches!(&fx.actions[..], [Action::QueryRequest { key: k, .. }] if *k == key),
+            "{fx:?}"
         );
         assert_eq!(os.get(id).unwrap().status, status::BUY_SET);
-        os.cancel(id, Leg::Buy);
-        let fx = os.apply(&update(key, "b2", ExecStatus::New, 1, 0, 0.0), 1004);
+        assert!(os.cancel(id, Leg::Buy).actions.is_empty());
+        let mut read = update(&key, "b1", ExecStatus::PartiallyFilled, 2, 1, 300.0);
+        read.price = 300.0;
+        let fx = os.apply(&read, 1003);
         assert!(
-            matches!(&fx.actions[0], Action::Cancel { exchange_id, .. } if exchange_id == "b2")
+            matches!(&fx.actions[..], [Action::Cancel { exchange_id, .. }] if exchange_id == "b1"),
+            "{fx:?}"
         );
-        os.apply(&update(key, "b2", ExecStatus::Cancelled, 1, 0, 0.0), 1005);
+        os.apply(
+            &update(&key, "b1", ExecStatus::Cancelled, 2, 1, 300.0),
+            1005,
+        );
         let r = os.get(id).unwrap().record();
         assert_eq!(
             (r.status, r.buy.filled, r.buy.mean_price),
@@ -6035,6 +6215,8 @@ mod tests {
         assert_eq!(back.get(id).unwrap().status, before);
     }
 
+    /// The entry's last fill reported after its end: the exit already out is
+    /// amended to the grown position — no second exit.
     #[test]
     fn late_entry_fill_expands_existing_exit_without_posting_another() {
         let m = sber_model();
@@ -6046,31 +6228,23 @@ mod tests {
             1000,
         );
         let id = fx.changed[0];
-        let old = post_key(&fx);
-        os.apply(&update(&old, "b1", ExecStatus::New, 2, 0, 0.0), 1001);
-        let fx = os.target(id, Leg::Buy, 299.0, None);
-        let Action::Replace { key, .. } = &fx.actions[0] else {
-            panic!();
-        };
-        let fx = os.apply(&update(key, "b2", ExecStatus::Cancelled, 2, 1, 299.0), 1002);
+        let buy = post_key(&fx);
+        os.apply(&update(&buy, "b1", ExecStatus::New, 2, 0, 0.0), 1001);
+        let fx = os.apply(
+            &update(&buy, "b1", ExecStatus::Cancelled, 2, 1, 300.0),
+            1002,
+        );
         let exit = post_key(&fx);
         os.apply(&update(&exit, "s1", ExecStatus::New, 1, 0, 0.0), 1003);
         let fx = os.apply(
-            &update(&old, "b1", ExecStatus::Cancelled, 2, 1, 300.0),
+            &update(&buy, "b1", ExecStatus::Cancelled, 2, 2, 300.0),
             1004,
         );
         assert!(
-            matches!(&fx.actions[..], [Action::Cancel { exchange_id, .. }] if exchange_id == "s1"),
+            matches!(&fx.actions[..], [Action::Replace { exchange_id, lots: 2, .. }] if exchange_id == "s1"),
             "{fx:?}"
         );
         assert_eq!(os.get(id).unwrap().record().buy.filled, 20.0);
-        let mut done = update(&exit, "s1", ExecStatus::Cancelled, 1, 0, 306.0);
-        done.unary = true;
-        let fx = os.apply(&done, 1005);
-        assert!(
-            matches!(&fx.actions[..], [Action::Post { lots: 2, .. }]),
-            "{fx:?}"
-        );
     }
 
     #[test]
@@ -6106,7 +6280,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_replace_reconciles_the_retired_generations_numeric_alias() {
+    fn a_failed_amend_reads_the_order_by_its_numeric_id() {
         let m = sber_model();
         let mut os = Orders::new();
         let fx = os.start(
@@ -6120,17 +6294,17 @@ mod tests {
         let mut stream = update(&old, "uuid-alias", ExecStatus::New, 1, 0, 0.0);
         stream.unary = false;
         os.apply(&stream, 1001);
+        // Known only by the alias: amended by our key.
         let fx = os.target(id, Leg::Buy, 299.0, None);
         let action = fx.actions[0].clone();
+        assert!(
+            matches!(&action, Action::Replace { exchange_id, key, .. } if exchange_id == "uuid-alias" && *key == old)
+        );
         os.apply(&update(&old, "9876543", ExecStatus::New, 1, 0, 0.0), 1002);
+        // A refusal reads the order by the number it has meanwhile.
         let fx = os.failed(&action, true, "api 400/-2013: Order does not exist.", 1003);
         assert!(
             matches!(&fx.actions[0], Action::Query { exchange_id, .. } if exchange_id == "9876543")
-        );
-        assert!(os.target(id, Leg::Buy, 298.0, None).actions.is_empty());
-        let fx = os.apply(&update(&old, "9876543", ExecStatus::New, 1, 0, 0.0), 1004);
-        assert!(
-            matches!(&fx.actions[0], Action::Replace { exchange_id, price: 298.0, .. } if exchange_id == "9876543")
         );
     }
 
@@ -6718,8 +6892,11 @@ mod tests {
             .all(|a| matches!(a, Action::Cancel { .. })));
     }
 
+    /// A stop fires on a partly filled entry while its amend is out: the
+    /// panic waits for the amend's answer, then cancels the entry and sells
+    /// every lot it bought.
     #[test]
-    fn partial_entry_stop_waits_for_pending_replace_then_cancels_new_id() {
+    fn partial_entry_stop_waits_for_pending_amend_then_cancels() {
         let mut model = sber_model();
         let mut os = Orders::new();
         let fx = os.start(
@@ -6732,31 +6909,27 @@ mod tests {
         os.apply(&update(&key, "1001", ExecStatus::New, 3, 0, 0.0), 1100);
         os.set_stops(42, true, false, 2.0, 0.0);
         let fx = os.target(42, Leg::Buy, 299.0, None);
-        let Action::Replace {
-            key: replacement, ..
-        } = &fx.actions[0]
-        else {
-            panic!("{fx:?}");
-        };
-        let replacement = replacement.clone();
-        os.apply(
-            &update(&key, "1001", ExecStatus::PartiallyFilled, 3, 1, 299.0),
-            1200,
+        assert!(
+            matches!(&fx.actions[..], [Action::Replace { exchange_id, lots: 3, .. }] if exchange_id == "1001"),
+            "{fx:?}"
         );
+        // A fill on the stream, from before the amend landed.
+        let mut partial = update(&key, "1001", ExecStatus::PartiallyFilled, 3, 1, 299.0);
+        (partial.unary, partial.price) = (false, 300.0);
+        os.apply(&partial, 1200);
         assert_eq!(os.get(42).unwrap().record().stop, Some((293.02, 0.0)));
         model.get_mut("u-sber").unwrap().last_price = Some(290.0);
         assert!(os.watch(&model, 1300).actions.is_empty());
         assert!(os.get(42).unwrap().record().panic);
-        let fx = os.apply(
-            &update(&replacement, "1002", ExecStatus::New, 3, 0, 0.0),
-            1400,
-        );
+        let mut amended = update(&key, "1001", ExecStatus::PartiallyFilled, 3, 1, 299.0);
+        amended.price = 299.0;
+        let fx = os.apply(&amended, 1400);
         assert!(
-            matches!(fx.actions.as_slice(), [Action::Cancel { exchange_id, .. }] if exchange_id == "1002"),
+            matches!(fx.actions.as_slice(), [Action::Cancel { exchange_id, .. }] if exchange_id == "1001"),
             "{fx:?}"
         );
         os.apply(
-            &update(&replacement, "1002", ExecStatus::Cancelled, 3, 1, 299.0),
+            &update(&key, "1001", ExecStatus::Cancelled, 3, 2, 299.0),
             1500,
         );
         let fx = os.watch(&model, 1501);
@@ -6785,11 +6958,13 @@ mod tests {
         );
         let original = post_key(&fx);
         os.apply(&update(&original, "2001", ExecStatus::New, 3, 0, 0.0), 1200);
-        let fx = os.target(42, Leg::Sell, 305.0, None);
+        // The exit is taken off and placed again: a second generation.
+        let fx = os.cancel(42, Leg::Sell);
         assert!(matches!(&fx.actions[..], [Action::Cancel { .. }]));
         let mut done = update(&original, "2001", ExecStatus::Cancelled, 3, 0, 306.0);
         done.unary = true;
-        let fx = os.apply(&done, 1250);
+        os.apply(&done, 1250);
+        let fx = os.target(42, Leg::Sell, 305.0, None);
         let replacement = &post_key(&fx);
         // The new exit is cancelled outside the core.
         os.apply(

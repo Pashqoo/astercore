@@ -505,6 +505,32 @@ impl Rest {
         )
     }
 
+    /// `PUT /fapi/v3/order`, signed, weight 1: move `symbol`'s resting LIMIT order to `price`
+    /// with `quantity` as its whole size, fills included — the same order, its id, key and
+    /// `reduceOnly` kept. A refused amend leaves the order as it was (API docs, «Modify
+    /// Order»).
+    pub fn amend_order(
+        &mut self,
+        signer: &mut Signer,
+        symbol: &str,
+        order: OrderRef<'_>,
+        quantity: &str,
+        price: &str,
+    ) -> Result<OrderReply, Error> {
+        let (k, v) = order.param();
+        self.signed_send(
+            Method::Put,
+            signer,
+            "/fapi/v3/order",
+            &[
+                ("symbol", symbol),
+                (k, &v),
+                ("quantity", quantity),
+                ("price", price),
+            ],
+        )
+    }
+
     /// `GET /fapi/v3/order`, signed, weight 1: one order of `symbol`, by the
     /// exchange's id or by our key. Not found once it is cancelled or expired
     /// without a fill and 7 days old (docs).
@@ -548,7 +574,7 @@ impl Rest {
         self.fetch(&url, path)
     }
 
-    /// A v3-signed `POST` or `DELETE`: the signed string is the form-encoded
+    /// A v3-signed `POST`, `PUT` or `DELETE`: the signed string is the form-encoded
     /// body, sent as it was signed — the docs pass every parameter of these
     /// methods "in the request body".
     fn signed_send<T: DeserializeOwned>(
@@ -563,11 +589,17 @@ impl Rest {
         const FORM: &str = "application/x-www-form-urlencoded";
         let verb = match method {
             Method::Post => "POST",
+            Method::Put => "PUT",
             Method::Delete => "DELETE",
         };
         self.exchange(verb, path, |agent| match method {
             Method::Post => agent
                 .post(&url)
+                .header("Accept", "application/json")
+                .header("Content-Type", FORM)
+                .send(&body),
+            Method::Put => agent
+                .put(&url)
                 .header("Accept", "application/json")
                 .header("Content-Type", FORM)
                 .send(&body),
@@ -775,6 +807,7 @@ impl Default for Rest {
 #[derive(Debug, Clone, Copy)]
 enum Method {
     Post,
+    Put,
     Delete,
 }
 

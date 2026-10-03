@@ -4280,8 +4280,9 @@ mod tests {
         assert_eq!(shot.rate_halt_until, 0, "a refusal is not a rate limit");
     }
 
-    /// An exit move cancels the live exit `old`: its final report posts the
-    /// remainder, which the exchange acknowledges as `new`.
+    /// An exit going to MARKET cancels the live exit `old`: its final report
+    /// posts the remainder, which the exchange acknowledges as `new`. (A limit
+    /// move is an amend, acknowledged by `apply`.)
     fn settle_exit_move(orders: &mut Orders, old: &str, new: &str, lots: i64, now: i64) {
         use crate::orders::Action;
         let mut done = report("", old, ExecStatus::Cancelled, lots, 0, 0.0);
@@ -4317,9 +4318,10 @@ mod tests {
     }
 
     /// Runs `cmds` through `Orders` like the engine; returns idempotency keys
-    /// of posted legs in order. An entry replace is acknowledged at once under
-    /// the same exchange id, so the tests keep naming orders by their first
-    /// id. An exit move only cancels: `settle_exit_move` completes it.
+    /// of posted legs in order. An amend, of an entry or an exit, is
+    /// acknowledged at once under the same exchange id, so the tests keep
+    /// naming orders by their first id. An exit going to MARKET only cancels:
+    /// `settle_exit_move` completes it.
     fn apply(
         shot: &mut MoonShot,
         orders: &mut Orders,
@@ -5437,12 +5439,10 @@ mod tests {
             "Auto Sell Replacing (PriceDown: 301.93 => Perc: 0.5 AllowedDrop: 297.49 NewP: 300.42)"
         ));
         apply(&mut shot, &mut orders, &model, &cmds, t);
-        settle_exit_move(&mut orders, "900002", "900003", 1, t);
         t += 5000;
         let cmds = shot.tick(&st, &orders, &model, &win, sched, t);
         assert_eq!(moves(&cmds), [(tier0, Leg::Sell, 298.92)]);
         apply(&mut shot, &mut orders, &model, &cmds, t);
-        settle_exit_move(&mut orders, "900003", "900004", 1, t);
         assert_eq!(reason_of(&orders), reason::AUTO_PRICE_DOWN);
 
         // Stop at -3 % (287.13): a break must hold 2 s, then a limit
@@ -5459,11 +5459,10 @@ mod tests {
              StopLoss fixed: 287.13 spread: 0.40% => 285.85"
         ));
         apply(&mut shot, &mut orders, &model, &cmds, t);
-        settle_exit_move(&mut orders, "900004", "900005", 1, t);
         assert_eq!(reason_of(&orders), reason::STOP_LOSS);
         // The close fills at a loss: TradePenaltyTime (10 s) keeps the market
         // quiet, then a fresh ladder goes out.
-        orders.apply(&report("", "900005", ExecStatus::Filled, 1, 1, 285.85), t);
+        orders.apply(&report("", "900002", ExecStatus::Filled, 1, 1, 285.85), t);
         model.at_mut(1).unwrap().last_price = Some(288.0);
         t += 1000;
         assert!(shot.tick(&st, &orders, &model, &win, sched, t).is_empty());
@@ -6807,12 +6806,11 @@ mod tests {
         assert_eq!(star.nearest(0.05465 * 1.002), 0.05476);
     }
 
-    /// A PriceDown step that falls while the previous step's Cancel waits for
-    /// the exit's final report is handed to `Orders` once: later passes see
-    /// it deferred and neither repeat the move nor the log line (up to 130
-    /// lines a step).
+    /// A PriceDown step that falls while the previous step's amend waits for
+    /// its answer is handed to `Orders` once: later passes see it deferred and
+    /// neither repeat the move nor the log line (up to 130 lines a step).
     #[test]
-    fn price_down_step_behind_a_cancel_in_flight_is_sent_once() {
+    fn price_down_step_behind_an_amend_in_flight_is_sent_once() {
         use crate::orders::Action;
         use FieldValue::{Bool, Double, String as Str};
         let model = model();
@@ -6854,8 +6852,8 @@ mod tests {
         assert_eq!(moves(&cmds), [(id, Leg::Sell, 0.05815)]);
         let fx = orders.target(id, Leg::Sell, 0.05815, None);
         assert!(
-            matches!(fx.actions.as_slice(), [Action::Cancel { exchange_id, .. }] if exchange_id == "900001"),
-            "cancel expected: {:?}",
+            matches!(fx.actions.as_slice(), [Action::Replace { exchange_id, .. }] if exchange_id == "900001"),
+            "amend expected: {:?}",
             fx.actions
         );
         // Step 2 falls behind it: deferred once, then quiet.
@@ -6870,22 +6868,19 @@ mod tests {
             let cmds = shot.tick(&st, &orders, &model, &win, sched, t0 + at);
             assert!(cmds.is_empty(), "at {at} ms: {cmds:?}");
         }
-        // The final report releases the deferred step.
-        let mut done = report(&keys[0], "900001", ExecStatus::Cancelled, 1, 0, 0.0);
-        done.uid = "STAR".into();
-        done.unary = true;
-        let fx = orders.apply(&done, t0 + 5_100);
+        // The amend's answer releases the deferred step.
+        let answer = |price: f64| {
+            let mut u = report(&keys[0], "900001", ExecStatus::New, 1, 0, 0.0);
+            (u.uid, u.price) = ("STAR".into(), price);
+            u
+        };
+        let fx = orders.apply(&answer(0.05815), t0 + 5_100);
         assert!(
-            matches!(fx.actions.as_slice(), [Action::Post { price: Some(p), .. }] if *p == 0.05745),
+            matches!(fx.actions.as_slice(), [Action::Replace { price, .. }] if *price == 0.05745),
             "{:?}",
             fx.actions
         );
-        let [Action::Post { key, .. }] = fx.actions.as_slice() else {
-            unreachable!()
-        };
-        let mut new = report(key, "900002", ExecStatus::New, 1, 0, 0.0);
-        new.uid = "STAR".into();
-        orders.apply(&new, t0 + 5_150);
+        orders.apply(&answer(0.05745), t0 + 5_150);
         assert!(shot
             .tick(&st, &orders, &model, &win, sched, t0 + 5_200)
             .is_empty());
@@ -9619,7 +9614,6 @@ mod tests {
         let cmds = fx.at(4_000, 297.3);
         assert_eq!(exit_moves(&cmds), [(295.52, reason::STOP_LOSS)]);
         assert!(has_log(&cmds, "StopLoss3 AutoActivated"));
-        settle_exit_move(&mut fx.orders, "900001", "900002", 1, fx.t0 + 4_000);
         // A restart keeps the third stop's drop: reason 7 is shared.
         fx.shot = MoonShot::default();
         fx.shot.restore(&fx.orders, fx.t0 + 4_000);

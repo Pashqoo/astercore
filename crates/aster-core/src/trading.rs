@@ -359,12 +359,11 @@ impl Call {
     }
 }
 
-/// Order-making calls an action costs of the exchange's budget: a post one, a replace (a cancel
-/// and a post) two, a cancel or a read none.
+/// Order-making calls an action costs of the exchange's budget: a post or an amend one, a cancel
+/// or a read none.
 fn weight_of(action: &Action) -> usize {
     match action {
-        Action::Post { .. } => 1,
-        Action::Replace { .. } => 2,
+        Action::Post { .. } | Action::Replace { .. } => 1,
         _ => 0,
     }
 }
@@ -919,13 +918,11 @@ const CODE_REDUCE_ONLY: i64 = -2022;
 
 /// One action's exchange calls.
 ///
-/// A `Replace` is a cancel and a post under the new key: Aster has no
-/// replace that takes a new key. The cancel's report goes first, so fills of
-/// the old order are counted. When the cancel's answer shows fills the model
-/// had not counted (`filled`), the new order is not posted: its lots were
-/// sized without them, and posting would buy past the budget. The `Replace`
-/// then fails, and the model falls back to the old order, whose final report
-/// it has (`Orders::failed`).
+/// A `Replace` is Aster's amend (`PUT /fapi/v3/order`): the same order moved to
+/// a new price, its size the whole order's, fills included — so fills that
+/// land while it is on its way only shorten what is left, and nothing is sold
+/// or bought past the target (`Orders::target`). Until 03.10 it was
+/// TInvestCore's cancel and post under a new key.
 fn execute(rest: &mut Rest, signer: &mut Signer, a: &Action, uid: &str, grid: Grid) -> Done {
     let mut done = Done::default();
     let report = |done: &mut Done, r: &OrderReply, key: Option<&str>| -> bool {
@@ -962,36 +959,21 @@ fn execute(rest: &mut Rest, signer: &mut Signer, a: &Action, uid: &str, grid: Gr
             }
         }
         Action::Replace {
-            leg,
             exchange_id,
             key,
             lots,
             price,
-            filled,
             ..
         } => {
-            let old = match rest.cancel_order(signer, uid, OrderRef::Id(exchange_id)) {
-                Ok(old) => old,
-                Err(e) => return done.fail(&e),
+            // By the exchange's id when the leg has one, else by our key.
+            let order = if exchange_id.parse::<i64>().is_ok() {
+                OrderRef::Id(exchange_id)
+            } else {
+                OrderRef::Key(key)
             };
-            if !report(&mut done, &old, None) {
-                return done;
-            }
-            let old_filled = done.reports[0].lots_executed;
-            if old_filled > *filled {
-                done.failed = Some((
-                    true,
-                    format!(
-                        "{} lot(s) filled while it was being replaced; the new order is not placed",
-                        old_filled - filled
-                    ),
-                ));
-                return done;
-            }
-            let sell = old.side == "SELL";
-            let params = post_params(uid, *leg, key, *lots, Some(*price), sell, grid);
-            let params: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            match rest.new_order(signer, &params) {
+            let quantity = on_grid(*lots as f64 * grid.step, grid.step);
+            let price = on_grid(*price, grid.tick);
+            match rest.amend_order(signer, uid, order, &quantity, &price) {
                 Ok(r) => {
                     report(&mut done, &r, Some(key));
                 }
@@ -1612,10 +1594,9 @@ mod tests {
             uid: "AAAUSDT".into(),
             lots: 1,
             price: 1.0,
-            filled: 0,
         };
         assert_eq!(weight_of(&post("AAAUSDT", 1).action), 1);
-        assert_eq!(weight_of(&replace), 2);
+        assert_eq!(weight_of(&replace), 1, "an amend is one call");
         assert_eq!(weight_of(&call("AAAUSDT", 1, Leg::Buy).action), 0);
     }
 

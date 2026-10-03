@@ -745,8 +745,8 @@ impl SymbolBrackets {
     }
 }
 
-/// An order as `POST`, `DELETE` and `GET /fapi/v3/order` answer it (docs:
-/// the three answers carry the same fields).
+/// An order as `POST`, `PUT` (amend), `DELETE` and `GET /fapi/v3/order` answer it (docs:
+/// the four answers carry the same fields).
 ///
 /// Strict, like the account rows ([`dec_f64`]): a quantity misread as 0 is a
 /// fill the core never counts, so a malformed one fails the call and the
@@ -1045,7 +1045,9 @@ pub struct OrderEvent {
     pub side: String,
     #[serde(default, rename = "o")]
     pub kind: String,
-    /// Execution type: `NEW`, `TRADE`, `CANCELED`, `EXPIRED`, `CALCULATED`.
+    /// Execution type: `NEW`, `TRADE`, `CANCELED`, `EXPIRED`, `CALCULATED` — and whatever an
+    /// amend brings, which the docs do not list (Binance's is `AMENDMENT`). The core reads the
+    /// order's status `X` and its price, not this.
     #[serde(default, rename = "x")]
     pub execution: String,
     /// Order status: `NEW`, `PARTIALLY_FILLED`, `FILLED`, …

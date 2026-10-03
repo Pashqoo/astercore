@@ -43,13 +43,17 @@ const LINK_METHODS: [&str; 1] = ["GET /fapi/v1/time"];
 
 /// The order line: what it costs to place or pull an order — the exchange's
 /// work and not the wire's, drawn apart from the link for that reason.
-const ORDER_METHODS: [&str; 2] = ["POST /fapi/v3/order", "DELETE /fapi/v3/order"];
+const ORDER_METHODS: [&str; 3] = [
+    "POST /fapi/v3/order",
+    "PUT /fapi/v3/order",
+    "DELETE /fapi/v3/order",
+];
 
 /// Every call the core makes, so a card for each is on the page from the
 /// first paint — flat at zero is an answer too. A call site added without its
 /// line here is not lost: it appears as its own card the first time it is
 /// counted (see [`ApiMeter::view`]).
-pub const METHODS: [&str; 19] = [
+pub const METHODS: [&str; 20] = [
     "GET /fapi/v1/time",
     "GET /fapi/v1/exchangeInfo",
     "GET /fapi/v1/ticker/24hr",
@@ -64,6 +68,7 @@ pub const METHODS: [&str; 19] = [
     "GET /fapi/v3/openOrders",
     "GET /fapi/v3/order",
     "POST /fapi/v3/order",
+    "PUT /fapi/v3/order",
     "DELETE /fapi/v3/order",
     "POST /fapi/v3/listenKey",
     "POST /fapi/v3/leverage",
@@ -991,7 +996,10 @@ mod tests {
     fn the_page_is_told_which_calls_each_line_is() {
         let v = ApiMeter::detached().view(T0);
         assert_eq!(v.ping.link_methods, vec!["GET time"]);
-        assert_eq!(v.ping.order_methods, vec!["POST order", "DELETE order"]);
+        assert_eq!(
+            v.ping.order_methods,
+            vec!["POST order", "PUT order", "DELETE order"]
+        );
     }
 
     #[test]
