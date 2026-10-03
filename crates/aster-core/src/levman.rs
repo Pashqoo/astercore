@@ -2,6 +2,8 @@
 //! terminal sends its whole `TLevManageCommand` on Apply (the page's Leverage tab sends the same
 //! settings), the core keeps it, applies it at once
 //! and again every hour (MoonBot checks hourly too: the brackets change on the exchange's side).
+//! A pass that does not cover the account (a 429, the network, the site's figures missing) is
+//! made again sooner: 5 min, doubling while they keep falling short, back to the hour at most.
 //!
 //! What is asked of a market, in MoonBot's order of priority:
 //! 1. the position limit of the Config line (`5000 def`, `10k def 30k BTC ETH`) with «Авто плечи
@@ -40,6 +42,12 @@ use crate::setup::{self, Want};
 
 /// How often the account is looked over without being asked (MoonBot: once an hour).
 const PERIOD: Duration = Duration::from_secs(3600);
+
+/// How soon a pass that did not cover the account is made again: one stopped by a 429 or the
+/// network, or one that went without the site's figures and so raised nothing. Inside
+/// [`OI_TTL`], so the figures the short pass did read are not asked for again. It doubles with
+/// each short pass in a row, up to [`PERIOD`]: a ban or an outage is not probed every 5 min.
+const RETRY: Duration = Duration::from_secs(300);
 
 /// One position-limit rule of the Config line: a limit for the markets its token names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,7 +279,7 @@ pub fn save(path: &Path, payload: &[u8]) {
 pub struct Last {
     /// A pass is running now.
     pub running: bool,
-    /// When the last pass began (Unix ms; 0 = none yet) and why: start, applied, hourly.
+    /// When the last pass began (Unix ms; 0 = none yet) and why: start, applied, hourly, retry.
     pub at_ms: i64,
     pub why: String,
     pub markets: usize,
@@ -325,6 +333,7 @@ pub fn start(rest: Rest, signer: Signer, initial: Option<Config>, status: Shared
         oi_down: false,
         oi_failures: 0,
         oi_cache: HashMap::new(),
+        short_passes: 0,
     };
     thread::Builder::new()
         .name("aster-levman".into())
@@ -342,7 +351,9 @@ pub fn start(rest: Rest, signer: Signer, initial: Option<Config>, status: Shared
                             continue;
                         }
                         Ok(None) => {}
+                        // Made again it would panic again: the hour stands.
                         Err(_) => {
+                            worker.short_passes = 0;
                             log::error!("leverage: a pass panicked, the next is in an hour");
                             let mut last =
                                 worker.status.lock().unwrap_or_else(PoisonError::into_inner);
@@ -351,18 +362,31 @@ pub fn start(rest: Rest, signer: Signer, initial: Option<Config>, status: Shared
                         }
                     }
                 }
-                match rx.recv_timeout(PERIOD) {
+                let (wait, next) = next_pass(worker.short_passes);
+                match rx.recv_timeout(wait) {
                     Ok(Msg::Config(c)) => {
                         worker.config = Some(newest(&rx, c));
                         why = "applied";
                     }
-                    Err(RecvTimeoutError::Timeout) => why = "hourly",
+                    Err(RecvTimeoutError::Timeout) => why = next,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
         })
         .expect("spawn");
     tx
+}
+
+/// The wait before the next pass nobody asked for, and its reason on the page, after `short`
+/// passes in a row that did not cover the account.
+fn next_pass(short: u32) -> (Duration, &'static str) {
+    match short {
+        0 => (PERIOD, "hourly"),
+        n => (
+            RETRY.saturating_mul(1 << (n - 1).min(8)).min(PERIOD),
+            "retry",
+        ),
+    }
 }
 
 /// Only the last of several queued settings counts.
@@ -385,6 +409,9 @@ struct Worker {
     /// The site's figures by symbol and when they were read: a second pass minutes after the
     /// first (an Apply) does not read them all again.
     oi_cache: HashMap<String, (Instant, Vec<(i32, f64)>)>,
+    /// Passes in a row that did not cover every market with the site's figures; while there
+    /// are, the next is sooner than the hour ([`next_pass`]).
+    short_passes: u32,
 }
 
 impl Worker {
@@ -402,6 +429,7 @@ impl Worker {
                 ),
                 ..Last::default()
             });
+            self.short_passes = 0;
             return None;
         };
         self.oi_down = false;
@@ -417,6 +445,7 @@ impl Worker {
             Ok(read) => read,
             Err(e) => {
                 log::warn!("leverage: {why}: not made: {e}");
+                self.short_passes += 1;
                 last.running = false;
                 last.stopped = Some(e);
                 self.publish(last);
@@ -488,6 +517,15 @@ impl Worker {
         }
         Self::fill(&mut last, &total);
         last.running = false;
+        if stopped.is_none() && !self.oi_down {
+            self.short_passes = 0;
+        } else {
+            self.short_passes += 1;
+            log::info!(
+                "leverage: {why}: the pass is made again in {} min",
+                next_pass(self.short_passes).0.as_secs() / 60
+            );
+        }
         last.stopped = stopped;
         self.publish(last);
         None
@@ -694,6 +732,20 @@ mod tests {
             limits: Limits::parse(text),
             ..Config::default()
         }
+    }
+
+    /// A pass that stopped short (a 429, the network) or went without the site's figures is
+    /// made again in minutes: an hour would leave markets unmanaged and raises waiting.
+    #[test]
+    fn a_pass_short_of_the_account_is_made_again_soon() {
+        assert_eq!(next_pass(0), (PERIOD, "hourly"));
+        let (wait, why) = next_pass(1);
+        assert_eq!(why, "retry");
+        assert!(wait < PERIOD / 6, "{wait:?}");
+        // Falling short again and again (a ban, an outage) backs off to the hour, no further.
+        assert_eq!(next_pass(2).0, wait * 2);
+        assert_eq!(next_pass(5).0, PERIOD);
+        assert_eq!(next_pass(u32::MAX).0, PERIOD);
     }
 
     #[test]
