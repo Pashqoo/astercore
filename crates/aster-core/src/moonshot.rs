@@ -3751,11 +3751,6 @@ fn filter_counts(
     counts
 }
 
-/// The trader's clock, which MoonBot reads its work windows on (the
-/// terminal's auto-start window, `WorkingTime`) — the venue's UTC would shift
-/// every window by three hours.
-const TRADER_UTC_OFFSET_MS: i64 = crate::clock::TRADER_OFFSET_MS;
-
 /// A time window of the day on the trader's clock, minutes since
 /// midnight, or of the hour, minutes past it; `from > to` wraps over
 /// midnight (or the hour's end).
@@ -3817,7 +3812,9 @@ impl WorkWindow {
 
     pub fn contains(self, now_ms: i64) -> bool {
         let minute_of_day =
-            ((now_ms + TRADER_UTC_OFFSET_MS).rem_euclid(86_400_000) / 60_000) as u32;
+            // The trader's clock, which MoonBot reads its work windows on (the
+            // terminal's auto-start window, `WorkingTime`), not the venue's UTC.
+            ((now_ms + crate::clock::trader_offset_ms()).rem_euclid(86_400_000) / 60_000) as u32;
         let (at, from, to) = match self {
             Self::Daily { from, to } => (minute_of_day, from, to),
             Self::Hourly { from, to } => (minute_of_day % 60, from, to),
@@ -5021,7 +5018,8 @@ mod tests {
     #[test]
     fn working_time_parses_and_wraps() {
         // On the trader's clock: 10:30 there is 07:30 UTC.
-        let at = |h: i64, m: i64| (h * 60 + m) * 60_000 - TRADER_UTC_OFFSET_MS + 86_400_000;
+        let at =
+            |h: i64, m: i64| (h * 60 + m) * 60_000 - crate::clock::trader_offset_ms() + 86_400_000;
         let w = WorkWindow::parse("10:30 - 16:45").unwrap().unwrap();
         assert!(w.contains(at(10, 30)) && w.contains(at(16, 45)));
         assert!(!w.contains(at(10, 29)) && !w.contains(at(16, 46)));
@@ -5053,7 +5051,7 @@ mod tests {
         let model = model();
         let (win, sched) = (Windows::default(), None::<f64>);
         // 12:00 on the trader's clock, some day.
-        let t = 20_000 * 86_400_000 + 12 * 3_600_000 - TRADER_UTC_OFFSET_MS;
+        let t = 20_000 * 86_400_000 + 12 * 3_600_000 - crate::clock::trader_offset_ms();
         let run = |extra: &[(&str, FieldValue)]| {
             let mut f = vec![
                 ("CoinsWhiteList", Str("SBER".into())),

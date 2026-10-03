@@ -1,17 +1,45 @@
 //! The core's two clocks in text and days. Every timestamp of the venue and
-//! the wire is unix milliseconds, UTC. The trader's is Moscow (UTC+3): MoonBot
-//! reads its work windows, the daily summary, the day files of the journal and
-//! the times printed on a deal's picture on the trader's local clock, as
-//! TInvestCore did. RFC 3339 conversions ported from TInvestCore
-//! (`tinvest/time.rs`), the trader's day from its `tinvest/moex.rs`.
+//! the wire is unix milliseconds, UTC. The trader's is local: MoonBot reads its
+//! work windows, the daily summary, the day files of the journal and the times
+//! printed on a deal's picture on the clock of the machine it runs on. The core
+//! may run on a host in another zone, so the trader's offset is a setting
+//! (`data/config.json` → `utc_offset_min`, Moscow by default) rather than the
+//! host's zone; until 03.10 it was Moscow as a constant, as TInvestCore had
+//! it. RFC 3339 conversions ported from TInvestCore (`tinvest/time.rs`), the
+//! trader's day from its `tinvest/moex.rs`.
 
-/// The trader's clock against UTC.
-pub const TRADER_OFFSET_MS: i64 = 3 * 3_600_000;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+/// Moscow, UTC+3 — the trader's, and what the core always used.
+pub const DEFAULT_UTC_OFFSET_MIN: i32 = 180;
+/// The zones there are: UTC−12 to UTC+14.
+pub const UTC_OFFSET_RANGE_MIN: std::ops::RangeInclusive<i32> = -12 * 60..=14 * 60;
+
+static UTC_OFFSET_MIN: AtomicI32 = AtomicI32::new(DEFAULT_UTC_OFFSET_MIN);
+
+/// Set the trader's clock against UTC, in minutes (the settings, at the start
+/// and on every save). A value outside [`UTC_OFFSET_RANGE_MIN`] is not taken:
+/// the settings refuse it before it gets here.
+pub fn set_trader_offset_min(minutes: i32) {
+    if UTC_OFFSET_RANGE_MIN.contains(&minutes) {
+        UTC_OFFSET_MIN.store(minutes, Ordering::Relaxed);
+    }
+}
+
+/// The trader's clock against UTC, ms.
+pub fn trader_offset_ms() -> i64 {
+    i64::from(UTC_OFFSET_MIN.load(Ordering::Relaxed)) * 60_000
+}
 
 /// Start of the trader's calendar day containing `unix_ms`.
 pub fn trader_midnight(unix_ms: i64) -> i64 {
+    midnight_at(unix_ms, trader_offset_ms())
+}
+
+/// Start of the calendar day containing `unix_ms` on a clock `offset_ms` off UTC.
+fn midnight_at(unix_ms: i64, offset_ms: i64) -> i64 {
     const DAY_MS: i64 = 86_400_000;
-    (unix_ms + TRADER_OFFSET_MS).div_euclid(DAY_MS) * DAY_MS - TRADER_OFFSET_MS
+    (unix_ms + offset_ms).div_euclid(DAY_MS) * DAY_MS - offset_ms
 }
 
 /// Parse `YYYY-MM-DDTHH:MM:SS[.frac]Z` (fraction of any length, truncated to ms).
@@ -96,6 +124,19 @@ mod tests {
         let t = parse_rfc3339_ms("2024-04-30T21:30:00Z").unwrap();
         assert_eq!(format_rfc3339(trader_midnight(t)), "2024-04-30T21:00:00Z");
         assert_eq!(trader_midnight(trader_midnight(t)), trader_midnight(t));
+    }
+
+    /// A trader in another zone gets their own midnight: UTC−5 at 00:30 local
+    /// is 05:30 UTC, and their day began at 05:00 UTC.
+    #[test]
+    fn the_trader_day_follows_the_offset() {
+        let t = parse_rfc3339_ms("2024-05-01T05:30:00Z").unwrap();
+        let day = midnight_at(t, -5 * 3_600_000);
+        assert_eq!(format_rfc3339(day), "2024-05-01T05:00:00Z");
+        assert_eq!(format_rfc3339(midnight_at(t, 0)), "2024-05-01T00:00:00Z");
+        // India's half hour.
+        let day = midnight_at(t, 330 * 60_000);
+        assert_eq!(format_rfc3339(day), "2024-04-30T18:30:00Z");
     }
 
     #[test]

@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_PATH: &str = "data/config.json";
 /// Default web endpoint: loopback, beside the core's own UDP port (3101).
 pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:3102";
-/// MoonBot's daily summary hour: 23:50 of the Moscow day.
+/// MoonBot's daily summary hour: 23:50 of the trader's day.
 const DEFAULT_DAILY_AT: &str = "23:50";
-/// Moscow days of journal files kept, today included.
+/// The trader's days of journal files kept, today included.
 const DEFAULT_LOG_KEEP_DAYS: i64 = 3;
 /// A year: past that the files are an archive, not a journal. The number
 /// belongs to the module that sweeps them.
@@ -33,8 +33,13 @@ use crate::stderr_log::MAX_KEEP_DAYS as MAX_LOG_KEEP_DAYS;
 pub struct Settings {
     /// `error` | `warn` | `info` | `debug` | `trace`.
     pub log_level: String,
-    /// Moscow days of `logs/` kept, today included.
+    /// The trader's days of `logs/` kept, today included.
     pub log_keep_days: i64,
+    /// The trader's clock against UTC, minutes (`clock`): their day for the
+    /// journal files, the summary and the profit of the day, `WorkingTime` and
+    /// the auto-start window, the times on a deal's picture. A file written
+    /// before 03.10 has none and reads Moscow, what the core always used.
+    pub utc_offset_min: i32,
     /// What the strategies do when the core starts.
     pub start_strategies: StartMode,
     pub telegram: Telegram,
@@ -70,7 +75,7 @@ pub struct Telegram {
     /// reach `api.telegram.org` itself (TInvestCore's server went through its
     /// own xray), one binary, one setting.
     pub proxy: String,
-    /// `HH:MM` of the Moscow day for the summary (`events.daily`).
+    /// `HH:MM` of the trader's day for the summary (`events.daily`).
     pub daily_at: String,
     pub events: Events,
     pub shots: Shots,
@@ -88,7 +93,7 @@ pub struct Events {
     pub alarms: bool,
     /// The core started or stopped.
     pub lifecycle: bool,
-    /// The summary, at the Moscow hour [`Telegram::daily_at`] names.
+    /// The summary, at the trader's hour [`Telegram::daily_at`] names.
     pub daily: bool,
 }
 
@@ -156,6 +161,7 @@ impl std::fmt::Debug for Edit {
         f.debug_struct("Edit")
             .field("log_level", &self.log_level)
             .field("log_keep_days", &self.log_keep_days)
+            .field("utc_offset_min", &self.utc_offset_min)
             .field("start_strategies", &self.start_strategies)
             .field(
                 "telegram_token",
@@ -180,6 +186,7 @@ impl Default for Settings {
         Self {
             log_level: "info".into(),
             log_keep_days: DEFAULT_LOG_KEEP_DAYS,
+            utc_offset_min: crate::clock::DEFAULT_UTC_OFFSET_MIN,
             start_strategies: StartMode::default(),
             telegram: Telegram::default(),
             web: Web::default(),
@@ -234,6 +241,20 @@ impl Default for Web {
     }
 }
 
+/// The trader's offset is a zone there is: UTC−12 to UTC+14 (`clock::UTC_OFFSET_RANGE_MIN`).
+fn check_utc_offset(minutes: i32) -> Result<(), String> {
+    let range = crate::clock::UTC_OFFSET_RANGE_MIN;
+    if range.contains(&minutes) {
+        Ok(())
+    } else {
+        Err(format!(
+            "utc_offset_min {minutes} is not {}..={}",
+            range.start(),
+            range.end()
+        ))
+    }
+}
+
 /// One edit from the page: the fields it actually changed, `None` for the rest.
 ///
 /// A patch and not a whole [`Settings`] because the page never holds one: the
@@ -247,6 +268,7 @@ impl Default for Web {
 pub struct Edit {
     pub log_level: Option<String>,
     pub log_keep_days: Option<i64>,
+    pub utc_offset_min: Option<i32>,
     pub start_strategies: Option<StartMode>,
     /// Empty string = forget the token (the reports go off), as the page's
     /// «clear» button asks; `None` = leave it alone, which is every save the
@@ -255,7 +277,7 @@ pub struct Edit {
     /// 0 = forget the approved chat, so the PIN pairing can be redone.
     pub telegram_chat_id: Option<i64>,
     pub telegram_proxy: Option<String>,
-    /// `HH:MM` of the Moscow day for the summary.
+    /// `HH:MM` of the trader's day for the summary.
     pub telegram_daily_at: Option<String>,
     pub telegram_events: Option<Events>,
     pub telegram_shots: Option<Shots>,
@@ -390,7 +412,7 @@ impl Settings {
     /// error too — an unparsable one would otherwise pass this check and only
     /// fail when the listener opens.
     pub fn validate(&self) -> Result<(), String> {
-        // Both are read long after the start — the journal rolls at Moscow
+        // Both are read long after the start — the journal rolls at the trader's
         // midnight, the summary goes out in the evening — so a file edited by
         // hand is caught here and not hours later by a line nobody is reading.
         if parse_hhmm(&self.telegram.daily_at).is_none() {
@@ -405,6 +427,7 @@ impl Settings {
                 self.log_keep_days
             ));
         }
+        check_utc_offset(self.utc_offset_min)?;
         let addr = self.web_addr()?;
         if !addr.ip().is_loopback() && self.web.password.is_empty() {
             return Err(format!(
@@ -460,6 +483,10 @@ impl Settings {
             }
             next.log_keep_days = v;
         }
+        if let Some(v) = edit.utc_offset_min {
+            check_utc_offset(v)?;
+            next.utc_offset_min = v;
+        }
         if let Some(v) = edit.start_strategies {
             next.start_strategies = v;
         }
@@ -497,7 +524,7 @@ impl Settings {
             .map_err(|_| format!("web.bind {:?} is not host:port", self.web.bind))
     }
 
-    /// Milliseconds into the Moscow day at which the summary goes out.
+    /// Milliseconds into the trader's day at which the summary goes out.
     /// Validated on the way in, so a file that reached here has one.
     pub fn daily_at_ms(&self) -> i64 {
         parse_hhmm(&self.telegram.daily_at).unwrap_or(23 * 60 + 50) * 60_000
@@ -683,7 +710,30 @@ mod tests {
         assert_eq!(loaded.settings.log_level, "info");
         assert_eq!(loaded.settings.web.bind, DEFAULT_WEB_BIND);
         assert!(loaded.settings.telegram.shots.may_send);
+        assert_eq!(
+            loaded.settings.utc_offset_min, 180,
+            "a file from before 03.10 reads Moscow"
+        );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The trader's clock is a zone there is: India's half hour is taken, a
+    /// day and a half is not, and a refused edit changes nothing.
+    #[test]
+    fn the_utc_offset_is_a_zone_there_is() {
+        let mut settings = Settings::default();
+        let edit = |m| Edit {
+            utc_offset_min: Some(m),
+            ..Edit::default()
+        };
+        assert!(settings.apply(&edit(330)).unwrap().is_empty(), "no restart");
+        assert_eq!(settings.utc_offset_min, 330);
+        assert!(settings.apply(&edit(-5 * 60)).is_ok());
+        for bad in [15 * 60, -13 * 60, 36 * 60] {
+            let err = settings.apply(&edit(bad)).unwrap_err();
+            assert!(err.contains("utc_offset_min"), "{err}");
+        }
+        assert_eq!(settings.utc_offset_min, -300);
     }
 
     #[test]

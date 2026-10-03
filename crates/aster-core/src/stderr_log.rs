@@ -1,6 +1,6 @@
 //! Minimal `log` backend: level from `ASTER_CORE_LOG` (default `info`). Each line goes to
 //! stderr (journald under systemd) and to `logs/YYYY-MM-DD.log` in the working directory: one file
-//! per day of the trader's clock (Moscow, `clock.rs`; lines keep UTC time), the last `KEEP_DAYS`
+//! per day of the trader's clock (`clock.rs`, Moscow by default; lines keep UTC time), the last `KEEP_DAYS`
 //! files kept. The web page reads their tail. Ported from TInvestCore.
 
 use std::fs::{self, File, OpenOptions};
@@ -11,10 +11,10 @@ use std::sync::{Mutex, PoisonError};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 use crate::clock as time;
-use crate::clock::{trader_midnight as msk_midnight_fn, TRADER_OFFSET_MS};
+use crate::clock::{trader_midnight as msk_midnight_fn, trader_offset_ms};
 
 const LOG_DIR: &str = "logs";
-/// Moscow days of files kept, today included. The settings replace it at the
+/// trader's days of files kept, today included. The settings replace it at the
 /// start and whenever the page changes it ([`set_keep_days`]); an atomic
 /// rather than a lock, because it is read on the logging path itself.
 static KEEP_DAYS: AtomicI64 = AtomicI64::new(3);
@@ -27,10 +27,10 @@ const DAY_MS: i64 = 86_400_000;
 /// this far back and not from the start.
 const TAIL_BYTES: u64 = 512 * 1024;
 
-/// The current Moscow day's file; `file` is `None` after a failed open or write, retried when the
+/// The current trader's day's file; `file` is `None` after a failed open or write, retried when the
 /// day changes.
 struct DayFile {
-    /// Unix ms of the day's Moscow midnight.
+    /// Unix ms of the day's trader's midnight.
     day: i64,
     file: Option<File>,
 }
@@ -125,15 +125,15 @@ fn append(ms: i64, line: &str) {
     {
         let _ = writeln!(
             std::io::stderr(),
-            "log file: {e}; file logging paused until the next Moscow day"
+            "log file: {e}; file logging paused until the next trader's day"
         );
         day_file.file = None;
     }
 }
 
-/// `YYYY-MM-DD` of the Moscow day containing `ms`.
+/// `YYYY-MM-DD` of the trader's day containing `ms`.
 fn msk_date(ms: i64) -> String {
-    time::format_rfc3339(ms + TRADER_OFFSET_MS)[..10].to_owned()
+    time::format_rfc3339(ms + trader_offset_ms())[..10].to_owned()
 }
 
 fn open_day(ms: i64) -> Option<File> {
@@ -144,7 +144,7 @@ fn open_day(ms: i64) -> Option<File> {
         .ok()
 }
 
-/// A day file (`YYYY-MM-DD.log`) older than the `KEEP_DAYS` Moscow days ending with `now_ms`'s.
+/// A day file (`YYYY-MM-DD.log`) older than the `KEEP_DAYS` trader's days ending with `now_ms`'s.
 fn is_stale(name: &str, now_ms: i64) -> bool {
     let keep = KEEP_DAYS.load(Ordering::Relaxed).max(1);
     let oldest_kept = msk_date(now_ms - (keep - 1) * DAY_MS);
@@ -169,8 +169,8 @@ fn remove_stale(now_ms: i64) {
 }
 
 /// The last `lines` of the journal, oldest first, for the page (`web.rs`):
-/// today's Moscow day file, topped up from the day before when today's is
-/// shorter — a page opened at 00:05 MSK would otherwise be blank.
+/// today's trader's day file, topped up from the day before when today's is
+/// shorter — a page opened at 00:05 of the trader's clock would otherwise be blank.
 ///
 /// Read from its own handle, not through the writer's mutex: the page must not
 /// be able to hold up a line the trading loop is logging.
@@ -184,7 +184,7 @@ pub fn tail(now_ms: i64, lines: usize) -> String {
     out.join("\n")
 }
 
-/// The last `lines` of one Moscow day's file, oldest first; an absent or
+/// The last `lines` of one trader's day's file, oldest first; an absent or
 /// unreadable file is no lines, because the page asking for the journal must
 /// not be an error the operator has to read.
 fn day_tail(ms: i64, lines: usize) -> Vec<String> {
@@ -224,14 +224,14 @@ pub fn init() {
     }
 }
 
-/// Apply how many Moscow days of files to keep. Takes effect at the next day
+/// Apply how many trader's days of files to keep. Takes effect at the next day
 /// change, when the stale ones are swept — nothing is deleted the moment the
 /// number is lowered, which also means an operator who lowers it by mistake
 /// has until midnight to put it back.
 pub fn set_keep_days(days: i64) {
     let days = days.clamp(1, MAX_KEEP_DAYS);
     if KEEP_DAYS.swap(days, Ordering::Relaxed) != days {
-        log::info!("log files kept: {days} Moscow day(s)");
+        log::info!("log files kept: {days} trader's day(s)");
     }
 }
 

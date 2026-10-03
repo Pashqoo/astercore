@@ -218,9 +218,17 @@
       <h2>Reports</h2>
       <div class="checks" id="events"></div>
       <div class="fields" style="margin-top:10px">
-        <label>daily summary at <span class="note">(MSK)</span>
+        <label>daily summary at <span class="note">(trader's clock)</span>
           <input name="telegram_daily_at" placeholder="23:50"></label>
+        <label>trader's clock, UTC <span class="note">(+3 Moscow, -5, +5:30)</span>
+          <input name="utc_offset_min" placeholder="+3"></label>
       </div>
+      <p class="note">
+        The trader's clock is the day of the summary and of the profit of the day, the journal's
+        day files, <code>WorkingTime</code> and the auto-start window, the times on a deal's
+        picture. It applies at once; a summary already sent today is not sent again, and one whose
+        hour has already passed on the new clock comes tomorrow. The venue itself is UTC.
+      </p>
     </div>
 
     <div class="card">
@@ -313,7 +321,7 @@
       <p class="note">
         The last lines of today's file in <code>logs/</code>, topped up from yesterday's. The
         level applies at once; <code>debug</code> writes a great deal more into that file. The
-        day files are swept at the next Moscow midnight, so a number lowered by mistake can be
+        day files are swept at the next midnight of the trader's clock, so a number lowered by mistake can be
         put back before anything goes.
       </p>
     </div>
@@ -809,12 +817,27 @@ function shotValue(i) {
   return parseFloat(i.value) || 0;
 }
 
+/* The trader's clock as the page writes it, `+3` or `+5:30`, and back to the
+   core's minutes; NaN for text that is not one. */
+function offsetText(m) {
+  const a = Math.abs(m);
+  return (m < 0 ? '-' : '+') + Math.floor(a / 60) + (a % 60 ? ':' + String(a % 60).padStart(2, '0') : '');
+}
+
+function offsetMinutes(text) {
+  const r = /^\s*([+-]?)(\d{1,2})(?::([0-5]\d))?\s*$/.exec(text);
+  if (!r) return NaN;
+  const m = parseInt(r[2], 10) * 60 + (r[3] ? parseInt(r[3], 10) : 0);
+  return r[1] === '-' ? -m : m;
+}
+
 function fill(v) {
   const f = $('settings');
   f.log_level.value = v.log_level;
   f.log_keep_days.value = v.log_keep_days;
   f.start_strategies.value = v.start_strategies;
   f.telegram_daily_at.value = v.telegram_daily_at;
+  f.utc_offset_min.value = offsetText(v.utc_offset_min);
   f.web_bind.value = v.web_bind;
   f.telegram_proxy.value = v.telegram_proxy;
   f.telegram_chat_id.value = v.telegram_chat_id;
@@ -852,6 +875,9 @@ async function edit() {
   put('log_keep_days', parseInt(f.log_keep_days.value, 10) || 0);
   put('start_strategies', f.start_strategies.value);
   put('telegram_daily_at', f.telegram_daily_at.value);
+  // Text the core cannot read goes as it is, so the refusal names it.
+  const offset = offsetMinutes(f.utc_offset_min.value);
+  put('utc_offset_min', Number.isNaN(offset) ? f.utc_offset_min.value : offset);
   put('web_bind', f.web_bind.value);
   put('telegram_proxy', f.telegram_proxy.value);
   put('telegram_chat_id', parseInt(f.telegram_chat_id.value, 10) || 0);

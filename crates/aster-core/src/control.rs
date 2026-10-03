@@ -661,7 +661,7 @@ pub struct Order {
 /// «day», where it read as a day's loss when it was a week's.
 #[derive(Debug, Default, Serialize)]
 pub struct Profit {
-    /// Closed since Moscow midnight.
+    /// Closed since trader's midnight.
     pub day_total: f64,
     pub day_trades: i32,
     /// Closed in the last hour.
@@ -685,6 +685,7 @@ pub struct Stream {
 pub struct SettingsView {
     pub log_level: String,
     pub log_keep_days: i64,
+    pub utc_offset_min: i32,
     pub start_strategies: settings::StartMode,
     pub telegram_token_set: bool,
     pub telegram_chat_id: i64,
@@ -707,6 +708,7 @@ impl From<&Settings> for SettingsView {
         Self {
             log_level: s.log_level.clone(),
             log_keep_days: s.log_keep_days,
+            utc_offset_min: s.utc_offset_min,
             start_strategies: s.start_strategies,
             telegram_token_set: !s.telegram.token.is_empty(),
             telegram_chat_id: s.telegram.chat_id,

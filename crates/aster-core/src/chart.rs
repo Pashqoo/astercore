@@ -28,7 +28,7 @@ use flate2::write::ZlibEncoder;
 use flate2::{Compression, Crc};
 use moonproto::server::codec::market_data::{Candle, HistoryTrade};
 
-use crate::clock::TRADER_OFFSET_MS as MSK_OFFSET_MS;
+use crate::clock::trader_offset_ms;
 use crate::orders::Move;
 
 /// Delphi day 0 in Unix days (`moonproto::time`, which keeps it private).
@@ -487,7 +487,7 @@ pub fn deal_png(series: Series, deal: &Deal) -> Option<Vec<u8>> {
     }
 
     // The day the deal happened, not the day the axis begins: the axis
-    // carries air at both ends, and a deal just after Moscow midnight came
+    // carries air at both ends, and a deal just after trader's midnight came
     // out stamped with yesterday.
     let stamp = marks.first().copied().unwrap_or(tape.0);
     title(&mut canvas, &plot, &track, deal, scale_pct, stamp);
@@ -620,7 +620,7 @@ fn grid(canvas: &mut Canvas, plot: &Plot, step: f64) {
     }
 }
 
-/// The clock down the picture: whole minutes in Moscow, so the grid lines
+/// The clock down the picture: whole minutes on the trader's clock, so the grid lines
 /// fall where a trader expects them and a hole in the data is visible as the
 /// distance between two bars.
 ///
@@ -631,7 +631,8 @@ fn grid(canvas: &mut Canvas, plot: &Plot, step: f64) {
 fn time_axis(canvas: &mut Canvas, plot: &Plot) {
     let baseline = plot.y1 + 6.0 * SCALE;
     let step = time_step(plot.t1 - plot.t0);
-    let mut t = (plot.t0 + MSK_OFFSET_MS).div_euclid(step) * step + step - MSK_OFFSET_MS;
+    let offset = trader_offset_ms();
+    let mut t = (plot.t0 + offset).div_euclid(step) * step + step - offset;
     for _ in 0..TIME_LABELS_MAX {
         if t >= plot.t1 {
             break;
@@ -1219,18 +1220,18 @@ fn price_label(price: f64, step: f64) -> String {
     }
 }
 
-/// `HH:MM` in Moscow, from Unix milliseconds.
+/// `HH:MM` on the trader's clock, from Unix milliseconds.
 fn clock_ms(unix_ms: i64) -> String {
-    let minutes = (unix_ms + MSK_OFFSET_MS)
+    let minutes = (unix_ms + trader_offset_ms())
         .div_euclid(60_000)
         .rem_euclid(1_440);
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
-/// `YYYY-MM-DD HH:MM` in Moscow. The date comes from the one place in the
+/// `YYYY-MM-DD HH:MM` on the trader's clock. The date comes from the one place in the
 /// tree that owns the civil calendar, rather than a second copy of it here.
 fn day_text(unix_ms: i64) -> String {
-    let stamp = crate::clock::format_rfc3339(unix_ms + MSK_OFFSET_MS);
+    let stamp = crate::clock::format_rfc3339(unix_ms + trader_offset_ms());
     match stamp.get(..10) {
         Some(date) => format!("{date} {}", clock_ms(unix_ms)),
         None => clock_ms(unix_ms),

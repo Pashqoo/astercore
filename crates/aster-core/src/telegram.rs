@@ -26,7 +26,7 @@ use ureq::{Agent, Proxy};
 
 use crate::chart;
 use crate::clock::format_rfc3339;
-use crate::clock::{trader_midnight as msk_midnight, TRADER_OFFSET_MS as MSK_OFFSET_MS};
+use crate::clock::{trader_midnight as msk_midnight, trader_offset_ms};
 use crate::control::{self, AskError, ControlCmd, Topic};
 use crate::reports::Row;
 use crate::settings::{Events, Settings, Telegram};
@@ -1507,7 +1507,7 @@ pub fn shot_caption(row: &Row) -> String {
     )
 }
 
-/// The summary of the deals closed today, sent at the Moscow hour
+/// The summary of the deals closed today, sent at the trader's hour
 /// `telegram.daily_at` names (23:50 by default, MoonBot's).
 pub fn daily_text<'a>(rows: impl Iterator<Item = &'a Row>, day_start_s: i64) -> String {
     let (mut profit, mut fees, mut wins, mut losses) = (0.0, 0.0, 0, 0);
@@ -1548,9 +1548,9 @@ pub fn daily_text<'a>(rows: impl Iterator<Item = &'a Row>, day_start_s: i64) -> 
     text
 }
 
-/// `27.09` of an MSK day, from the Unix milliseconds of any moment in it.
+/// `27.09` of a trader's day, from the Unix milliseconds of any moment in it.
 fn msk_date(ms: i64) -> String {
-    let iso = format_rfc3339(ms + MSK_OFFSET_MS);
+    let iso = format_rfc3339(ms + trader_offset_ms());
     // `2026-09-27T20:50:00Z` -> `27.09`.
     match (iso.get(8..10), iso.get(5..7)) {
         (Some(day), Some(month)) => format!("{day}.{month}"),

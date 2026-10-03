@@ -98,6 +98,7 @@ fn main() -> ExitCode {
         Ok(loaded) => {
             stderr_log::set_level(&loaded.settings.log_level);
             stderr_log::set_keep_days(loaded.settings.log_keep_days);
+            aster_core::clock::set_trader_offset_min(loaded.settings.utc_offset_min);
             if loaded.created {
                 log::info!("config: {} created", settings::DEFAULT_PATH);
             }

@@ -760,12 +760,20 @@ impl CoreHandler {
     /// One edit from the page: merge it, apply what applies at once, save.
     /// `Err` is only a refused patch, and then nothing changed.
     fn settings_edited(&mut self, edit: &settings::Edit) -> Result<control::Applied, String> {
+        let offset_was = self.ops.settings.utc_offset_min;
         let restart = self.ops.settings.apply(edit).map_err(|e| {
             log::error!("config: the page's edit was refused: {e}");
             e
         })?;
         stderr_log::set_level(&self.ops.settings.log_level);
         stderr_log::set_keep_days(self.ops.settings.log_keep_days);
+        crate::clock::set_trader_offset_min(self.ops.settings.utc_offset_min);
+        if self.ops.settings.utc_offset_min != offset_was {
+            // The summary's day was a midnight of the old clock: taken note of
+            // again on the new one, so a day it already went out on is not
+            // reported twice.
+            self.ops.daily_day = 0;
+        }
         let unsaved = self
             .settings_written("settings changed from the page")
             .err();
