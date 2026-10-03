@@ -200,18 +200,7 @@ impl Rest {
         if self.network != Network::Mainnet {
             return Ok(Vec::new());
         }
-        // A symbol goes into the query as it is: only what exchangeInfo spells like one does
-        // (`B-MONEYUSDT` has a hyphen).
-        if symbol.is_empty()
-            || !symbol
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        {
-            return Err(Error::Decode(format!("leverageoi: odd symbol {symbol:?}")));
-        }
-        let url = format!(
-            "https://www.asterdex.com/bapi/futures/v1/public/future/common/symbol/leverageoi/remaining?symbol={symbol}"
-        );
+        let url = leverage_oi_url(symbol)?;
         let resp = self
             .agent
             .get(&url)
@@ -795,9 +784,40 @@ pub fn now_us() -> i64 {
         .unwrap_or(0)
 }
 
+/// The site's query for one symbol. The symbol is percent-encoded: five trading markets are
+/// spelled in Chinese (`龙虾USDT`), and the site answers those only encoded (measured 03.10).
+fn leverage_oi_url(symbol: &str) -> Result<String, Error> {
+    if symbol.is_empty() {
+        return Err(Error::Decode("leverageoi: empty symbol".into()));
+    }
+    let mut url = String::from(
+        "https://www.asterdex.com/bapi/futures/v1/public/future/common/symbol/leverageoi/remaining?symbol=",
+    );
+    super::sign::encode_into(&mut url, symbol);
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Chinese symbol reaches the site encoded, and nothing a symbol holds can cut the query.
+    #[test]
+    fn a_symbol_goes_to_the_site_percent_encoded() {
+        const BASE: &str =
+            "https://www.asterdex.com/bapi/futures/v1/public/future/common/symbol/leverageoi/remaining?symbol=";
+        let url = |s| {
+            leverage_oi_url(s)
+                .unwrap()
+                .strip_prefix(BASE)
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(url("龙虾USDT"), "%E9%BE%99%E8%99%BEUSDT");
+        assert_eq!(url("B-MONEYUSDT"), "B-MONEYUSDT");
+        assert_eq!(url("A&b=c#d"), "A%26b%3Dc%23d");
+        assert!(leverage_oi_url("").is_err());
+    }
 
     /// A gateway's HTML page in place of the exchange's JSON is cut to one short line before it
     /// goes to the journal and to Telegram.

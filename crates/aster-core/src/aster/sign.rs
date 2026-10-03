@@ -399,8 +399,9 @@ fn checksum(hex: &str) -> String {
 }
 
 /// Form-encode `s` the way the docs' `urllib.parse.urlencode` does: letters,
-/// digits and `_.-~` as they are, space as `+`, every other byte `%XX`.
-fn encode_into(out: &mut String, s: &str) {
+/// digits and `_.-~` as they are, space as `+`, every other byte `%XX`. The
+/// site's unsigned open-interest query (`rest.rs`) encodes its symbol with it too.
+pub(super) fn encode_into(out: &mut String, s: &str) {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'~' => {
