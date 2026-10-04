@@ -19,8 +19,15 @@
 
 ## Commands
 
-Разработка на Mac, `cargo` в `~/.cargo/bin`: `export PATH="$HOME/.cargo/bin:$PATH"`.
-Проверено 01.10 — каждая из этих команд прогнана.
+Разработка переезжает на сервер `<server>` (раздел «Сервер» внизу): чекаут
+`/root/Projects/Astercore`, рядом `TInvestCore` и `moon-terminal`. На Mac — то же самое, `cargo` в
+`~/.cargo/bin`: `export PATH="$HOME/.cargo/bin:$PATH"`. Проверено 01.10 на Mac и 04.10 на
+сервере — каждая из этих команд прогнана.
+
+Toolchain — **1.98.0** на обеих машинах (`rustup default 1.98.0`). На 1.99 lint падает:
+`fetch_update` у атомиков там устарел (переименован в `try_update`; `telegram.rs:513`,
+`aster/sign.rs:276`), а lint идёт с `-D warnings`. Переход на 1.99 — отдельная правка, вместе с обеими машинами.
+На сервере 2 ядра и соседние сервисы: сборка — под `nice -n 15`, release-сборка с нуля ~4.5 мин.
 
 - build: `cargo build --release -p aster-core --all-targets`
 - test: `cargo test -p aster-core --all-targets` и `cargo test -p moonproto --lib -- server::`
@@ -155,9 +162,22 @@
 
 `MIN_NOTIONAL` на всех символах = 5 USDT, значит живая проверка ордера стоит пять долларов.
 
-## Чего здесь нет
+## Сервер
 
-Боевого хоста и деплоя — решение трейдера (`PLAN.md`, «Открытые решения» п. 6); юнит для него
-готов (`tools/aster-core.service`, рабочий каталог `/opt/aster-core`). С Mac и REST, и
-WebSocket доступны напрямую, прокси не нужен (замерено 01.10: `/fapi/v1/time` 0.30 с,
-`wss://fstream.asterdex.com` рукопожатие 0.82 с).
+`<server>` (`~/.ssh/config`: <user>@<SERVER_IP>) — <провайдер>, <регион>, Debian 13, 2 ядра, 1.9 ГБ
+памяти + 6 ГБ swap. Решение трейдера 04.10: здесь и боевое ядро, и разработка. До Aster — тот же
+CloudFront в том же регионе (ping 0.3 мс). На хосте живут чужие для ядра сервисы (список — в CLAUDE.local.md) — их не трогать.
+
+- **Боевое ядро** — служба `aster-core` (`tools/aster-core.service`, пользователь `aster`, каталог
+  `/opt/aster-core`), установлена по README. Ключ терминала `<TERMINAL_KEY_ID>` выпущен на
+  `<SERVER_IP>:3101` (04.10); показать — `cd /opt/aster-core && sudo -u aster ./aster-core
+  --print-key`. Журнал — `journalctl -u aster-core` и `/opt/aster-core/logs/`.
+- **Страница** — только через туннель: `ssh -L 3102:127.0.0.1:3102 <server>`.
+- **Тестовое ядро** — `/root/aster-test` на порту 3111 (`ASTER_CORE_PORT=3111
+  ASTER_CORE_ADDR=127.0.0.1`), без ключа биржи; вендорные примеры — уже собранные бинари в
+  `target/release/examples/`.
+- **Обновление боевого** — README, «Обновление»; перед `stop` — `/api/status` → `orders`.
+- Правила Claude — `/root/.claude` из чекаута `/root/bot/ClaudRules`, память проекта перенесена.
+
+Переключение с Mac (ядро на Mac стоп → `data/` и `asterkey` на сервер → служба старт → новый ключ в
+терминал) — по команде трейдера; до него боевое ядро работает на Mac (`PLAN.md`, верхний блок).

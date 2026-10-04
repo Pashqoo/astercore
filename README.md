@@ -5,8 +5,9 @@
 
 ## Установка на Linux
 
-Команды — для Debian/Ubuntu; юнит подойдёт любому Linux с systemd. На живом Linux-хосте эта
-инструкция ещё не прогонялась (ядро пока собирается и работает на Mac).
+Команды — для Debian/Ubuntu; юнит подойдёт любому Linux с systemd. Прогнана 04.10 на Debian 13
+(2 ядра, 1.9 ГБ памяти + swap): сборка ~4.5 мин, тесты зелёные. Toolchain — 1.98.0: на 1.99
+сборка идёт, но с двумя предупреждениями об устаревшем `fetch_update`.
 Всё чистый Rust на rustls: OpenSSL не нужен, нужен только компилятор C для `ring`.
 
 ### 1. Сборка
@@ -32,7 +33,7 @@ cargo build --release -p aster-core
 Служба идёт от отдельного пользователя без прав на остальную систему (`User=aster` в юните):
 
 ```sh
-sudo useradd --system --home-dir /opt/aster-core --shell /usr/sbin/nologin aster
+sudo useradd --system --home-dir /opt/aster-core --no-create-home --shell /usr/sbin/nologin aster
 sudo mkdir -p /opt/aster-core
 sudo install -m 755 target/release/aster-core /opt/aster-core/
 sudo chown -R aster:aster /opt/aster-core
