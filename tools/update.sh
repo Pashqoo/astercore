@@ -149,15 +149,16 @@ until [ "$(ack_kind)" = running ]; do
 		echo "update: build $build did not come up in $HEALTH_S s, rolling back" >&2
 		# A unit that is inactive was stopped on purpose (exit 0: `systemctl stop`, the page,
 		# the terminal): the old binary goes back, and the unit stays as the operator left it.
+		# The binary goes back by rename first, under a running or restarting core, and one
+		# `restart` then stops the new core and starts the old one.
 		was=$(systemctl is-active "$UNIT" 2>/dev/null || true)
-		systemctl stop "$UNIT" || true
 		if [ -f "$EXE.prev" ]; then
 			mv -fT "$EXE.prev" "$EXE"
 		fi
 		state rolled-back "build $build did not come up in $HEALTH_S s"
 		if [ "$was" != inactive ]; then
 			systemctl reset-failed "$UNIT" 2>/dev/null || true
-			systemctl start "$UNIT"
+			systemctl restart "$UNIT"
 		fi
 		exit 1
 	fi
