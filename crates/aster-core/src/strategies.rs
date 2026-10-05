@@ -907,6 +907,22 @@ mod tests {
     use super::*;
     use moonproto::{StrategyFields, StrategyKind};
 
+    /// `MarketTags` reaches the terminal as a text field with no list: its
+    /// dropdown picks one item, and a strategy may want several classes.
+    #[test]
+    fn market_tags_is_a_text_field() {
+        let st = Strategies::new(None, 0);
+        let f = st
+            .schema()
+            .fields
+            .iter()
+            .find(|f| f.name == MARKET_TAGS)
+            .expect("MarketTags in the schema");
+        assert_eq!(f.ui_kind, moonproto::StrategyFieldUiKind::Edit);
+        assert!(f.static_picklist.is_empty() && f.dynamic_picklist.is_none());
+        assert_eq!(f.default_value, Some(FieldValue::String("all".into())));
+    }
+
     /// Every control the helper offers stands for a real schema field. A name
     /// that drifted would be a control the page draws empty and the core
     /// ignores — the operator would move it and watch nothing change.
