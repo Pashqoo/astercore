@@ -85,8 +85,8 @@ Toolchain — **1.98.0** на обеих машинах (`rustup default 1.98.0`
 - `tools/aster-core-update.service`, `tools/aster-core-update.path`, `tools/aster-core.service`;
 - `crates/aster-core/src/update.rs` — сторона ядра: протокол файлов, подмена бинаря, номер сборки;
 - `crates/aster-core/tests/loopback.rs` — гейт перед подменой (`cargo test --release --test loopback`);
-- `crates/moonproto/src/server/codec/ui.rs` (`CMD_UPDATE_VERSION`) и ветка `CMD_UPDATE_VERSION` в
-  `engine.rs` — приём команды.
+- ветка `update::CMD_UPDATE_VERSION` в `engine.rs` и `update::decode` — приём команды (в ядре, не
+  в вендоре: `moonproto` ради этой команды не правится).
 
 CI и workflow нет: гейт — проверка в `update.sh` и контрактный тест. Правки скрипта и юнитов на
 сервер сами не приезжают, ставятся вручную.

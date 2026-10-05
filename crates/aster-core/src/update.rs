@@ -44,6 +44,9 @@ const FLAT_WAIT_MS: i64 = 10 * 60_000;
 const CHECK_EVERY_MS: i64 = 1_000;
 /// The token the terminal reads as «the core refused the update» (`BGF-SUB4`, MoonBot's).
 pub const REFUSED: &str = "BGF-SUB4";
+/// `TUpdateVersionCommand`, UI cmd 6. Read here and not in the vendored codec: `moonproto`'s own
+/// parser for it is crate-private, and the vendor is not edited for it.
+pub const CMD_UPDATE_VERSION: u8 = 6;
 
 const REQUEST: &str = "update-request";
 const STATE: &str = "update-state";
@@ -67,6 +70,21 @@ const fn parse_build(s: Option<&str>) -> i32 {
         i += 1;
     }
     n
+}
+
+/// The build a `TUpdateVersionCommand` payload asks for: `(version_name, is_release)`. The layout
+/// of `moonproto`'s `build_update_version`: the 11-byte header, the name as a `u16` length and its
+/// bytes, one byte `is_release` (absent reads as false, as the upstream parser has it).
+pub fn decode(payload: &[u8]) -> Option<(String, bool)> {
+    const HEADER: usize = 11;
+    if payload.first() != Some(&CMD_UPDATE_VERSION) {
+        return None;
+    }
+    let len = u16::from_le_bytes([*payload.get(HEADER)?, *payload.get(HEADER + 1)?]) as usize;
+    let start = HEADER + 2;
+    let name = payload.get(start..start + len)?;
+    let release = payload.get(start + len).is_some_and(|&b| b != 0);
+    Some((String::from_utf8_lossy(name).into_owned(), release))
 }
 
 /// A build name the terminal may ask for: a commit (7–40 hex) or a tag. The script checks that
@@ -428,6 +446,35 @@ mod tests {
 
     fn state(dir: &Path, line: &str) {
         std::fs::write(dir.join("state").join(STATE), line).unwrap();
+    }
+
+    fn wire(name: &str, release: Option<bool>) -> Vec<u8> {
+        let mut out = vec![CMD_UPDATE_VERSION, 1, 0];
+        out.extend_from_slice(&7u64.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend(release.map(u8::from));
+        out
+    }
+
+    #[test]
+    fn the_command_decodes_as_the_upstream_builder_writes_it() {
+        assert_eq!(decode(&wire("", Some(true))), Some((String::new(), true)));
+        assert_eq!(
+            decode(&wire("eeadeb0", Some(false))),
+            Some(("eeadeb0".into(), false))
+        );
+        assert_eq!(
+            decode(&wire("eeadeb0", None)),
+            Some(("eeadeb0".into(), false))
+        );
+        // A name longer than the payload, or another command, is no request.
+        let mut cut = wire("eeadeb0", Some(false));
+        cut.truncate(16);
+        assert_eq!(decode(&cut), None);
+        let mut other = wire("", Some(true));
+        other[0] = 9;
+        assert_eq!(decode(&other), None);
     }
 
     #[test]

@@ -1489,9 +1489,9 @@ impl CoreHandler {
             // MoonBot's update button: the build is made off the core (`update.rs`), and the core
             // restarts into it once it holds no position. Never echoed: a Delphi terminal that
             // hears the command back starts its own updater.
-            ui::CMD_UPDATE_VERSION => {
+            update::CMD_UPDATE_VERSION => {
                 let now = now_ms();
-                let accepted = ui::update_version(payload)
+                let accepted = update::decode(payload)
                     .ok_or_else(|| "the request does not parse".to_string())
                     .and_then(|(name, release)| self.ask_update(name.trim(), release, now));
                 match accepted {
