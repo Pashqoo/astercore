@@ -477,7 +477,8 @@ impl Worker {
             ..Last::default()
         };
         self.publish(last.clone());
-        let (markets, brackets) = match self.markets_and_brackets() {
+        let limits = (config.auto_max_order && !config.limits.is_empty()).then_some(&config.limits);
+        let (markets, brackets) = match self.markets_and_brackets(limits) {
             Ok(read) => read,
             Err(e) => {
                 log::warn!("leverage: {why}: not made: {e}");
@@ -633,8 +634,10 @@ impl Worker {
 
     /// The trading markets (symbol, base coin) in symbol order, listed now, and their brackets.
     #[allow(clippy::type_complexity)]
+    /// `limits`: the Config line's, when it manages leverage — read against the site's table.
     fn markets_and_brackets(
         &mut self,
+        limits: Option<&Limits>,
     ) -> Result<(Vec<(String, String)>, HashMap<String, SymbolBrackets>), String> {
         let err = |what: &'static str| move |e| format!("{what}: {e}");
         self.sync_clock().map_err(err("clock"))?;
@@ -654,10 +657,57 @@ impl Worker {
         if rows.is_empty() {
             return Err("no bracket rows".into());
         }
-        Ok((
-            markets,
-            rows.into_iter().map(|b| (b.symbol.clone(), b)).collect(),
-        ))
+        let mut brackets: HashMap<String, SymbolBrackets> =
+            rows.into_iter().map(|b| (b.symbol.clone(), b)).collect();
+        // A limit is read against the site's table: its leverage dialog holds an order to these
+        // caps, and the signed table does not (05.10: BTC 151–200x holds 400 USDT on the site, the
+        // signed table had the core put a 10 000 limit on 200x). Not read, no pass; a market
+        // with a limit the site has no usable row for gets no leverage — the signed caps are what
+        // raised BTC. A market without a limit (a fixed leverage, a margin type) needs no caps and
+        // keeps the signed table where the site has no row.
+        if let Some(limits) = limits.filter(|_| self.rest.has_open_interest_feed()) {
+            let base: HashMap<&str, &str> = markets
+                .iter()
+                .map(|(s, b)| (s.as_str(), b.as_str()))
+                .collect();
+            let mut site: HashMap<String, SymbolBrackets> = self
+                .rest
+                .site_brackets()
+                .map_err(err("site brackets"))?
+                .into_iter()
+                .filter(|b| {
+                    b.brackets
+                        .iter()
+                        .any(|r| r.initial_leverage > 0 && r.notional_cap > 0.0)
+                })
+                .map(|b| (b.symbol.clone(), b))
+                .collect();
+            let mut missing: Vec<&str> = Vec::new();
+            brackets.retain(|symbol, slot| match site.remove(symbol) {
+                Some(b) => {
+                    *slot = b;
+                    true
+                }
+                None => {
+                    let b = base.get(symbol.as_str()).copied().unwrap_or("");
+                    if limits.of(symbol, b) <= 0 {
+                        return true;
+                    }
+                    missing.push(known.get(symbol.as_str()).copied().unwrap_or(""));
+                    false
+                }
+            });
+            if !missing.is_empty() {
+                missing.sort_unstable();
+                log::warn!(
+                    "leverage: {} market(s) not in the site's bracket table, their leverage is left \
+                     alone: {}",
+                    missing.len(),
+                    missing.iter().take(10).copied().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+        Ok((markets, brackets))
     }
 
     /// The plan of one chunk of markets, from the account as it is read now.

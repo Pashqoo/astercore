@@ -158,7 +158,10 @@ Toolchain — **1.98.0** на обеих машинах (`rustup default 1.98.0`
     прохода, `/api/status` → `leverage`): в журнале `leverage: settings received — limit config …`
     на Apply терминала и на OK в окне «Настройки ядра» (секция «Плечо / маржа», едет в
     `SharedConfig`; отказ — `leverage settings not applied: …` в журнале терминала), затем `leverage: <причина>: N of M markets read …, margin set …, leverage set
-    …, left alone …, failed …` и построчно `setup: BTCUSDT leverage -> 50x`. Проверка живьём без
+    …, left alone …, failed …` и построчно `setup: BTCUSDT leverage -> 50x`. Под лимит Config скобки
+    берутся из таблицы сайта (`trading.mdc`, «Плечо»); рынков, которых в ней нет, — строка
+    `leverage: N market(s) not in the site's bracket table`. Сверка с окном биржи — «Remaining
+    openable notional» при выбранном плече должен быть ≥ лимита. Проверка живьём без
     риска: настройка на один рынок (`200 BTC` — Config с лимитом только у BTC), зонд — отдельный
     крейт в скрэтчпаде, шлёт `LevManage` через `client.settings().manage_leverage` (фича
     `diagnostics` вендора). Файл `data/lev_manage.bin` в рабочем каталоге ядра.

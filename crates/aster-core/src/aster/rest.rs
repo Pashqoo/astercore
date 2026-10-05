@@ -237,9 +237,39 @@ impl Rest {
         self.get("/fapi/v1/exchangeInfo", &[])
     }
 
-    /// Whether [`Self::leverage_oi_remaining`] has a source on this network.
+    /// Whether the site's figures — [`Self::leverage_oi_remaining`] and [`Self::site_brackets`] —
+    /// have a source on this network.
     pub fn has_open_interest_feed(&self) -> bool {
         self.network == Network::Mainnet
+    }
+
+    /// The site's own bracket table for every symbol
+    /// (`POST /bapi/futures/v1/friendly/future/common/brackets`, [`super::json::parse_site_brackets`]):
+    /// the caps behind «Remaining openable notional value» in its leverage dialog, which the
+    /// signed `leverageBracket` does not match (BTC 151–200x: 400 USDT here, measured 05.10).
+    /// Another host, outside the weight meter, ~850 KB; empty off mainnet, as
+    /// [`Self::leverage_oi_remaining`] is.
+    pub fn site_brackets(&mut self) -> Result<Vec<SymbolBrackets>, Error> {
+        if self.network != Network::Mainnet {
+            return Ok(Vec::new());
+        }
+        let resp = self
+            .agent
+            .post("https://www.asterdex.com/bapi/futures/v1/friendly/future/common/brackets")
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .send(r#"{"symbol":""}"#)?;
+        // The agent hands back any status as an answer: a 429 or a WAF page is not a table.
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(Error::Transport(format!("site brackets: HTTP {status}")));
+        }
+        let text = resp
+            .into_body()
+            .read_to_string()
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        super::json::parse_site_brackets(&text)
+            .map_err(|e| Error::Decode(format!("site brackets: {e}")))
     }
 
     /// The site's own public read of what is left of the open interest at each leverage of one

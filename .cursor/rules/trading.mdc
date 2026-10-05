@@ -184,8 +184,14 @@ band» (`MShotPrice` 2,8–4 % против ±2 %). Теперь `Market::within
   потолок — первый брекет `/fapi/v3/leverageBracket`, смена — `POST /fapi/v3/leverage`.
   `ACCOUNT_CONFIG_UPDATE` ядро не потребляет. `exchangeInfo` даёт только `requiredMarginPercent` —
   потолок инструмента (5.0 → 20×), запасной вариант, а не плечо счёта.
-  Плечо рынка под лимит позиции — по `notionalCap` брекетов (`levman.rs`, `PLAN.md` «Управление
-  плечами»); живьём — только по `PLAN.md`, пока не записано иное.
+  Плечо рынка под лимит позиции — по потолкам скобок **таблицы сайта** (`POST
+  www.asterdex.com/bapi/futures/v1/friendly/future/common/brackets`, `{"symbol":""}` — все символы:
+  `minOpenPosLeverage..maxOpenPosLeverage` → `bracketNotionalCap`) и остатку OI сайта; это ровно
+  формула «Remaining openable notional» окна плеча биржи: `min(потолок − позиция/ордера, остаток OI)`
+  (разобрано по бандлу сайта 05.10). Подписанный `leverageBracket` потолкам не равен: BTC 151–200x
+  на сайте держит 400 USDT, а по нему ядро ставило 200x под лимит 10 000. `GET
+  /fapi/v3/remainingOpenableNotionalValue` (вес 50) даёт только остаток OI, без потолка скобки.
+  Код — `levman.rs`, `PLAN.md` «Управление плечами».
 
 ### Сессии вместо расписания
 

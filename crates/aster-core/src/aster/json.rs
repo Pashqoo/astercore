@@ -628,6 +628,67 @@ pub fn parse_leverage_oi(text: &str) -> Result<Vec<(i32, f64)>, String> {
     Ok(out)
 }
 
+/// The site's own bracket table (`POST /bapi/futures/v1/friendly/future/common/brackets`, every
+/// symbol for an empty one): the caps its leverage dialog reads «Remaining openable notional»
+/// against, before the open interest. A bracket holds every leverage from `minOpenPosLeverage` to
+/// `maxOpenPosLeverage` up to `bracketNotionalCap`, and is read as its highest leverage with that
+/// cap, the shape of the signed table's rows. Measured 05.10: BTC's 151–200x holds 400 USDT here,
+/// while the signed `leverageBracket` had the core put BTC on 200x for a 10 000 limit.
+pub fn parse_site_brackets(text: &str) -> Result<Vec<SymbolBrackets>, String> {
+    #[derive(Deserialize)]
+    struct Reply {
+        code: String,
+        data: Option<Data>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        #[serde(default)]
+        brackets: Vec<Row>,
+    }
+    // Lenient row by row, as the signed table is: one odd row costs that row, not the table.
+    #[derive(Deserialize)]
+    struct Row {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default, rename = "riskBrackets")]
+        risk: Vec<Risk>,
+    }
+    #[derive(Deserialize)]
+    struct Risk {
+        #[serde(default, rename = "maxOpenPosLeverage", deserialize_with = "cap_of")]
+        max_leverage: f64,
+        #[serde(default, rename = "bracketNotionalCap", deserialize_with = "cap_of")]
+        cap: f64,
+    }
+    let reply: Reply = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if reply.code != "000000" {
+        return Err(format!("code {}", reply.code));
+    }
+    Ok(reply
+        .data
+        .ok_or("no data")?
+        .brackets
+        .into_iter()
+        .filter(|row| !row.symbol.is_empty())
+        .map(|row| SymbolBrackets {
+            symbol: row.symbol,
+            brackets: row
+                .risk
+                .into_iter()
+                .filter(|r| {
+                    r.max_leverage >= 1.0
+                        && r.max_leverage.fract() == 0.0
+                        && r.max_leverage <= f64::from(i32::MAX)
+                })
+                .map(|r| LeverageBracket {
+                    initial_leverage: r.max_leverage as i32,
+                    notional_cap: r.cap,
+                })
+                .collect(),
+        })
+        .collect())
+}
+
 /// `POST /fapi/v3/leverage`: `{"leverage": 21, "maxNotionalValue": "1000000", "symbol": "BTCUSDT"}`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LeverageSet {
@@ -635,8 +696,10 @@ pub struct LeverageSet {
     pub symbol: String,
 }
 
-/// One symbol of `GET /fapi/v3/leverageBracket`: the brackets run from the smallest notional up,
-/// and the highest `initialLeverage` of them is the most the account may ask for.
+/// One symbol of `GET /fapi/v3/leverageBracket`, or of the site's own table
+/// ([`parse_site_brackets`], each bracket at the top of its leverage range): the brackets run from
+/// the smallest notional up, and the highest `initialLeverage` of them is the most the account
+/// may ask for.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SymbolBrackets {
     pub symbol: String,
@@ -1402,6 +1465,40 @@ mod stream_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The site's table and its open interest, as read 05.10: BTC's 200x holds 400 USDT, so a
+    /// 10 000 limit is 150x there; NEAR's 50x and 20x have no open interest left, so 10x.
+    #[test]
+    fn the_sites_brackets_hold_the_limit_the_dialog_shows() {
+        let text = r#"{"code":"000000","data":{"brackets":[
+            {"symbol":"BTCUSDT","riskBrackets":[
+                {"bracketNotionalCap":400,"minOpenPosLeverage":151,"maxOpenPosLeverage":200},
+                {"bracketNotionalCap":300000,"minOpenPosLeverage":101,"maxOpenPosLeverage":150},
+                {"bracketNotionalCap":800000,"minOpenPosLeverage":76,"maxOpenPosLeverage":100}]},
+            {"symbol":"NEARUSDT","riskBrackets":[
+                {"bracketNotionalCap":1000000,"minOpenPosLeverage":21,"maxOpenPosLeverage":50},
+                {"bracketNotionalCap":5000000,"minOpenPosLeverage":11,"maxOpenPosLeverage":20},
+                {"bracketNotionalCap":10000000,"minOpenPosLeverage":6,"maxOpenPosLeverage":10}]}]}}"#;
+        let table = parse_site_brackets(text).unwrap();
+        assert_eq!(table.len(), 2);
+        let (btc, near) = (&table[0], &table[1]);
+        assert_eq!(btc.max_leverage(), Some(200));
+        let btc_oi = [(100, 38_973_131.0), (150, 139_224.0), (200, 139_224.0)];
+        assert_eq!(btc.leverage_for_limit_within(10_000.0, &btc_oi), Some(150));
+        assert_eq!(btc.leverage_for_limit_within(300.0, &btc_oi), Some(200));
+        let near_oi = [(10, 3_978_172.0), (20, 0.0), (50, 0.0)];
+        assert_eq!(near.leverage_for_limit_within(10_000.0, &near_oi), Some(10));
+        assert!(parse_site_brackets(r#"{"code":"100001","data":null}"#).is_err());
+        // An odd row costs that row: the table still reads.
+        let odd = r#"{"code":"000000","data":{"brackets":[
+            {"riskBrackets":[]},
+            {"symbol":"XUSDT","riskBrackets":[
+                {"bracketNotionalCap":5000,"maxOpenPosLeverage":"twenty"},
+                {"bracketNotionalCap":9000,"maxOpenPosLeverage":10}]}]}}"#;
+        let odd = parse_site_brackets(odd).unwrap();
+        assert_eq!(odd.len(), 1);
+        assert_eq!(odd[0].max_leverage(), Some(10));
+    }
 
     /// An integer where 0 means «absent» that arrives as `null`, a string, a float, a bool,
     /// `[]` or `{}` costs that field, not the document: one odd row of a 767-row frame must not
