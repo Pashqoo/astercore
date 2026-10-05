@@ -533,6 +533,7 @@ impl CoreHandler {
                     Seat::Black => "black",
                     Seat::NotListed => "notlisted",
                     Seat::OtherClass => "otherclass",
+                    Seat::TokenTags => "tokentags",
                     Seat::DynBlack => "dynblack",
                     Seat::Ranked => "ranked",
                     Seat::Unranked => "unranked",

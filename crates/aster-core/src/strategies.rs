@@ -6,7 +6,7 @@
 //! Ported from TInvestCore. Two departures: the BTC fields carry MoonBot's own
 //! names and meaning again (`Delta_BTC_*`, `MShotAddBTCDelta`,
 //! `MShotAddBTC5mDelta` — TInvestCore read them off the MOEX index), and
-//! `EmulatorMode` defaults ON, the safe side for a strategy made without it.
+//! `BinanceTokenTags` filters by Aster's tags (`model::TokenTags`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -75,7 +75,12 @@ pub const SCREEN_FIELDS: &[(&str, &[&str])] = &[
     ),
     (
         "Filters / Base",
-        &["IgnoreBase", "MinLeverage", "MaxLeverage"],
+        &[
+            "IgnoreBase",
+            "BinanceTokenTags",
+            "MinLeverage",
+            "MaxLeverage",
+        ],
     ),
     (
         "Filters / Delta",
@@ -136,9 +141,10 @@ fn schema_fields() -> Vec<SchemaField> {
         f("StrategyName", s(""), ui::EDIT, None),
         f("SignalType", s(KIND_MOONSHOT.1), ui::COMBO, None),
         f("Comment", s(""), ui::EDIT, None),
-        // ON, unlike MoonBot: a strategy made or pasted without the field
-        // must not trade real money by default (Astercore, 01.10).
-        f("EmulatorMode", Bool(true), ui::CHECKBOX, None),
+        // MoonBot's default. A strategy copied from another core carries only
+        // the fields that differ from that core's defaults, so a default of
+        // our own here silently changed it on paste (trader, 05.10).
+        f("EmulatorMode", Bool(false), ui::CHECKBOX, None),
         f("SoundAlert", Bool(true), ui::CHECKBOX, None),
         f("SoundKind", s("ding1"), ui::EDIT, None),
         f("KeepAlert", Int32(20), ui::EDIT, None),
@@ -255,16 +261,18 @@ fn schema_fields() -> Vec<SchemaField> {
         f("MaxVolume", Double(0.0), ui::EDIT, None),
         f("MinHourlyVolume", Double(0.0), ui::EDIT, None),
         f("MaxHourlyVolume", Double(0.0), ui::EDIT, None),
-        // MoonBot's Filters / Base, the part this core reads: the market's
-        // leverage corridor. `MinLeverage` 1 and `MaxLeverage` 0 (no limit) are
-        // MoonBot's defaults and filter nothing. The box's other fields
-        // (`BinanceTokenTags`, `MarkPriceMin`, …) are not read here.
+        // MoonBot's Filters / Base, the part this core reads: the token tags
+        // (Aster's, `model::TokenTags`) and the market's leverage corridor.
+        // An empty `BinanceTokenTags`, `MinLeverage` 1 and `MaxLeverage` 0 (no
+        // limit) are MoonBot's defaults and filter nothing. The box's other
+        // fields (`MarkPriceMin`, …) are not read here.
         f(
             "IgnoreBase",
             Bool(false),
             ui::CHECKBOX,
             Some("Filters / Base"),
         ),
+        f("BinanceTokenTags", s(""), ui::EDIT, None),
         f("MinLeverage", Int32(1), ui::EDIT, None),
         f("MaxLeverage", Int32(0), ui::EDIT, None),
         // MoonBot's dynamic lists, and with the volume bounds gone from the
@@ -307,7 +315,8 @@ fn schema_fields() -> Vec<SchemaField> {
             f("Short", Bool(false), ui::CHECKBOX, Some("Buy conditions")),
         ),
         f("MaxActiveOrders", Int32(5), ui::EDIT, None),
-        f("MaxMarkets", Int32(5), ui::EDIT, None),
+        // 0 = not limited, as on MoonBot (see `EmulatorMode`).
+        f("MaxMarkets", Int32(0), ui::EDIT, None),
         // USDT per entry. MoonBot's 1000 is in the quote of the venue it was written for (roubles
         // on MOEX); here it would be a thousand dollars on a strategy nobody has tuned yet. Aster's
         // `MIN_NOTIONAL` is 5 USDT.
@@ -647,7 +656,9 @@ impl Strategies {
     }
 
     /// A listed strategy's boolean field, its schema default when the
-    /// strategy itself does not carry it (a file written before the field).
+    /// strategy itself does not carry it (a file written before the field,
+    /// or a field left at the default: the default is today's, not the one
+    /// the file was written under — `EmulatorMode` went ON → OFF on 05.10).
     /// `None` when there is no such strategy any more — the caller decides
     /// what a deleted strategy's deal is worth reporting.
     pub fn flag(&self, strategy_id: u64, name: &str) -> Option<bool> {

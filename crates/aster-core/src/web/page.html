@@ -395,7 +395,7 @@
       measured right now. Nothing here is saved — move a corridor, watch the table, then type the
       numbers you settled on into the terminal.
       Two different questions are kept apart, because the core keeps them apart: the pool is a
-      ranking — <b>MarketTags</b> and the dynamic lists decide which markets the strategy is
+      ranking — <b>MarketTags</b>, <b>BinanceTokenTags</b> and the dynamic lists decide which markets the strategy is
       <i>about</i> — and the filters are a gate on entering one of them. A market can be watched
       all day and entered never.
       <br>«Filters passed» is exactly that and no more: the screener and the Filters tab let this
@@ -1335,7 +1335,7 @@ const SCR_ROWS = 300;
 const SEATS = {
   pool: 'watched', ranked: 'past the count', unranked: 'not ranked',
   dynblack: 'dynamic black list', black: 'black list', notlisted: 'not in the white list',
-  otherclass: 'another class', nopool: 'no pool',
+  otherclass: 'another class', tokentags: 'BinanceTokenTags', nopool: 'no pool',
 };
 
 function screenPick(s) {

@@ -196,6 +196,70 @@ impl MarketTags {
     }
 }
 
+/// MoonBot's `BinanceTokenTags` (Filters / Base) over Aster's taxonomy
+/// ([`Tag`]), case-insensitive: every plain tag is required («and»), a `!tag`
+/// excludes (`Fan !Monitoring` in the MoonBot FAQ). `Tradfi` is every non-coin
+/// class at once. A tag Aster has no counterpart for (Binance's `Monitoring`,
+/// `Fan`, …) filters nothing and lands in `unknown`: a strategy pasted from a
+/// Binance core keeps trading what the tags it can read allow.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenTags {
+    /// One mask per plain tag: a market carries a tag of each.
+    require: Vec<u16>,
+    exclude: u16,
+    pub unknown: Vec<String>,
+}
+
+impl TokenTags {
+    pub fn parse(text: &str) -> Self {
+        let mut out = Self::default();
+        for token in text.split([',', ' ', ';']).filter(|t| !t.is_empty()) {
+            let (negated, name) = match token.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, token),
+            };
+            let mask = if name.eq_ignore_ascii_case("tradfi") {
+                [Tag::Stock, Tag::Forex, Tag::Commodities, Tag::Etf]
+                    .iter()
+                    .fold(0, |acc, t| acc | t.bit())
+            } else if let Some(tag) = Tag::ALL
+                .iter()
+                .find(|t| t.name().eq_ignore_ascii_case(name))
+            {
+                tag.bit()
+            } else {
+                if !out.unknown.iter().any(|u| u.eq_ignore_ascii_case(name)) {
+                    out.unknown.push(name.to_string());
+                }
+                continue;
+            };
+            if negated {
+                out.exclude |= mask;
+            } else {
+                out.require.push(mask);
+            }
+        }
+        out
+    }
+
+    /// Nothing to check: no tag this core can read.
+    pub fn is_empty(&self) -> bool {
+        self.require.is_empty() && self.exclude == 0
+    }
+
+    /// A plain tag every one of whose classes is also excluded
+    /// (`crypto !crypto`): no market can pass.
+    pub fn contradicts(&self) -> bool {
+        self.require.iter().any(|m| m & !self.exclude == 0)
+    }
+
+    /// A market with these tags passes.
+    pub fn matches(&self, tags: &[Tag]) -> bool {
+        let bits = tags.iter().fold(0, |acc, t| acc | t.bit());
+        self.require.iter().all(|m| bits & m != 0) && bits & self.exclude == 0
+    }
+}
+
 /// One market of the catalog.
 #[derive(Debug, Clone)]
 pub struct Market {
@@ -1788,6 +1852,31 @@ mod tests {
         for name in MarketTags::PICKLIST.split('|') {
             assert!(MarketTags::parse(name).is_ok(), "{name}");
         }
+    }
+
+    /// MoonBot's `BinanceTokenTags`: plain tags are «and», `!tag` excludes,
+    /// `Tradfi` is the non-coin classes, and a Binance-only tag filters nothing.
+    #[test]
+    fn token_tags_require_every_tag_and_skip_unknown_ones() {
+        let doge = [Tag::Meme, Tag::Crypto];
+        let gold = [Tag::Commodities];
+        let nvda = [Tag::Stock];
+        let t = TokenTags::parse;
+        let pasted = t("!Monitoring !Tradfi");
+        assert_eq!(pasted.unknown, ["Monitoring"]);
+        assert!(pasted.matches(&doge) && !pasted.matches(&gold) && !pasted.matches(&nvda));
+        assert!(t("meme crypto").matches(&doge) && !t("meme stock").matches(&doge));
+        assert!(t("TRADFI").matches(&gold) && !t("tradfi").matches(&doge));
+        assert!(!t("crypto !meme").matches(&doge), "an excluded tag wins");
+        let binance = t("Fan Seed !fan");
+        assert!(binance.is_empty() && binance.matches(&gold));
+        assert_eq!(binance.unknown, ["Fan", "Seed"], "each unknown tag once");
+        assert!(t("").is_empty() && t("").unknown.is_empty());
+        assert!(
+            t("crypto !crypto").contradicts()
+                && t("tradfi !stock !forex !commodities !etf").contradicts()
+        );
+        assert!(!pasted.contradicts() && !t("tradfi !stock").contradicts());
     }
 
     /// What the trader typed into `CoinsWhiteList` on 02.10 (`btc, eth`) found

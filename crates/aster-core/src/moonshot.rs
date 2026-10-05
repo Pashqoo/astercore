@@ -29,7 +29,7 @@ use crate::bvsv;
 use crate::drops::Tapes;
 use crate::guards;
 use crate::hook;
-use crate::model::{Catalog as Model, Market, MarketTags};
+use crate::model::{Catalog as Model, Market, MarketTags, TokenTags};
 use crate::orders::{reason, CoreOrder, Leg, Orders};
 use crate::screener::{self, DynList};
 use crate::stops::{self, exit_price, Fired};
@@ -241,6 +241,10 @@ pub struct Params {
     /// `MarketTags`: the classes the screener picks from when the white list
     /// is empty; `Err` holds the first unknown tag.
     pub market_tags: Result<MarketTags, String>,
+    /// `BinanceTokenTags` (Filters / Base): markets outside it are not
+    /// candidates. `None` when the field is empty or `IgnoreFilters` /
+    /// `IgnoreBase` switch it off.
+    pub token_tags: Option<TokenTags>,
     pub max_active: i64,
     pub max_markets: i64,
     pub max_ping: i64,
@@ -441,6 +445,9 @@ impl Params {
             white: list("CoinsWhiteList"),
             black: list("CoinsBlackList"),
             market_tags: MarketTags::parse(&text(MARKET_TAGS)),
+            token_tags: (!flag("IgnoreFilters") && !flag("IgnoreBase"))
+                .then(|| TokenTags::parse(&text("BinanceTokenTags")))
+                .filter(|t| !t.is_empty() || !t.unknown.is_empty()),
             max_active: num("MaxActiveOrders") as i64,
             max_markets: num("MaxMarkets") as i64,
             max_ping: num("MaxPing") as i64,
@@ -4195,8 +4202,8 @@ mod tests {
         m.at_mut(1).unwrap().last_price = Some(300.0);
         m.at_mut(2).unwrap().last_price = Some(120.0);
         m.at_mut(3).unwrap().last_price = Some(0.0614);
-        // BTCUSDT stands where TInvestCore's service market stood, and like it
-        // is nobody's candidate: Aster's «top» alone, not a coin of the class.
+        // BTCUSDT stands where TInvestCore's service market stood: Aster's
+        // «top» alone, so a `crypto` strategy never picks it (`all` does).
         m.at_mut(0).unwrap().tags = vec![crate::model::Tag::Top];
         // STAR's tests size entries of 1 USDT, under Aster's 5 USDT floor:
         // they replay MoonBot's prices, which the size does not move.
@@ -4216,9 +4223,6 @@ mod tests {
         let mut st = Strategies::new(None, 0);
         let mut f = StrategyFields::new();
         f.insert("StrategyName", FieldValue::String("shot".into()));
-        // TInvestCore's tests ran on MoonBot's default, real orders; this
-        // core's schema defaults to the emulator, so they say it.
-        f.insert("EmulatorMode", FieldValue::Bool(false));
         for (k, v) in fields {
             f.insert(*k, v.clone());
         }
@@ -7582,6 +7586,78 @@ mod tests {
         let p = Params::from_snapshot(&st.list()[0], st.schema());
         assert!(screener::problem(&p).is_some_and(|t| t.contains("DynWL_Count 0")));
         assert!(screener::universe(&p, &cx, &none()).is_empty());
+    }
+
+    /// `BinanceTokenTags` (Filters / Base) cuts the candidates BEFORE the
+    /// ranking — MoonBot ranks «the coins passing the filter» — so the count
+    /// backfills past a refused market. `IgnoreBase` / `IgnoreFilters` switch
+    /// it off, a Binance-only tag is a warning, and the page names the reason.
+    #[test]
+    fn token_tags_cut_the_candidates_before_the_ranking() {
+        use crate::model::Tag;
+        use FieldValue::{Bool, Int32, String as Str};
+        let mut model = model();
+        // SGAZP a commodity perpetual: tradfi.
+        model.at_mut(2).unwrap().tags = vec![Tag::Commodities];
+        let mut win = Windows::default();
+        let now = 9_000_000_000;
+        win.push(1, now - 60_000, 300.0, 10.0);
+        win.push(2, now - 60_000, 120.0, 400.0);
+        let cx = Ctx {
+            model: &model,
+            win: &win,
+            now,
+            btc: None,
+            market_delta: None,
+        };
+        let params = |extra: &[(&str, FieldValue)]| {
+            let mut fields = vec![
+                ("DynWL_SortBy", Str("DailyVol".into())),
+                ("DynWL_Count", Int32(2)),
+            ];
+            fields.extend(extra.iter().cloned());
+            let st = strategies(&fields, true);
+            Params::from_snapshot(&st.list()[0], st.schema())
+        };
+        let tags = |t: &str| ("BinanceTokenTags", Str(t.into()));
+        let pool = |p: &Params| screener::universe(p, &cx, &none());
+        let seat = |p: &Params, sym: &str| {
+            let idx = model.index_of_symbol(sym).unwrap();
+            screener::explain(p, &cx, &none())
+                .into_iter()
+                .find(|s| s.idx == idx)
+                .unwrap()
+                .seat
+        };
+        assert_eq!(pool(&params(&[])), [2, 1]);
+        let pasted = params(&[tags("!Monitoring !Tradfi")]);
+        // BTCUSDT (`top`) and STAR (crypto) both pass and both never traded
+        // (DailyVol 0): the tie goes to catalog order, so BTCUSDT backfills.
+        assert_eq!(pool(&pasted), [1, 0], "the count backfills past SGAZP");
+        assert_eq!(seat(&pasted, "SGAZP"), screener::Seat::TokenTags);
+        assert!(
+            screener::problem(&pasted).is_none(),
+            "a warning, not a refusal"
+        );
+        assert!(screener::unknown_symbols(&pasted, &model)
+            .is_some_and(|t| t.contains("BinanceTokenTags") && t.contains("Monitoring")));
+        assert_eq!(
+            pool(&params(&[tags("!tradfi"), ("IgnoreBase", Bool(true))])),
+            [2, 1]
+        );
+        assert_eq!(
+            pool(&params(&[tags("!tradfi"), ("IgnoreFilters", Bool(true))])),
+            [2, 1]
+        );
+        // A white list is filtered too, and a market it does not name is
+        // still «not listed», whatever its tags.
+        let white = params(&[
+            tags("!tradfi"),
+            ("CoinsWhiteList", Str("SGAZP, SBER".into())),
+        ]);
+        assert_eq!(pool(&white), [1]);
+        assert_eq!(seat(&white, "SGAZP"), screener::Seat::TokenTags);
+        assert_eq!(seat(&white, "STAR"), screener::Seat::NotListed);
     }
 
     /// Both lists are text somebody typed by hand — the terminal's global

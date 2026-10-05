@@ -285,6 +285,9 @@ pub fn problem(p: &Params) -> Option<String> {
             );
         }
     }
+    if p.token_tags.as_ref().is_some_and(|t| t.contradicts()) {
+        return Some("BinanceTokenTags excludes a tag it requires, no markets".to_string());
+    }
     for (list, name) in [(&p.dyn_wl, "DynWL_SortBy"), (&p.dyn_bl, "DynBL_SortBy")] {
         if let (true, Err(key)) = (list.on(), &list.by) {
             return Some(format!(
@@ -373,6 +376,18 @@ pub fn unknown_symbols(p: &Params, model: &Model) -> Option<String> {
         ]
     })
     .flatten()
+    .chain(
+        p.token_tags
+            .as_ref()
+            .filter(|t| !t.unknown.is_empty())
+            .map(|t| {
+                format!(
+                    "BinanceTokenTags: no such tag on Aster, it filters nothing: {} (known: {}, tradfi)",
+                    t.unknown.join(", "),
+                    crate::model::MarketTags::known()
+                )
+            }),
+    )
     .collect();
     (!said.is_empty()).then(|| said.join("; "))
 }
@@ -391,12 +406,15 @@ fn blocked(p: &Params, model: &Model) -> HashSet<u16> {
 
 /// The markets the strategy is about BEFORE the dynamic lists: its white list
 /// in the order it was written, or every market of its `MarketTags` classes;
-/// black-listed markets are out of both. [`universe`] ranks this down to the pool, and [`explain`] tells the
+/// black-listed markets and the ones `BinanceTokenTags` refuses are out of
+/// both — MoonBot ranks «the coins passing the filter» (FAQ, `DynWL_Count`). [`universe`] ranks this down to the pool, and [`explain`] tells the
 /// markets that never were candidates from the ones the ranking dropped.
 fn candidates(p: &Params, cx: &Ctx) -> Vec<u16> {
     let model = cx.model;
     let black = blocked(p, model);
-    let ok = |i: u16, _: &Market| !black.contains(&i);
+    let ok = |i: u16, m: &Market| {
+        !black.contains(&i) && p.token_tags.as_ref().is_none_or(|t| t.matches(&m.tags))
+    };
     if !p.white.is_empty() {
         // A white list is its own bound and keeps its own order: the operator
         // wrote the markets down, and a dynamic list over them is optional.
@@ -496,6 +514,8 @@ pub enum Seat {
     NotListed,
     /// No white list, and its class is not in `MarketTags`.
     OtherClass,
+    /// `BinanceTokenTags` refuses its tags.
+    TokenTags,
     /// `DynBL_*` took it off the pool.
     DynBlack,
     /// A candidate ranked past `DynWL_Count`.
@@ -560,15 +580,26 @@ pub fn explain(p: &Params, cx: &Ctx, prev: &HashSet<u16>) -> Vec<Seen> {
     let black = blocked(p, cx.model);
     cx.model
         .iter()
-        .map(|(idx, _)| {
+        .map(|(idx, m)| {
             let place = ranking.get(&idx).copied();
             let seat = if pool.contains(&idx) {
                 Seat::Pool
             } else if stuck {
                 Seat::NoPool
             } else if !in_cand.contains(&idx) {
+                // `BinanceTokenTags` only for a market that would otherwise have
+                // been a candidate: the list or the class is the first answer.
+                let in_scope = if p.white.is_empty() {
+                    p.market_tags.as_ref().is_ok_and(|t| t.matches(&m.tags))
+                } else {
+                    p.white
+                        .iter()
+                        .any(|sym| cx.model.index_of_symbol_ci(sym) == Some(idx))
+                };
                 if black.contains(&idx) {
                     Seat::Black
+                } else if in_scope {
+                    Seat::TokenTags
                 } else if p.white.is_empty() {
                     Seat::OtherClass
                 } else {

@@ -594,7 +594,7 @@ pub struct ScreenMarket {
     /// classify.
     pub class: String,
     /// Where it stands in the screener: `pool`, `ranked`, `unranked`,
-    /// `dynblack`, `black`, `notlisted`, `otherclass`, `nopool`.
+    /// `dynblack`, `black`, `notlisted`, `otherclass`, `tokentags`, `nopool`.
     pub seat: &'static str,
     pub rank: Option<usize>,
     /// The ranking key's value, in the key's own unit.
