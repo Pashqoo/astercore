@@ -299,7 +299,11 @@ impl Clock {
     }
 
     /// Measures at once, then every [`CLOCK_EVERY`](crate::account::CLOCK_EVERY) or when asked.
+    /// A measure refused for the rate holds the next one for its pause
+    /// ([`clock_retry`](crate::account::clock_retry)), asked or not: a kick would only ask a
+    /// gateway that is refusing again, and keep the refusal going.
     fn run(&self, mut rest: Rest) {
+        let mut refused = 0;
         loop {
             // A panic in the measure is a failed measure: the clock thread must outlive it, or
             // every later kick would ask nobody.
@@ -307,22 +311,35 @@ impl Clock {
                 .unwrap_or_else(|_| {
                     Err(rest::Error::Transport("the clock measure panicked".into()))
                 });
-            let wait = match measured {
+            let (wait, held) = match measured {
                 Ok(delta) => {
                     log::debug!("orders: clock delta {delta} ms");
                     self.set(delta);
-                    crate::account::CLOCK_EVERY
+                    refused = 0;
+                    (crate::account::CLOCK_EVERY, false)
                 }
                 Err(e) => {
-                    log::warn!("orders: clock: {e}");
-                    CLOCK_RETRY
+                    let wait = crate::account::clock_retry(&e, refused, CLOCK_RETRY);
+                    let held = crate::moonshot::rate_limited(&e.to_string());
+                    if held {
+                        log::warn!("orders: clock: {e}; next measure in {} s", wait.as_secs());
+                        refused += 1;
+                    } else {
+                        log::warn!("orders: clock: {e}");
+                    }
+                    (wait, held)
                 }
             };
+            let until = Instant::now() + wait;
             let mut asked = self.asked.lock().unwrap_or_else(PoisonError::into_inner);
-            if !*asked {
+            loop {
+                let left = until.saturating_duration_since(Instant::now());
+                if (*asked && !held) || left.is_zero() {
+                    break;
+                }
                 asked = self
                     .wake
-                    .wait_timeout(asked, wait)
+                    .wait_timeout(asked, left)
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
             }

@@ -366,6 +366,7 @@ pub fn start(rest: Rest, signer: Signer, initial: Option<Config>, status: Shared
         oi_failures: 0,
         oi_cache: HashMap::new(),
         short_passes: 0,
+        clock_at: None,
     };
     thread::Builder::new()
         .name("aster-levman".into())
@@ -444,6 +445,9 @@ struct Worker {
     /// Passes in a row that did not cover every market with the site's figures; while there
     /// are, the next is sooner than the hour ([`next_pass`]).
     short_passes: u32,
+    /// When the clock was last measured: it is measured again only past
+    /// [`CLOCK_EVERY`](crate::account::CLOCK_EVERY), as every other thread does.
+    clock_at: Option<Instant>,
 }
 
 impl Worker {
@@ -578,11 +582,24 @@ impl Worker {
             .collect();
     }
 
-    /// The clock measured again; a `429` (the IP's weight, mostly the core's own warm-up after a
-    /// restart) is waited out [`CLOCK_WAITS`] times instead of ending the pass. A ban (`418`) is not.
+    /// The clock measured again when the last measure is older than
+    /// [`CLOCK_EVERY`](crate::account::CLOCK_EVERY): a pass asked the gateway once for every chunk
+    /// of 60 markets, and two passes a minute apart had the CDN refuse `/fapi/v1/time` to the
+    /// whole core (05.10). A `429` (the IP's weight, or that refusal) is waited out
+    /// [`CLOCK_WAITS`] times instead of ending the pass. A ban (`418`) is not.
     fn sync_clock(&mut self) -> Result<i64, rest::Error> {
+        if self
+            .clock_at
+            .is_some_and(|at| at.elapsed() < crate::account::CLOCK_EVERY)
+        {
+            return Ok(self.rest.clock_delta_ms());
+        }
         for waited in 0..=CLOCK_WAITS {
             match self.rest.sync_clock() {
+                Ok(delta) => {
+                    self.clock_at = Some(Instant::now());
+                    return Ok(delta);
+                }
                 Err(e @ rest::Error::Api { status: 429, .. }) if waited < CLOCK_WAITS => {
                     let wait = e.retry_after().unwrap_or_default().max(CLOCK_WAIT);
                     log::info!(
@@ -651,7 +668,8 @@ impl Worker {
         brackets: &HashMap<String, SymbolBrackets>,
     ) -> Result<Vec<setup::Plan>, String> {
         let err = |what: &'static str| move |e| format!("{what}: {e}");
-        // The clock is measured again for every chunk: a pass is minutes of writes.
+        // A pass is minutes of writes: the clock is looked at again for every chunk, and
+        // measured once it is old (`sync_clock`).
         self.sync_clock().map_err(err("clock"))?;
         // What the site says is left of the open interest at each leverage, for the markets the
         // limit manages (read before the account, so the snapshot `plan_for` decides on is not older

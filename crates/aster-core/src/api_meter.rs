@@ -34,12 +34,13 @@ pub const SPAN_MIN: i64 = 24 * 60;
 /// build does not know about. The number is there for the reader of a file.
 const FORMAT: u32 = 1;
 
-/// The link line: the cheapest answer the gateway gives (`/fapi/v1/time`,
-/// weight 1), over a connection the heartbeat keeps warm — what MoonBot's
+/// The link line: the cheapest answer the gateway gives (`/fapi/v1/ping`,
+/// weight 1; `/fapi/v1/time` until 05.10, when the CDN in front of the gateway
+/// began refusing it to the core), over a connection the heartbeat keeps warm — what MoonBot's
 /// terminal calls its ping. Nothing heavier belongs here: a catalog or a
 /// candle window answers slowly because it is big, and averaged in it would
 /// read as a latency alarm.
-const LINK_METHODS: [&str; 1] = ["GET /fapi/v1/time"];
+const LINK_METHODS: [&str; 1] = ["GET /fapi/v1/ping"];
 
 /// The order line: what it costs to place or pull an order — the exchange's
 /// work and not the wire's, drawn apart from the link for that reason.
@@ -53,8 +54,10 @@ const ORDER_METHODS: [&str; 3] = [
 /// first paint — flat at zero is an answer too. A call site added without its
 /// line here is not lost: it appears as its own card the first time it is
 /// counted (see [`ApiMeter::view`]).
-pub const METHODS: [&str; 20] = [
+pub const METHODS: [&str; 22] = [
+    "GET /fapi/v1/ping",
     "GET /fapi/v1/time",
+    "GET /fapi/v3/time",
     "GET /fapi/v1/exchangeInfo",
     "GET /fapi/v1/ticker/24hr",
     "GET /fapi/v1/ticker/bookTicker",
@@ -967,8 +970,10 @@ mod tests {
         m.note("GET /fapi/v1/exchangeInfo", T0, Call::Ok { rtt_ms: 9_000 });
         // The portfolio poll is a read, but not a light one: on neither line.
         m.note("GET /fapi/v3/positionRisk", T0, Call::Ok { rtt_ms: 50 });
-        m.note("GET /fapi/v1/time", T0, Call::Ok { rtt_ms: 10 });
-        m.note("GET /fapi/v1/time", T0, Call::Ok { rtt_ms: 20 });
+        // The clock measure is a call of its own, not a link sample.
+        m.note("GET /fapi/v1/time", T0, Call::Ok { rtt_ms: 900 });
+        m.note("GET /fapi/v1/ping", T0, Call::Ok { rtt_ms: 10 });
+        m.note("GET /fapi/v1/ping", T0, Call::Ok { rtt_ms: 20 });
         m.note("POST /fapi/v3/order", T0, Call::Ok { rtt_ms: 160 });
         m.note("DELETE /fapi/v3/order", T0, Call::Ok { rtt_ms: 300 });
         let v = m.view(T0);
@@ -995,7 +1000,7 @@ mod tests {
     #[test]
     fn the_page_is_told_which_calls_each_line_is() {
         let v = ApiMeter::detached().view(T0);
-        assert_eq!(v.ping.link_methods, vec!["GET time"]);
+        assert_eq!(v.ping.link_methods, vec!["GET ping"]);
         assert_eq!(
             v.ping.order_methods,
             vec!["POST order", "PUT order", "DELETE order"]
@@ -1005,8 +1010,8 @@ mod tests {
     #[test]
     fn a_refusal_is_a_round_trip_and_a_hold_is_not() {
         let m = ApiMeter::detached();
-        m.note("GET /fapi/v1/time", T0, Call::Err { rtt_ms: 80 });
-        m.note("GET /fapi/v1/time", T0, Call::Held);
+        m.note("GET /fapi/v1/ping", T0, Call::Err { rtt_ms: 80 });
+        m.note("GET /fapi/v1/ping", T0, Call::Held);
         let v = m.view(T0);
         let last = (SPAN_MIN - 1) as usize;
         assert_eq!(

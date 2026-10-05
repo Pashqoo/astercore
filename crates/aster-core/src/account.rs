@@ -37,6 +37,27 @@ use crate::model::QUOTE;
 pub const REFRESH: Duration = Duration::from_secs(15);
 /// How often the clock is re-measured against the signer's gateway.
 pub const CLOCK_EVERY: Duration = Duration::from_secs(600);
+
+/// How long a clock measure that failed waits for the next one. Refused for the rate (the CDN in
+/// front of the gateway answers `/fapi/v1/time` with a bare 429 once an IP asks it too often, and
+/// kept refusing while the core asked every few seconds — 05.10; `Rest::sync_clock` then asks
+/// `/fapi/v3/time`, so this is both refusing): the answer's `Retry-After` as it is named (never
+/// under a second, nor under the caller's own pace `other`), else 60 s (418: 120 s) doubled for
+/// each such refusal before it in a row (`refused_before`), at most [`CLOCK_EVERY`]. Any other
+/// failure: `other`, as before.
+pub fn clock_retry(e: &rest::Error, refused_before: u32, other: Duration) -> Duration {
+    if crate::moonshot::rate_limited(&e.to_string()) {
+        if let Some(named) = e.retry_after() {
+            return named.max(Duration::from_secs(1)).max(other);
+        }
+    }
+    let Some(ms) = crate::moonshot::rate_halt_ms(&e.to_string()) else {
+        return other;
+    };
+    Duration::from_millis(u64::try_from(ms).unwrap_or(0))
+        .saturating_mul(1 << refused_before.min(4))
+        .min(CLOCK_EVERY)
+}
 /// How long reads may keep failing before the last snapshot is withdrawn,
 /// counted from the first failure: the fifth failed read in a row, some 75 s
 /// after the last good one (more when the calls run into their timeout). One
@@ -241,6 +262,9 @@ pub fn start(
                 let mut last = Some(first);
                 let mut failing_since: Option<Instant> = None;
                 let mut clock_due = Instant::now() + CLOCK_EVERY;
+                // No measure before this: the gateway refused one for its rate (`clock_retry`).
+                let mut clock_held = Instant::now();
+                let mut clock_refused = 0;
                 let mut last_read = Instant::now();
                 let mut read_due = last_read + REFRESH;
                 loop {
@@ -271,7 +295,7 @@ pub fn start(
                     if Instant::now() >= stream.key_due && !stream.renew(&mut rest, &mut signer) {
                         // A nonce outside the window is the likeliest reason,
                         // as for a read.
-                        clock_due = Instant::now();
+                        clock_due = Instant::now().max(clock_held);
                     }
                     if Instant::now() < read_due {
                         continue;
@@ -283,8 +307,22 @@ pub fn start(
                             Ok(delta) => {
                                 log::debug!("account: clock delta {delta} ms");
                                 clock_due = Instant::now() + CLOCK_EVERY;
+                                clock_refused = 0;
                             }
-                            Err(e) => log::warn!("account: clock: {e}"),
+                            Err(e) => {
+                                if !crate::moonshot::rate_limited(&e.to_string()) {
+                                    log::warn!("account: clock: {e}");
+                                } else {
+                                    let wait = clock_retry(&e, clock_refused, Duration::ZERO);
+                                    log::warn!(
+                                        "account: clock: {e}; next measure in {} s",
+                                        wait.as_secs()
+                                    );
+                                    clock_refused += 1;
+                                    clock_held = Instant::now() + wait;
+                                    clock_due = clock_held;
+                                }
+                            }
                         }
                     }
                     last_read = Instant::now();
@@ -308,7 +346,7 @@ pub fn start(
                         }
                         Err(e) => {
                             log::warn!("account: {e}");
-                            clock_due = Instant::now();
+                            clock_due = Instant::now().max(clock_held);
                             let since = *failing_since.get_or_insert_with(Instant::now);
                             withdraw_snapshot(last.is_some(), since.elapsed()).then(|| {
                                 log::error!(
@@ -584,6 +622,55 @@ fn log_event(event: &UserEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CDN's bare 429 on `/fapi/v1/time` (05.10): a minute, doubling, at most the period; the
+    /// answer's own `Retry-After` when it names one; any other failure keeps the caller's pace.
+    #[test]
+    fn a_clock_refused_for_the_rate_waits_and_doubles() {
+        let bare = rest::Error::Api {
+            status: 429,
+            code: 0,
+            msg: String::new(),
+        };
+        let secs = |n| clock_retry(&bare, n, Duration::from_secs(5)).as_secs();
+        assert_eq!(
+            (0..6).map(secs).collect::<Vec<_>>(),
+            [60, 120, 240, 480, 600, 600]
+        );
+        let named = rest::Error::Api {
+            status: 429,
+            code: 0,
+            msg: "slow down (retry after 7 s)".into(),
+        };
+        assert_eq!(
+            clock_retry(&named, 0, Duration::ZERO),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            clock_retry(&named, 3, Duration::ZERO),
+            Duration::from_secs(7),
+            "a named pause is kept as named"
+        );
+        let zero = rest::Error::Api {
+            status: 429,
+            code: 0,
+            msg: "slow down (retry after 0 s)".into(),
+        };
+        assert_eq!(
+            clock_retry(&zero, 0, Duration::ZERO),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            clock_retry(&zero, 0, Duration::from_secs(10)),
+            Duration::from_secs(10),
+            "never faster than the caller's own pace"
+        );
+        let other = rest::Error::Transport("timed out".into());
+        assert_eq!(
+            clock_retry(&other, 3, Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
 
     fn bal(asset: &str, balance: f64, available: f64) -> Balance {
         Balance {

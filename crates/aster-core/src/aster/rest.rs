@@ -184,6 +184,12 @@ impl Rest {
         self.last_rtt
     }
 
+    /// `GET /fapi/v1/ping`, weight 1: the round trip and nothing else.
+    pub fn ping(&mut self) -> Result<(), Error> {
+        self.get::<serde_json::Value>("/fapi/v1/ping", &[])
+            .map(drop)
+    }
+
     /// `GET /fapi/v1/time`, weight 1.
     pub fn server_time(&mut self) -> Result<i64, Error> {
         let t: ServerTime = self.get("/fapi/v1/time", &[])?;
@@ -195,9 +201,32 @@ impl Rest {
     /// Half the round trip is charged to the network, which is the usual
     /// estimate and is honest about the sign: a delta measured without it would
     /// be systematically late by the full trip.
+    ///
+    /// `/fapi/v1/time` refused by the CDN in front of the gateway (a bare 429,
+    /// no code of the exchange's: it did so for minutes on 05.10, while
+    /// `/fapi/v3/time` answered) is measured once on `/fapi/v3/time` instead: a
+    /// core that cannot measure its clock cannot start, nor sign once its delta
+    /// has gone stale. The gateway's own refusals (a 429 with `-1003`, a 418)
+    /// are not asked again at once. Should the second path fail too, the first
+    /// refusal is the answer, so the caller pauses for the rate.
     pub fn sync_clock(&mut self) -> Result<i64, Error> {
-        let before = now_ms();
-        let server = self.server_time()?;
+        let mut before = now_ms();
+        let server = match self.server_time() {
+            Err(
+                e @ Error::Api {
+                    status: 429,
+                    code: 0,
+                    ..
+                },
+            ) => {
+                before = now_ms();
+                match self.get::<ServerTime>("/fapi/v3/time", &[]) {
+                    Ok(t) => t.server_time_ms,
+                    Err(_) => return Err(e),
+                }
+            }
+            other => other?,
+        };
         let after = now_ms();
         self.clock_delta_ms = server - (before + after) / 2;
         Ok(self.clock_delta_ms)

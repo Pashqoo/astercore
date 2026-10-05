@@ -67,10 +67,12 @@ const LEV_MANAGE_FILE: &str = "data/lev_manage.bin";
 const API_METER_FILE: &str = "data/api_meter.json";
 /// How often the counters go to disk.
 const METER_SAVE: Duration = Duration::from_secs(60);
-/// The link line's heartbeat: `/fapi/v1/time` (weight 1) this often, whatever
+/// The link line's heartbeat: `/fapi/v1/ping` (weight 1) this often, whatever
 /// else the core is doing — that call *is* the line (`api_meter`), and ten
 /// seconds keeps its connection warm (TInvestCore measured the cold one as a
-/// different number).
+/// different number). It was `/fapi/v1/time` until 05.10: six of those a
+/// minute were most of what the CDN in front of the gateway counted when it
+/// began refusing the path, and the clock measures need it.
 const PING_HEARTBEAT: Duration = Duration::from_secs(10);
 const REPORTS_FILE: &str = "data/reports.jsonl";
 
@@ -595,18 +597,29 @@ fn start_meter(meter: Arc<ApiMeter>) {
         .spawn(move || {
             let mut rest = Rest::new();
             let (mut next_save, mut next_ping) = (Instant::now() + METER_SAVE, Instant::now());
+            let mut refused = 0;
             loop {
                 // A panic in one pass is said and the thread goes on: it is telemetry, and
                 // a heartbeat that died silently would leave the link line frozen for good.
                 let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if Instant::now() >= next_ping {
                         // The answer is thrown away: the round trip is what was
-                        // asked for, and the call has counted itself.
-                        let _ = rest.server_time();
+                        // asked for, and the call has counted itself. A refusal for
+                        // the rate pauses the beat as it pauses a clock measure.
+                        let wait = match rest.ping() {
+                            Err(e) if aster_core::moonshot::rate_limited(&e.to_string()) => {
+                                refused += 1;
+                                account::clock_retry(&e, refused - 1, PING_HEARTBEAT)
+                            }
+                            _ => {
+                                refused = 0;
+                                PING_HEARTBEAT
+                            }
+                        };
                         // From the answer, not from the deadline: a beat that
                         // waited for a dead gateway must not be followed by a
                         // burst catching up on it.
-                        next_ping = Instant::now() + PING_HEARTBEAT;
+                        next_ping = Instant::now() + wait;
                     }
                     if Instant::now() >= next_save {
                         meter.save();
