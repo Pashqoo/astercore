@@ -751,10 +751,7 @@ impl CoreHandler {
             text: e.lev_control.trim().to_string(),
             limits: levman::Limits::parse(&e.lev_control),
         };
-        let payload = config.to_wire(rand_uid());
-        let held = self.lev_manage_set(&payload)?;
-        // The terminals' own window shows what the core now holds.
-        self.outbox.push((UI, payload));
+        let held = self.lev_manage_set(&config.to_wire(rand_uid()))?;
         Ok(held.is_active())
     }
 
@@ -903,6 +900,72 @@ impl CoreHandler {
             }
         );
         self.ops.terminal_shots = Some(shots);
+    }
+
+    /// The leverage settings the core holds; all off while none was ever sent.
+    pub(super) fn lev_held(&self) -> levman::Config {
+        ui::lev_manage(&self.lev_manage)
+            .map(|l| levman::Config::from_wire(&l))
+            .unwrap_or_default()
+    }
+
+    /// Write the leverage settings the core holds into the shared-config blob, so the
+    /// terminal's «Настройки ядра» window shows what the core acts on rather than what the blob
+    /// last said. Whether the blob shows them now. A blob that does not parse is left as it is:
+    /// a default one in its place would hand every terminal default values for all the rest.
+    pub(super) fn lev_to_shared(&mut self) -> bool {
+        let parsed = gunzip(&self.shared_config)
+            .and_then(|plain| moonproto::shared_config::parse_payload(&plain).ok());
+        let Some(mut config) = parsed else {
+            log::warn!("leverage: the kept shared config does not parse, the terminal's window is not updated");
+            return false;
+        };
+        let held = self.lev_held();
+        if levman::Config::from_shared(&config) == held {
+            return true;
+        }
+        held.write_shared(&mut config);
+        let blob = moonproto::shared_config::serialize_payload(&config)
+            .ok()
+            .and_then(|plain| gzip(&plain));
+        let Some(blob) = blob else {
+            log::error!(
+                "leverage: the shared config did not serialize, the terminal shows the old settings"
+            );
+            return false;
+        };
+        self.shared_config = blob;
+        true
+    }
+
+    /// The leverage settings inside the shared config a terminal just sent: acted on only when
+    /// they differ from what the core holds — every other tab's OK carries them unchanged, and a
+    /// pass over the account is not started for that. A difference is the trader's OK in that
+    /// window: how fresh its draft is, is the terminal's to keep, as for every other section of
+    /// it. Refused ones are put back in the blob, so the echo shows the terminal the core's
+    /// settings and it reports the refusal. `None` when there was nothing to act on.
+    pub(super) fn lev_from_shared(&mut self) -> Option<Result<(), String>> {
+        let parsed = gunzip(&self.shared_config)
+            .and_then(|plain| moonproto::shared_config::parse_payload(&plain).ok());
+        let Some(config) = parsed else {
+            log::warn!("leverage: the terminal's shared config does not parse, its leverage settings are not read");
+            return None;
+        };
+        let sent = levman::Config::from_shared(&config);
+        if sent == self.lev_held() {
+            return None;
+        }
+        // Checked before it is put on the wire: a Config line past the wire's length would be
+        // cut there rather than refused.
+        let result = sent
+            .check()
+            .and_then(|()| self.lev_manage_set(&sent.to_wire(rand_uid())))
+            .map(drop);
+        if let Err(e) = &result {
+            log::warn!("leverage: {e}");
+            self.lev_to_shared();
+        }
+        Some(result)
     }
 
     /// The picture thresholds in force: the terminal's while it has sent
@@ -1305,6 +1368,14 @@ fn gunzip(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// gzip, as the terminal expects the shared-config blob.
+fn gzip(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(data).ok()?;
+    enc.finish().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,5 +1446,93 @@ mod tests {
         h.flush_deal_notes(now + 2 * DEAL_SETTLE_MS + 1_000, false);
         assert!(sent.notes().is_empty());
         assert!(h.ops.deal_notes.is_empty());
+    }
+
+    fn shared(h: &CoreHandler) -> moonproto::shared_config::SharedConfig {
+        moonproto::shared_config::parse_payload(&gunzip(&h.shared_config).unwrap()).unwrap()
+    }
+
+    fn set_shared(h: &mut CoreHandler, cfg: &moonproto::shared_config::SharedConfig) {
+        h.shared_config = gzip(&moonproto::shared_config::serialize_payload(cfg).unwrap()).unwrap();
+    }
+
+    /// «Настройки ядра» → Плечо / маржа: the window shows what the core holds from the start,
+    /// another tab's OK leaves the settings alone, a changed one is taken and shown to every
+    /// terminal, a refused one is put back for the echo.
+    #[test]
+    fn leverage_settings_follow_the_shared_config_both_ways() {
+        let file = std::env::temp_dir().join(format!("lev-shared-{}.bin", std::process::id()));
+        let held = levman::Config {
+            auto_max_order: true,
+            auto_lev_up: true,
+            auto_isolated: true,
+            text: "200 def".into(),
+            limits: levman::Limits::parse("200 def"),
+            ..levman::Config::default()
+        };
+        let mut h = CoreHandler::new(
+            1,
+            "x".into(),
+            fixtures::sber_catalog(),
+            Strategies::new(None, 0),
+        )
+        .with_levman(file.clone(), Some(held.to_wire(7)), None);
+        assert_eq!(
+            levman::Config::from_shared(&shared(&h)),
+            held,
+            "shown from the start"
+        );
+
+        // Another tab's OK: the leverage fields come back as they were sent.
+        let mut cfg = shared(&h);
+        cfg.trading.fav_markets = "BTC".into();
+        set_shared(&mut h, &cfg);
+        assert!(h.lev_from_shared().is_none());
+        assert!(h.outbox.is_empty(), "nothing to tell anyone");
+
+        // The window changed: fixed 50x, no Config line.
+        let mut cfg = shared(&h);
+        cfg.trading.auto_manage_lev.auto_fix_lev = true;
+        cfg.trading.auto_manage_lev.fix_lev = 50;
+        cfg.trading.auto_lev_control = String::new();
+        set_shared(&mut h, &cfg);
+        assert_eq!(h.lev_from_shared(), Some(Ok(())));
+        let now = h.lev_held();
+        assert!(
+            now.auto_fix_lev && now.fix_lev == 50 && now.text.is_empty(),
+            "{now:?}"
+        );
+        assert_eq!(levman::load(&file), Some(h.lev_manage.clone()), "saved");
+        assert_eq!(levman::Config::from_shared(&shared(&h)), now);
+        assert_eq!(
+            shared(&h).trading.fav_markets,
+            "BTC",
+            "the rest of the snapshot is kept"
+        );
+        let sent: Vec<u8> = h.outbox.iter().map(|(_, p)| p[0]).collect();
+        assert_eq!(sent, vec![ui::CMD_LEV_MANAGE, ui::CMD_SHARED_CONFIG]);
+        h.outbox.clear();
+
+        // Refused: the echo carries what the core holds.
+        let mut cfg = shared(&h);
+        cfg.trading.auto_manage_lev.fix_lev = 5000;
+        set_shared(&mut h, &cfg);
+        assert!(matches!(h.lev_from_shared(), Some(Err(_))));
+        assert_eq!(h.lev_held(), now, "kept");
+        assert_eq!(shared(&h).trading.auto_manage_lev.fix_lev, 50, "put back");
+        assert!(h.outbox.is_empty());
+
+        // A blob that does not parse is neither read nor replaced, and not sent on a change.
+        h.shared_config = b"not gzip".to_vec();
+        assert!(h.lev_from_shared().is_none());
+        assert!(!h.lev_to_shared());
+        assert_eq!(h.shared_config, b"not gzip");
+        let mut page = h.lev_held();
+        page.fix_lev = 25;
+        h.lev_manage_set(&page.to_wire(1)).unwrap();
+        let sent: Vec<u8> = h.outbox.iter().map(|(_, p)| p[0]).collect();
+        assert_eq!(sent, vec![ui::CMD_LEV_MANAGE], "the command only");
+        h.outbox.clear();
+        let _ = std::fs::remove_file(&file);
     }
 }

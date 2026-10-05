@@ -576,6 +576,7 @@ impl CoreHandler {
         self.lev_manage = saved.unwrap_or_default();
         self.lev_file = Some(file);
         self.levman = worker;
+        self.lev_to_shared();
         self
     }
 
@@ -1444,10 +1445,10 @@ impl CoreHandler {
                 self.set_client_settings(payload.to_vec(), now_ms());
                 session.send_encrypted(UI, &ui::with_uid(payload, rand_uid()), true);
             }
-            // «Настройка плеча» → Apply: the whole snapshot. Kept, echoed like the client
-            // settings, and acted on at once by the leverage worker.
+            // «Настройка плеча» → Apply: the whole snapshot. Kept and acted on at once by the
+            // leverage worker; `lev_manage_set` shows it to every terminal, this one too.
             ui::CMD_LEV_MANAGE => match self.lev_manage_set(payload) {
-                Ok(_) => session.send_encrypted(UI, &ui::with_uid(payload, rand_uid()), true),
+                Ok(_) => {}
                 // Refused: the terminal's window keeps what it typed, so it is told in its log.
                 Err(e) => {
                     log::warn!("leverage: {e}");
@@ -1480,12 +1481,28 @@ impl CoreHandler {
                 session.send_encrypted(UI, &profit_state(&self.profit), true);
             }
             ui::CMD_SHARED_CONFIG => {
+                let mut echo = true;
                 if let Some(blob) = ui::shared_config_blob(payload) {
                     self.shared_config = blob.to_vec();
                     self.read_terminal_shots();
+                    // «Настройки ядра» → Плечо / маржа.
+                    match self.lev_from_shared() {
+                        // Taken: `lev_manage_set` sends every terminal, this one too, the
+                        // snapshot it now holds, so a second copy is not sent here.
+                        Some(Ok(())) => echo = false,
+                        // Refused: the echo carries the core's settings back, and the
+                        // terminal's log says why.
+                        Some(Err(e)) => {
+                            let text = format!("leverage settings not applied: {e}");
+                            session.send_encrypted(LOG, &log_msg(now_ms(), &text), true);
+                        }
+                        None => {}
+                    }
                 }
-                let resp = ui::shared_config_payload(rand_uid(), &self.shared_config);
-                session.send_encrypted(UI, &resp, true);
+                if echo {
+                    let resp = ui::shared_config_payload(rand_uid(), &self.shared_config);
+                    session.send_encrypted(UI, &resp, true);
+                }
             }
             ui::CMD_SHARED_CONFIG_REQUEST => {
                 let resp = ui::shared_config_payload(hdr.uid, &self.shared_config);
@@ -1647,7 +1664,8 @@ impl CoreHandler {
         true
     }
 
-    /// New leverage settings, from a terminal's Apply or from the page: kept, saved and handed
+    /// New leverage settings, from a terminal (its Apply, or the shared config of its «Настройки
+    /// ядра» window) or from the page: kept, saved, shown to every terminal and handed
     /// to the worker, which acts on them at once. Without an account they are kept and not acted on.
     fn lev_manage_set(&mut self, payload: &[u8]) -> Result<levman::Config, String> {
         let lev = ui::lev_manage(payload).ok_or_else(|| {
@@ -1682,6 +1700,17 @@ impl CoreHandler {
         self.lev_manage = payload.to_vec();
         if let Some(file) = &self.lev_file {
             levman::save(file, payload);
+        }
+        // Every terminal is shown what the core now holds, in both of its windows: the older
+        // «Настройка плеча» reads the command, «Настройки ядра» the shared config (sent last, so
+        // a client overlaying the one on the other ends on the snapshot). A snapshot that could
+        // not be brought in line is not sent: it would carry the old settings back.
+        self.outbox.push((UI, ui::with_uid(payload, rand_uid())));
+        if self.lev_to_shared() {
+            self.outbox.push((
+                UI,
+                ui::shared_config_payload(rand_uid(), &self.shared_config),
+            ));
         }
         Ok(config)
     }

@@ -1,6 +1,7 @@
 //! The terminal's «Настройка плеча» (MoonBot's leverage management), served by the core: the
 //! terminal sends its whole `TLevManageCommand` on Apply (the page's Leverage tab sends the same
-//! settings), the core keeps it, applies it at once
+//! settings; the newer terminal's «Настройки ядра» window sends them inside the shared config,
+//! and is shown what the core holds there), the core keeps it, applies it at once
 //! and again every hour (MoonBot checks hourly too: the brackets change on the exchange's side).
 //! A pass that does not cover the account (a 429, the network, the site's figures missing) is
 //! made again sooner: 5 min, doubling while they keep falling short, back to the hour at most.
@@ -32,6 +33,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use moonproto::server::codec::ui;
+use moonproto::shared_config::SharedConfig;
 use moonproto::LevManage;
 
 use crate::aster::json::{PositionRisk, SymbolBrackets};
@@ -188,6 +190,36 @@ impl Config {
             self.tlg_report,
             &self.text,
         )
+    }
+
+    /// The settings as the terminal's «Настройки ядра» window holds them: `trading.auto_manage_lev`
+    /// and `trading.auto_lev_control` of the shared config, the Config line as typed.
+    pub fn from_shared(cfg: &SharedConfig) -> Self {
+        let m = &cfg.trading.auto_manage_lev;
+        Self {
+            auto_max_order: m.auto_max_order,
+            auto_lev_up: m.auto_lev_up,
+            auto_isolated: m.auto_isolated,
+            auto_cross: m.auto_cross,
+            auto_fix_lev: m.auto_fix_lev,
+            fix_lev: m.fix_lev,
+            tlg_report: m.tlg_report,
+            text: cfg.trading.auto_lev_control.clone(),
+            limits: Limits::parse(&cfg.trading.auto_lev_control),
+        }
+    }
+
+    /// The settings written into the shared config, for that window to show.
+    pub fn write_shared(&self, cfg: &mut SharedConfig) {
+        let m = &mut cfg.trading.auto_manage_lev;
+        m.auto_max_order = self.auto_max_order;
+        m.auto_lev_up = self.auto_lev_up;
+        m.auto_isolated = self.auto_isolated;
+        m.auto_cross = self.auto_cross;
+        m.auto_fix_lev = self.auto_fix_lev;
+        m.fix_lev = self.fix_lev;
+        m.tlg_report = self.tlg_report;
+        cfg.trading.auto_lev_control.clone_from(&self.text);
     }
 
     /// The settings a terminal or the page may hand over: a whole fixed leverage, a Config line
