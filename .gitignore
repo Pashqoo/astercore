@@ -20,3 +20,6 @@ probe.env
 
 # Formula notes from the strategy tuner side: working docs, not for the public repo
 _doc/STRATEGY_FORMULAS/
+
+# Real host, key id and other local facts behind the placeholders in AGENTS.md
+CLAUDE.local.md
