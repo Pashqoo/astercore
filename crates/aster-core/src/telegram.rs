@@ -2157,6 +2157,8 @@ mod tests {
     #[test]
     fn the_status_reads_as_the_core_at_a_glance() {
         let status = control::Status {
+            build: 120,
+            commit: "dev",
             uptime_s: 3_725,
             account: "mainnet 0x21cF…1bb0".into(),
             trading: true,

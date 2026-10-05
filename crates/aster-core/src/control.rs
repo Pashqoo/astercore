@@ -345,6 +345,9 @@ pub struct LevEditView {
 #[derive(Debug, Serialize)]
 pub struct Status {
     pub uptime_s: i64,
+    /// The build this process runs (`update.rs`): the number the terminal shows, and its commit.
+    pub build: i32,
+    pub commit: &'static str,
     /// The account the core trades on, as the page names it: the API
     /// wallet's signer, shortened (`account.rs`), or `none`.
     pub account: String,

@@ -33,6 +33,7 @@ use aster_core::orders::Action;
 use aster_core::strategies::Strategies;
 use aster_core::stream_health::StreamHealth;
 use aster_core::trading::{ExecStatus, OrderUpdate, TradeCommand, TradingEvent};
+use aster_core::update::Updater;
 use moonproto::server::codec::market_data::{delphi_days, Candle};
 use moonproto::server::key_export::ServerKey;
 use moonproto::server::Server;
@@ -1333,6 +1334,61 @@ fn a_shutdown_is_refused_while_a_position_is_open() {
         "no refusal while a position is open"
     );
     let _ = client.disconnect();
+}
+
+/// MT's update button: the core writes the request for the updater and says so; with a
+/// position it refuses with the token the terminal reads as a refusal (`BGF-SUB4`).
+#[test]
+fn an_update_is_handed_to_the_updater_and_refused_while_a_position_is_open() {
+    let dir = std::env::temp_dir().join(format!("aster-loopback-update-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (data, exe) = (dir.join("data"), dir.join("aster-core"));
+    let (tx, orders) = mpsc::channel();
+    let (store, saved) = OrderStore::open(dir.join("orders.json"));
+    let updater = Updater::new(data.clone(), dir.join("state"), exe);
+    let core = FedCore::start_with(move |h| {
+        h.with_orders(store, saved)
+            .with_trading(tx)
+            .with_updater(updater)
+    });
+    let client = core.connect();
+    client
+        .settings()
+        .request_version_update("eeadeb0")
+        .expect("sent");
+    assert!(
+        log_line(&client, "update to eeadeb0 accepted"),
+        "no word of the accepted update"
+    );
+    let request = std::fs::read_to_string(data.join("update-request")).expect("the request");
+    assert!(request.contains(" 0 eeadeb0 "), "{request}");
+    // One at a time.
+    client.settings().request_release_update().expect("sent");
+    assert!(log_line(
+        &client,
+        "BGF-SUB4 update refused: an update is already in progress"
+    ));
+
+    let key = post_entry(&client, &orders);
+    core.ev_tx
+        .send(report(&key, "902", ExecStatus::Filled, 1, 1))
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        client.drain_events().into_iter().any(|e| {
+            matches!(e, Event::Order(moonproto::state::OrderEvent::Updated(o))
+                if o.status == moonproto::OrderWorkerStatus::BuyDone)
+        })
+    }));
+    client
+        .settings()
+        .request_version_update("eeadeb0")
+        .expect("sent");
+    assert!(
+        log_line(&client, "BGF-SUB4 update refused: 1 position(s)"),
+        "no refusal while a position is open"
+    );
+    let _ = client.disconnect();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Without a position the core agrees, and the stop withdraws the live entry:

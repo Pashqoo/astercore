@@ -12,6 +12,9 @@ pub const CMD_CLIENT_SETTINGS: u8 = 1;
 pub const CMD_SETTINGS_REQUEST: u8 = 2;
 pub const CMD_STRAT_START_STOP: u8 = 3;
 pub const CMD_STRAT_START_STOP_V2: u8 = 4;
+/// `TUpdateVersionCommand`: the terminal asks the core to update itself — an empty name with
+/// `is_release` for the release, otherwise a named build.
+pub const CMD_UPDATE_VERSION: u8 = 6;
 const CMD_NEW_MARKET_NOTIFY: u8 = 8;
 /// `TLevManageCommand`: the terminal's leverage-management snapshot (the whole of it, on Apply).
 pub const CMD_LEV_MANAGE: u8 = 9;
@@ -156,6 +159,14 @@ pub fn default_shared_config_blob() -> Vec<u8> {
 pub fn lev_manage(payload: &[u8]) -> Option<LevManage> {
     match UICommand::parse(payload)? {
         UICommand::LevManage(l) => Some(l),
+        _ => None,
+    }
+}
+
+/// The build an inbound `TUpdateVersionCommand` asks for: `(version_name, is_release)`.
+pub fn update_version(payload: &[u8]) -> Option<(String, bool)> {
+    match UICommand::parse(payload)? {
+        UICommand::UpdateVersion(u) => Some((u.version_name, u.is_release)),
         _ => None,
     }
 }
@@ -452,6 +463,20 @@ mod tests {
         let (start, parsed) =
             parse_strat_start_stop(v1[0], &v1[super::super::BASE_HEADER_SIZE..]).unwrap();
         assert!(!start && parsed.is_empty());
+    }
+
+    #[test]
+    fn update_version_parses_upstream_builder() {
+        use crate::commands::ui::build_update_version;
+        assert_eq!(
+            update_version(&build_update_version(4, "", true)),
+            Some((String::new(), true))
+        );
+        assert_eq!(
+            update_version(&build_update_version(5, "eeadeb0", false)),
+            Some(("eeadeb0".to_string(), false))
+        );
+        assert_eq!(update_version(&runtime_state(1, true, false)), None);
     }
 
     #[test]

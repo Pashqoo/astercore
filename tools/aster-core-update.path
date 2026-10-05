@@ -1,0 +1,12 @@
+# Starts the core's updater when the core asks for an update (`TUpdateVersionCommand` from the
+# terminal → data/update-request, crates/aster-core/src/update.rs). Installed by hand into
+# /etc/systemd/system with aster-core-update.service — README, «Обновление из терминала».
+[Unit]
+Description=Astercore — watch for the core's update request
+
+[Path]
+PathExists=/opt/aster-core/data/update-request
+Unit=aster-core-update.service
+
+[Install]
+WantedBy=multi-user.target

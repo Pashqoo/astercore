@@ -35,6 +35,7 @@ use aster_core::stderr_log;
 use aster_core::strategies::Strategies;
 use aster_core::stream_health::StreamHealth;
 use aster_core::trading;
+use aster_core::update::{self, Updater};
 use aster_core::{telegram, web};
 use moonproto::server::codec::engine as engine_codec;
 use moonproto::server::codec::ui;
@@ -75,6 +76,11 @@ const METER_SAVE: Duration = Duration::from_secs(60);
 /// began refusing the path, and the clock measures need it.
 const PING_HEARTBEAT: Duration = Duration::from_secs(10);
 const REPORTS_FILE: &str = "data/reports.jsonl";
+/// Where the core and the updater leave each other the update's files (`update.rs`).
+const UPDATE_DIR: &str = "data";
+/// Where the updater answers (`update-state`): its own root-owned directory, which the core only
+/// reads; `ASTER_UPDATE_STATE_DIR` names another (`tools/update.sh` takes the same variable).
+const UPDATE_STATE_DIR: &str = "/var/lib/aster-core-update/state";
 
 fn main() -> ExitCode {
     // First of all, before the journal, the settings or anything that writes: it only reads the
@@ -457,6 +463,19 @@ fn main() -> ExitCode {
     .with_telegram(reporter)
     .with_account_label(account_label)
     .with_reports(Reports::open(Some(PathBuf::from(REPORTS_FILE)), now));
+    // The update from the sources swaps the binary this process was started from; without its
+    // path the terminal's update button is refused, and nothing else changes.
+    let handler = match std::env::current_exe() {
+        Ok(exe) => {
+            let state_dir = std::env::var_os("ASTER_UPDATE_STATE_DIR")
+                .map_or_else(|| PathBuf::from(UPDATE_STATE_DIR), PathBuf::from);
+            handler.with_updater(Updater::new(PathBuf::from(UPDATE_DIR), state_dir, exe))
+        }
+        Err(e) => {
+            log::warn!("update: the running binary's path is unknown ({e}), updates refused");
+            handler
+        }
+    };
     // The order store with or without an account: a core without one runs
     // its strategies in the emulator, and a restart must resume them.
     let orders_file = if account.is_some() {
@@ -511,10 +530,12 @@ fn main() -> ExitCode {
         }
     };
     log::info!(
-        "serving MoonProto on udp/{} as {} (exchange code {})",
+        "serving MoonProto on udp/{} as {} (exchange code {}), build {} ({})",
         key.port,
         engine::SERVER_NAME,
-        engine::EXCHANGE_CODE
+        engine::EXCHANGE_CODE,
+        update::BUILD,
+        update::COMMIT
     );
     // The signal handlers go up here, not earlier: until the loop below runs
     // nobody would notice the flag, and a `systemctl stop` during the start
@@ -525,6 +546,7 @@ fn main() -> ExitCode {
     {
         let (handler, _) = server.split();
         handler.announce();
+        handler.report_update();
     }
 
     // Every way out of THIS LOOP goes through the stop below: the entries are

@@ -76,8 +76,20 @@ Toolchain — **1.98.0** на обеих машинах (`rustup default 1.98.0`
 
 ## Release surface
 
-`N/A`: релизов репозиторий пока не публикует — ни CI, ни workflow, ни апдейтера в приложении нет.
-Появится пайплайн — секция заполняется, как `## Commands`.
+С 05.10 есть обновление ядра из терминала (README, «Обновление из терминала»): кнопка MT собирает
+и ставит на боевое ядро **любой коммит `main`**. Поэтому то, что попадает в `main`, — это и есть
+релиз, и следующие пути решают, что окажется в боевом бинаре:
+
+- `tools/update.sh` (ставится как `/usr/local/sbin/aster-core-update`, от root: fetch, проверка
+  «коммит в `main`», сборка, тест, staging, откат);
+- `tools/aster-core-update.service`, `tools/aster-core-update.path`, `tools/aster-core.service`;
+- `crates/aster-core/src/update.rs` — сторона ядра: протокол файлов, подмена бинаря, номер сборки;
+- `crates/aster-core/tests/loopback.rs` — гейт перед подменой (`cargo test --release --test loopback`);
+- `crates/moonproto/src/server/codec/ui.rs` (`CMD_UPDATE_VERSION`) и ветка `CMD_UPDATE_VERSION` в
+  `engine.rs` — приём команды.
+
+CI и workflow нет: гейт — проверка в `update.sh` и контрактный тест. Правки скрипта и юнитов на
+сервер сами не приезжают, ставятся вручную.
 
 ## Канал наблюдения (§7)
 
@@ -165,6 +177,16 @@ Toolchain — **1.98.0** на обеих машинах (`rustup default 1.98.0`
     риска: настройка на один рынок (`200 BTC` — Config с лимитом только у BTC), зонд — отдельный
     крейт в скрэтчпаде, шлёт `LevManage` через `client.settings().manage_leverage` (фича
     `diagnostics` вендора). Файл `data/lev_manage.bin` в рабочем каталоге ядра.
+
+11. **Обновление из терминала**: `journalctl -u aster-core -u aster-core-update` — `update to …
+    accepted` → `update: accepted` / `building <sha> <N>` / `built in N s` / `staged` → `update:
+    build … installed, restarting` → `exit 70` → `serving … build N (<sha>)` → `updated: build A →
+    N`. Файлы протокола — `data/update-{request,running,ack}` и
+    `/var/lib/aster-core-update/state/update-state` (формат — шапка `update.rs`),
+    вывод сборки — `/var/lib/aster-core-update/build.log`, версия — `/api/status` → `build`,
+    `commit`. Отказ терминалу — строка журнала с `BGF-SUB4`. Проверка без боевого ядра: тестовое
+    ядро как временный юнит (`systemd-run --unit aster-core-test`) и скрипт с `ASTER_CORE_DIR` /
+    `ASTER_CORE_UNIT`, вместо терминала — `request_version_update` пробным клиентом.
 
 `MIN_NOTIONAL` на всех символах = 5 USDT, значит живая проверка ордера стоит пять долларов.
 

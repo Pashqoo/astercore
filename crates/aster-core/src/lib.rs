@@ -43,5 +43,6 @@ pub mod tape;
 pub mod telegram;
 pub mod trades_stream;
 pub mod trading;
+pub mod update;
 pub mod web;
 pub mod windows;

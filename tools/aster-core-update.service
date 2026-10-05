@@ -1,0 +1,25 @@
+# The core's updater (tools/update.sh, installed as /usr/local/sbin/aster-core-update): fetch the
+# requested commit of main, build and test it, stage the binary beside the core's, and roll it
+# back if the new core does not come up. Root, because it builds with root's toolchain and git
+# key and restarts aster-core; the core itself never gets either.
+#
+# Started by aster-core-update.path, never enabled on its own. Built at low priority: the live
+# core shares the host's two cores, and its latency matters more than the build's.
+[Unit]
+Description=Astercore — update the core from its sources
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aster-core-update
+Environment=HOME=/root
+Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Nice=15
+IOSchedulingClass=idle
+CPUWeight=20
+# The clone and the fetch (5 min each), the build (25), the test (10), the wait for a flat book (11)
+# and the health check (5): update.sh bounds each, this only bounds the sum.
+TimeoutStartSec=65min
+StandardOutput=journal
+StandardError=journal

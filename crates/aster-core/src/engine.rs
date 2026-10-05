@@ -53,6 +53,7 @@ use crate::stream_health::{Scope, StreamHealth, SUMMARY_EVERY_MS};
 use crate::tape::Tape;
 use crate::trades_stream::TradesStream;
 use crate::trading::{Grid, OrderUpdate, TradeCommand, TradingEvent};
+use crate::update::{self, Updater};
 use crate::windows::Windows;
 
 #[path = "engine_ops.rs"]
@@ -66,7 +67,9 @@ pub const EXCHANGE_NAME: &str = "Aster";
 /// core under `reported` without a logo, instead of borrowing a directory
 /// entry's rules (`venue(221) == None`, verified in the terminal's source).
 pub const EXCHANGE_CODE: u8 = 221;
-pub const SERVER_VERSION: i32 = 1;
+/// What BaseCheck reports as the version: the build number ([`update::BUILD`]), which the
+/// terminal compares before and after an update.
+pub const SERVER_VERSION: i32 = update::BUILD;
 /// `ExchangeTypeMask` bit for a futures venue.
 ///
 /// **Not SPOT, which is what TInvestCore reports.** With this bit the terminal
@@ -329,6 +332,9 @@ pub struct CoreHandler {
     stopping: bool,
     /// The terminal asked the core to leave and it agreed (`TShutdownCommand`).
     shutdown_requested: bool,
+    /// The update from the sources (`TUpdateVersionCommand`, `update.rs`); none in a run that
+    /// was not given one, which refuses the command.
+    updater: Option<Updater>,
     /// Markets the exchange takes no new positions on (`-4140`/`-4141` on an
     /// entry), for this run: an entry there is refused by the core.
     closed_markets: HashMap<String, i64>,
@@ -444,6 +450,7 @@ impl CoreHandler {
             manual: ui::ManualDefaults::default(),
             stopping: false,
             shutdown_requested: false,
+            updater: None,
             closed_markets: HashMap::new(),
             shots: MoonShot::default(),
             windows: Windows::default(),
@@ -594,6 +601,12 @@ impl CoreHandler {
         // strategy emulated.
         self.shots.set_emulator(self.emu_mode());
         self.replay_guards();
+        self
+    }
+
+    /// Take updates from the sources (`update.rs`).
+    pub fn with_updater(mut self, updater: Updater) -> Self {
+        self.updater = Some(updater);
         self
     }
 
@@ -1473,6 +1486,27 @@ impl CoreHandler {
                 log::info!("{text}");
                 session.send_encrypted(LOG, &log_msg(now_ms(), &text), true);
             }
+            // MoonBot's update button: the build is made off the core (`update.rs`), and the core
+            // restarts into it once it holds no position. Never echoed: a Delphi terminal that
+            // hears the command back starts its own updater.
+            ui::CMD_UPDATE_VERSION => {
+                let now = now_ms();
+                let accepted = ui::update_version(payload)
+                    .ok_or_else(|| "the request does not parse".to_string())
+                    .and_then(|(name, release)| self.ask_update(name.trim(), release, now));
+                match accepted {
+                    Ok(text) => {
+                        log::info!("{text}");
+                        self.tg(crate::telegram::Kind::Lifecycle, format!("🔄 {text}"));
+                        self.outbox.push((LOG, log_msg(now, &text)));
+                    }
+                    Err(why) => {
+                        let text = format!("{} update refused: {why}", update::REFUSED);
+                        log::info!("{text}");
+                        session.send_encrypted(LOG, &log_msg(now, &text), true);
+                    }
+                }
+            }
             ui::CMD_SETTINGS_REQUEST => {
                 self.refresh_temp_black_list(now_ms());
                 let resp = ui::with_uid(&self.client_settings, hdr.uid);
@@ -2152,6 +2186,28 @@ impl CoreHandler {
                 if self.manual.emulator { "on" } else { "off" }
             ),
         }
+    }
+
+    /// An update asked for by a terminal: refused while the core holds a position (the guard
+    /// `TShutdownCommand` has), for a name that is not one word, or with no updater in this run.
+    fn ask_update(&mut self, name: &str, release: bool, now: i64) -> Result<String, String> {
+        let release = release || name.is_empty();
+        if !release && !update::valid_target(name) {
+            return Err(format!("{name:?} is not a commit or a tag"));
+        }
+        if self.stopping || self.shutdown_requested {
+            return Err("the core is stopping".into());
+        }
+        let open = self.open_positions();
+        if open > 0 {
+            return Err(format!(
+                "{open} position(s) of the core are open — close them first"
+            ));
+        }
+        let Some(updater) = self.updater.as_mut() else {
+            return Err("this run of the core takes no updates".into());
+        };
+        updater.ask(name, release, now)
     }
 
     /// Positions of the core still open: a filled entry, with its exit live or

@@ -121,8 +121,12 @@ sudo ufw allow 3101/udp
 
 ### Обновление
 
+Вручную:
+
 ```sh
-cd astercore && git pull && cargo build --release -p aster-core
+cd astercore && git pull
+ASTER_CORE_BUILD=$(git rev-list --count HEAD) ASTER_CORE_COMMIT=$(git rev-parse HEAD) \
+  cargo build --release -p aster-core
 sudo systemctl stop aster-core
 sudo install -m 755 target/release/aster-core /opt/aster-core/
 sudo systemctl start aster-core
@@ -130,3 +134,40 @@ sudo systemctl start aster-core
 
 `stop` штатный: ядро снимает входы с биржи и сохраняет состояние (до 40 с). Ключ терминала,
 настройки и стратегии в `/opt/aster-core` сохраняются.
+
+`ASTER_CORE_BUILD` — номер сборки (число коммитов `main`): его терминал показывает как версию
+ядра (`1.20` для 120) и сравнивает до и после обновления. Сборка без него сообщает `0.01`.
+
+### Обновление из терминала
+
+Кнопка «Обновить» в окне статуса ядер MoonTerminal («до релиза» или «до именованной версии»)
+обновляет ядро из исходников на GitHub. «Релиз» — последний коммит `main`. Именованная версия —
+коммит (7–40 знаков hex) или тег, и только если он есть в `main`: ветки и чужие ссылки не
+собираются. Ядро отказывает, пока у него открыта позиция или уже идёт обновление.
+
+Как это работает: ядро само ничего не собирает. Оно пишет заявку `data/update-request`, а
+служба `aster-core-update` от root (её запускает path-юнит) делает `git fetch`, собирает с
+пониженным приоритетом, прогоняет контрактный тест и кладёт бинарь рядом как `aster-core.next`.
+Ядро подменяет им себя, как только у него нет позиций (ждёт до 10 минут, потом отменяет), и
+перезапускается (код 70). Старый бинарь остаётся как `aster-core.prev`. Если новое ядро не
+поднялось за 300 с, служба возвращает старый бинарь и перезапускает ядро. Каждый шаг пишется в
+журнал ядра, а итог — ещё и в Telegram.
+
+Установка, один раз, **в shell от root** (служба собирает тулчейном root из `/root/.cargo` и
+ходит на GitHub его ssh-ключом; `sudo` здесь не годится — он теряет `~/.cargo/bin` из `PATH`):
+
+```sh
+install -m 755 tools/update.sh /usr/local/sbin/aster-core-update
+install -m 644 tools/aster-core-update.service tools/aster-core-update.path /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now aster-core-update.path
+# Прогрев: первый клон и полная сборка (~5 мин), чтобы кнопка потом собирала только ядро.
+mkdir -p -m 755 /var/lib/aster-core-update
+git clone git@github.com:Pashqoo/astercore.git /var/lib/aster-core-update/src
+cd /var/lib/aster-core-update/src && CARGO_TARGET_DIR=/var/lib/aster-core-update/target \
+  nice -n 15 cargo build --release -p aster-core
+```
+
+Журнал обновления — `journalctl -u aster-core-update`, вывод сборки —
+`/var/lib/aster-core-update/build.log`. Скрипт сам себя не обновляет: правка `tools/update.sh`
+или юнитов ставится только вручную, командами выше.

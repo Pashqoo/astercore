@@ -366,6 +366,53 @@ impl CoreHandler {
         self.expire_chart_waits(now);
         self.flush_deal_notes(now, false);
         self.run_daily(now);
+        // Last, after the queue: a stop asked for in this pass wins over the update's restart.
+        self.run_update(control, now);
+    }
+
+    /// The update in flight (`update.rs`): what the updater said, and the restart into the new
+    /// build once the core holds no position. Nothing at all while none is pending.
+    fn run_update(&mut self, control: &Control, now: i64) {
+        // A core already leaving (a stop, a signal) swaps nothing in: its exit would not be the
+        // restart that starts the new binary, and the updater would then start the unit again.
+        if control.halted().is_some() || !self.updater.as_ref().is_some_and(|u| u.pending()) {
+            return;
+        }
+        let flat = self.open_positions() == 0;
+        let Some(updater) = self.updater.as_mut() else {
+            return;
+        };
+        match updater.check(flat, now) {
+            update::Step::Wait => {}
+            update::Step::Note(text) => {
+                log::info!("{text}");
+                self.outbox.push((LOG, log_msg(now, &text)));
+            }
+            // The token tells the terminal its named update is over; a release attempt
+            // ignores it, and the chat has the reason either way.
+            update::Step::Over(why) => {
+                log::warn!("{why}");
+                self.tg(telegram::Kind::Lifecycle, format!("⚠️ {why}"));
+                let text = format!("{} {why}", update::REFUSED);
+                self.outbox.push((LOG, log_msg(now, &text)));
+            }
+            update::Step::Restart(text) => {
+                log::info!("{text}");
+                self.tg(telegram::Kind::Lifecycle, format!("🔄 {text}"));
+                self.outbox.push((LOG, log_msg(now, &text)));
+                Self::ask_halt(control, Halted::Restart);
+            }
+        }
+    }
+
+    /// What the last update came to (`Updater::on_start`), once, after the core is up: the
+    /// journal and the chat.
+    pub fn report_update(&mut self) {
+        let Some(text) = self.updater.as_ref().and_then(|u| u.on_start()) else {
+            return;
+        };
+        log::info!("{text}");
+        self.tg(telegram::Kind::Lifecycle, format!("🔄 {text}"));
     }
 
     /// End the loop: `main` turns the halt into the process exit code. Every
@@ -1294,6 +1341,8 @@ impl CoreHandler {
             })
             .unwrap_or_default();
         control::Status {
+            build: update::BUILD,
+            commit: update::COMMIT,
             uptime_s: (now - self.started_at) / 1000,
             account: self.ops.account.clone(),
             trading: self.trading.is_some(),
