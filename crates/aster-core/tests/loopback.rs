@@ -1814,6 +1814,7 @@ fn the_account_leverage_reaches_the_client_with_and_without_a_position() {
                 entry: 83_000.0,
             }],
             leverage,
+            isolated: ["TONUSDT".to_string()].into(),
         })))
         .unwrap();
     let (_, btc) = next_balance(&client, "BTCUSDT");
@@ -1822,6 +1823,7 @@ fn the_account_leverage_reaches_the_client_with_and_without_a_position() {
         (0.002, 20),
         "on the position's row"
     );
+    assert!(btc.position_type.is_cross(), "cross unless isolated");
     let snap = client.snapshot().expect("snapshot");
     let ton = snap
         .markets()
@@ -1834,6 +1836,8 @@ fn the_account_leverage_reaches_the_client_with_and_without_a_position() {
         (0.0, 7),
         "alone, for a flat market"
     );
+    // The screener's «7 / 7 Isolated»: the margin type rides with the leverage.
+    assert!(ton.position_type.is_isolated());
 }
 
 /// `SetLeverage` goes to the exchange through the order path, and the terminal's answer is the
@@ -1852,6 +1856,7 @@ fn set_leverage_goes_to_the_exchange_and_the_answer_is_the_exchanges() {
             equity: 10.0,
             positions: Vec::new(),
             leverage: [("BTCUSDT".to_string(), 20)].into(),
+            ..Account::default()
         })))
         .unwrap();
     let (_, btc) = next_balance(&client, "BTCUSDT");
@@ -1925,6 +1930,7 @@ fn set_leverage_goes_to_the_exchange_and_the_answer_is_the_exchanges() {
             equity: 11.0,
             positions: Vec::new(),
             leverage: [("BTCUSDT".to_string(), 20)].into(),
+            ..Account::default()
         })))
         .unwrap();
     assert!(

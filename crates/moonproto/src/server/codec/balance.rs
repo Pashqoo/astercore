@@ -21,6 +21,10 @@ const F_POS_DIR: u32 = 1 << 5;
 const F_ASSET_BALANCE: u32 = 1 << 14;
 const F_ASSET_BALANCE_FULL: u32 = 1 << 15;
 const F_LEVERAGE: u32 = 1 << 20;
+const F_POSITION_TYPE: u32 = 1 << 21;
+/// `PositionType` ordinals.
+const MARGIN_CROSS: u8 = 0;
+const MARGIN_ISOLATED: u8 = 1;
 
 /// One market row of the full balance.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -35,6 +39,9 @@ pub struct BalanceItem<'a> {
     /// A row that carries the leverage and nothing else: no position, no balance. The terminal
     /// takes a market with neither as flat, which is what it is.
     pub leverage_only: bool,
+    /// Isolated margin on the market, cross otherwise. Sent with the leverage, which is when the
+    /// terminal reads it (its screener's «200 / 200 Cross»); left out, it reads cross.
+    pub isolated: bool,
     /// Open derivative position: signed size (long > 0) and entry price.
     pub pos_size: f64,
     pub pos_price: f64,
@@ -61,7 +68,11 @@ pub fn balance_full(
     for item in items {
         super::write_str(&mut out, item.market);
         out.extend_from_slice(&0u64.to_le_bytes()); // balance_hash
-        let stated = if item.leverage > 0 { F_LEVERAGE } else { 0 };
+        let stated = if item.leverage > 0 {
+            F_LEVERAGE | F_POSITION_TYPE
+        } else {
+            0
+        };
         let held = if item.leverage_only {
             0
         } else {
@@ -82,6 +93,11 @@ pub fn balance_full(
         }
         if item.leverage > 0 {
             out.extend_from_slice(&item.leverage.to_le_bytes());
+            out.push(if item.isolated {
+                MARGIN_ISOLATED
+            } else {
+                MARGIN_CROSS
+            });
         }
     }
     out
@@ -92,6 +108,51 @@ mod tests {
     use super::*;
     use crate::commands::balance::parse_balance;
     use crate::commands::trade::OrderType;
+
+    /// The margin type goes with the leverage, and reads back as the terminal reads it.
+    #[test]
+    fn the_margin_type_rides_with_the_leverage() {
+        use crate::commands::market::PositionType;
+        let rows = [
+            BalanceItem {
+                market: "BTCUSDT",
+                leverage: 150,
+                leverage_only: true,
+                isolated: true,
+                ..BalanceItem::default()
+            },
+            BalanceItem {
+                market: "ETHUSDT",
+                leverage: 20,
+                leverage_only: true,
+                ..BalanceItem::default()
+            },
+            BalanceItem {
+                market: "SOLUSDT",
+                pos_size: 1.0,
+                pos_price: 150.0,
+                leverage: 10,
+                isolated: true,
+                ..BalanceItem::default()
+            },
+        ];
+        let raw = balance_full(1, 1, 0.0, 0.0, 0.0, &rows);
+        let parsed =
+            parse_balance(raw[0], &raw[super::super::BASE_HEADER_SIZE..]).expect("balance");
+        let types: Vec<_> = parsed
+            .items
+            .iter()
+            .map(|i| (i.market_name.as_str(), i.leverage_x, i.position_type))
+            .collect();
+        assert_eq!(
+            types,
+            [
+                ("BTCUSDT", 150, PositionType::Isolated),
+                ("ETHUSDT", 20, PositionType::Cross),
+                ("SOLUSDT", 10, PositionType::Isolated),
+            ]
+        );
+    }
 
     #[test]
     fn full_balance_rows_parse_upstream() {

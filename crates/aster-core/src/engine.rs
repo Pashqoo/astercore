@@ -3385,7 +3385,9 @@ impl CoreHandler {
         // A row per open position, carrying its market's leverage when the exchange stated it,
         // and a leverage-only row for every other market that has one: the terminal reads the
         // leverage of the market on its chart from the rows, and a market left out of a full
-        // snapshot is read as flat with the default leverage.
+        // snapshot is read as flat with the default leverage. The margin type rides with the
+        // leverage (the terminal reads it only for a market whose leverage it has); a margin
+        // the leverage worker has just changed shows at the next account read.
         let mut items: Vec<balance::BalanceItem> = a
             .positions
             .iter()
@@ -3394,6 +3396,7 @@ impl CoreHandler {
                 pos_size: p.size,
                 pos_price: p.entry,
                 leverage: a.leverage.get(&p.symbol).copied().unwrap_or(0),
+                isolated: a.isolated.contains(&p.symbol),
                 ..balance::BalanceItem::default()
             })
             .collect();
@@ -3405,6 +3408,7 @@ impl CoreHandler {
                     market: symbol,
                     leverage,
                     leverage_only: true,
+                    isolated: a.isolated.contains(symbol),
                     ..balance::BalanceItem::default()
                 }),
         );

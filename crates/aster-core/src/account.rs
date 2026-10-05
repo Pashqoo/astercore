@@ -18,7 +18,7 @@
 //! unrealized PnL inside the equity moves with every mark price, which no
 //! account event reports.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -98,6 +98,11 @@ pub struct Account {
     /// `positionRisk` states it. A market the exchange did not state it for is missing, and
     /// reaches the terminal as unknown rather than as 1×.
     pub leverage: BTreeMap<String, i32>,
+    /// This core's markets whose `positionRisk` row says isolated margin; any other (cross, or
+    /// no `marginType`) is sent as cross, the only other state the wire has. Reaches the terminal
+    /// beside the leverage — its screener read every market as cross while the core sent none
+    /// (05.10).
+    pub isolated: BTreeSet<String>,
 }
 
 /// A symbol's net open position.
@@ -147,6 +152,16 @@ impl Account {
             .filter(|p| symbols.rows.contains(&p.symbol))
             .filter_map(|p| Some((p.symbol.clone(), p.leverage?)))
             .collect();
+        let isolated = positions
+            .iter()
+            .filter(|p| symbols.rows.contains(&p.symbol))
+            .filter(|p| {
+                p.margin_type
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("isolated"))
+            })
+            .map(|p| p.symbol.clone())
+            .collect();
         // Net per symbol. One-way mode gives one row a symbol; hedge mode two,
         // each signed and with its own entry. The wire carries one position a
         // market, so two open legs are netted and have no entry price to
@@ -177,6 +192,7 @@ impl Account {
             equity: usdt.balance + unrealized,
             positions,
             leverage,
+            isolated,
         })
     }
 
@@ -704,11 +720,14 @@ mod tests {
         };
         let mut btc = pos("BTCUSDT", 1.0, 100.0, 0.0);
         btc.leverage = Some(20);
+        btc.margin_type = Some("isolated".into());
         let mut eth = pos("ETHUSDT", 0.0, 0.0, 0.0);
         eth.leverage = Some(7);
+        eth.margin_type = Some("cross".into());
         let sol = pos("SOLUSDT", 0.0, 0.0, 0.0);
         let mut odd = pos("ODDUSDT", 0.0, 0.0, 0.0);
         odd.leverage = Some(3);
+        odd.margin_type = Some("isolated".into());
         let a = Account::from_rows(
             Some(&bal("USDT", 10.0, 10.0)),
             &[btc, eth, sol, odd],
@@ -719,6 +738,8 @@ mod tests {
             a.leverage.into_iter().collect::<Vec<_>>(),
             [("BTCUSDT".to_string(), 20), ("ETHUSDT".to_string(), 7)]
         );
+        // The margin type rides beside it, on this core's markets only.
+        assert_eq!(a.isolated.into_iter().collect::<Vec<_>>(), ["BTCUSDT"]);
     }
 
     /// The snapshot is withdrawn after a minute of failed reads, not before, and only if there
@@ -879,6 +900,7 @@ mod tests {
             equity: 90.0,
             positions: Vec::new(),
             leverage: BTreeMap::new(),
+            isolated: BTreeSet::new(),
         };
         assert_eq!(a.locked(), 0.0);
     }
