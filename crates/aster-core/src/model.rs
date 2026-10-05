@@ -141,19 +141,16 @@ pub struct MarketTags {
 }
 
 impl MarketTags {
-    /// Choices of the terminal's `MarketTags` combo: one class per item,
-    /// spelled the way [`Self::parse`] expects. A combination or a `!tag`
-    /// exclusion still parses when typed into a strategy file (`all` takes no `!`).
-    pub const PICKLIST: &'static str =
-        "all|crypto|stock|forex|commodities|etf|meme|ai|top|rwa|prelaunch";
-
     /// MoonBot tag-filter syntax, case-insensitive: `crypto`, `meme, ai` or
     /// `!stock` (only exclusions start from every class); `all` is every class,
     /// the editor's default. Empty text is the empty set; an unknown tag is the
     /// error, so a typo never widens the set.
     pub fn parse(text: &str) -> Result<Self, String> {
         let (mut include, mut exclude) = (0u16, 0u16);
-        for token in text.split([',', ' ', ';']).filter(|t| !t.is_empty()) {
+        for token in text
+            .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .filter(|t| !t.is_empty())
+        {
             let (negated, name) = match token.strip_prefix('!') {
                 Some(rest) => (true, rest),
                 None => (false, token),
@@ -213,7 +210,10 @@ pub struct TokenTags {
 impl TokenTags {
     pub fn parse(text: &str) -> Self {
         let mut out = Self::default();
-        for token in text.split([',', ' ', ';']).filter(|t| !t.is_empty()) {
+        for token in text
+            .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .filter(|t| !t.is_empty())
+        {
             let (negated, name) = match token.strip_prefix('!') {
                 Some(rest) => (true, rest),
                 None => (false, token),
@@ -1849,9 +1849,8 @@ mod tests {
         assert!(!t("all, !meme").matches(&doge) && t("all, !meme").matches(&nvda));
         assert!(MarketTags::parse("!all").is_err(), "all has no exclusion");
         assert_eq!(MarketTags::parse("crypto, fx"), Err("fx".to_string()));
-        for name in MarketTags::PICKLIST.split('|') {
-            assert!(MarketTags::parse(name).is_ok(), "{name}");
-        }
+        // Typed into the terminal's text field, a paste may bring a tab or a line break.
+        assert!(t("stock,\tcommodities\n").matches(&nvda));
     }
 
     /// MoonBot's `BinanceTokenTags`: plain tags are «and», `!tag` excludes,

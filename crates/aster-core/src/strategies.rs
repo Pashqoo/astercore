@@ -16,7 +16,6 @@ use moonproto::server::codec::strat::{self, ui, CheckedItem, SchemaField, Snapsh
 use moonproto::{FieldValue, StrategyKind, StrategySchema, StrategySnapshot};
 
 use crate::bvsv;
-use crate::model::MarketTags;
 use crate::screener;
 use crate::strategy_file;
 
@@ -159,18 +158,12 @@ fn schema_fields() -> Vec<SchemaField> {
         f("CoinsWhiteList", s(""), ui::EDIT, Some("Filters")),
         f("CoinsBlackList", s(""), ui::EDIT, None),
         // Classes the screener picks from when the white list is empty —
-        // Aster's taxonomy (`model::Tag`), `!tag` excludes. The combo offers
-        // one class per item (`MarketTags::PICKLIST`) so the editor cannot
-        // misspell a tag; a combination or a `!tag` still parses when a
-        // strategy file carries one. The default is `all`.
-        SchemaField {
-            name: MARKET_TAGS,
-            default: s("all"),
-            ui: ui::COMBO,
-            section: None,
-            picklist: Some(MarketTags::PICKLIST),
-            kinds: &[],
-        },
+        // Aster's taxonomy (`model::Tag`), `!tag` excludes. A text field, not
+        // a combo: the terminal's dropdown picks one item, and a strategy
+        // often wants several classes (`stock, commodities`; trader, 05.10).
+        // A misspelt tag leaves the strategy without markets and names the
+        // known tags in the log. The default is `all`.
+        f(MARKET_TAGS, s("all"), ui::EDIT, None),
         f("MaxPing", Int32(0), ui::EDIT, Some("Filters / Ping")),
         f("PingCooldown", Double(5.0), ui::EDIT, None),
         f(
