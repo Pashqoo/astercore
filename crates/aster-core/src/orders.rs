@@ -3688,6 +3688,7 @@ mod tests {
             maint_margin_percent: 2.5,
             required_margin_percent: 5.0,
             bracket_leverage: None,
+            account_leverage: None,
             liquidation_fee: 0.025,
             trading: true,
             has_sessions: false,

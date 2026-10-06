@@ -43,8 +43,9 @@ const ALIAS_1000: &str = "1000";
 /// Highest leverage this core will ever claim for a market.
 ///
 /// Only a sanity bound on arithmetic over an exchange-reported percent
-/// (`Market::max_leverage`'s estimate). The account's own figure per market comes from
-/// `/fapi/v3/leverageBracket` (`Market::bracket_leverage`) and is not cut by it. Measured 01.10
+/// (`Market::max_leverage`'s estimate). The account's highest figure per market comes from
+/// `/fapi/v3/leverageBracket` (`Market::bracket_leverage`), the one it holds from
+/// `positionRisk` (`Market::account_leverage`); neither is cut by it. Measured 01.10
 /// the catalog implies 2× to 20× and nothing near this.
 const MAX_LEVERAGE: i32 = 125;
 
@@ -307,14 +308,20 @@ pub struct Market {
     pub maint_margin_percent: f64,
     /// Initial margin, percent. The ceiling it implies — `100 /
     /// required_margin_percent`, so 5.0 means 20× — is only an upper bound, not
-    /// this account's leverage: the account's own comes from `/fapi/v3/leverageBracket`
-    /// ([`Market::bracket_leverage`]) and `positionRisk`, which is why this carries the percent
+    /// this account's leverage: the account's highest comes from `/fapi/v3/leverageBracket`
+    /// ([`Market::bracket_leverage`]), the one it holds from `positionRisk`
+    /// ([`Market::account_leverage`]), which is why this carries the percent
     /// rather than a `leverage` field that would read as authoritative.
     pub required_margin_percent: f64,
     /// The highest leverage the account may ask for on this market, from the brackets of
     /// `/fapi/v3/leverageBracket` (the highest `initialLeverage`). `None` until that read lands (or when it never does), and
     /// [`Market::max_leverage`] then falls back on the instrument's own ceiling.
     pub bracket_leverage: Option<i32>,
+    /// The leverage the account holds on this market now, as `positionRisk` states it — the
+    /// engine's account read, through [`Catalog::set_account_leverage`]. `None` before the first
+    /// account read (or with no account at all), or where the exchange did not state it; an
+    /// account withdrawn after failed reads keeps the last figures.
+    pub account_leverage: Option<i32>,
     pub liquidation_fee: f64,
 
     /// `TRADING` right now. The whole of TInvestCore's trading-schedule gate
@@ -435,7 +442,8 @@ impl Market {
             .map(|_| coin)
     }
 
-    /// Highest leverage the market allows: the account's own, from the brackets of
+    /// Highest leverage the market allows: the account's ceiling (not the leverage it holds,
+    /// [`Market::account_leverage`]), from the brackets of
     /// `/fapi/v3/leverageBracket` (the highest `initialLeverage`) ([`Market::bracket_leverage`]) when that read landed, else the
     /// INSTRUMENT's ceiling from its initial-margin percent, below.
     ///
@@ -463,6 +471,15 @@ impl Market {
         // would floor to 4 without it. Same shape as TInvestCore's
         // `max_leverage`, which learnt it on 0.1428 -> 7.
         ((100.0 / p + 1e-9).floor() as i32).clamp(1, MAX_LEVERAGE)
+    }
+
+    /// The leverage `MinLeverage` / `MaxLeverage` judge (Filters / Base): the one the account
+    /// holds on the market, which is the one an order goes in at. The leverage management sets
+    /// it below the brackets' highest where the open interest at the higher ones is spent (a 5x
+    /// table held at 3x, 06.10), so the table's figure would let a floor of 4 through. Without
+    /// an account figure, the market's ceiling ([`Self::max_leverage`]).
+    pub fn filter_leverage(&self) -> i32 {
+        self.account_leverage.unwrap_or_else(|| self.max_leverage())
     }
 
     /// Whether this market can be sized at all.
@@ -1142,6 +1159,15 @@ impl Catalog {
         taken
     }
 
+    /// The leverage the account holds per market ([`Market::account_leverage`]), from an
+    /// account read: every market takes its figure from `leverage`, and one it leaves out has
+    /// none.
+    pub fn set_account_leverage(&mut self, leverage: &std::collections::BTreeMap<String, i32>) {
+        for m in &mut self.markets {
+            m.account_leverage = leverage.get(&m.symbol).copied().filter(|&l| l > 0);
+        }
+    }
+
     /// Merge one `ticker/bookTicker` answer: the top of book per market.
     ///
     /// The answer is the exchange's COMPLETE word on what is quoted, not a
@@ -1459,8 +1485,10 @@ impl Catalog {
 /// - `volume` is the QUOTE turnover (USDT), which is what MoonBot's volume
 ///   filters and the terminal's screener column mean — the base turnover goes
 ///   only into deep-history chart rows (`PLAN.md`, "Объёмы");
-/// - `max_leverage` is the instrument's ceiling derived from the margin
-///   percent, until M2's signed brackets give the account's own figure.
+/// - `max_leverage` is the market's ceiling ([`Market::max_leverage`]): the
+///   account's brackets once read, else the margin percent's. The leverage the
+///   account holds rides in the balance rows, and is what the strategies'
+///   leverage filter judges ([`Market::filter_leverage`]).
 fn spec_of(m: &Market) -> MarketSpec {
     let alias = m.alias_1000();
     MarketSpec {
@@ -1561,6 +1589,7 @@ fn market_of(s: &SymbolInfo) -> Market {
         maint_margin_percent: s.maint_margin_percent,
         required_margin_percent: s.required_margin_percent,
         bracket_leverage: None,
+        account_leverage: None,
         liquidation_fee: s.liquidation_fee,
         trading: s.status == "TRADING",
         has_sessions: has_sessions(&s.channel),
@@ -1704,6 +1733,7 @@ pub(crate) mod fixtures {
             maint_margin_percent: 2.5,
             required_margin_percent: 5.0,
             bracket_leverage: None,
+            account_leverage: None,
             liquidation_fee: 0.025,
             trading: true,
             has_sessions: false,
@@ -1811,6 +1841,7 @@ mod tests {
             maint_margin_percent: 2.5,
             required_margin_percent: 5.0,
             bracket_leverage: None,
+            account_leverage: None,
             liquidation_fee: 0.025,
             trading: true,
             has_sessions: false,

@@ -954,7 +954,8 @@ enum Gate {
     Delta { what: &'static str, hundredths: i64 },
     /// Filters / Volume: `what` turnover of turnover is outside its range.
     Volume { what: &'static str, turnover: i64 },
-    /// Filters / Base: the market's leverage is outside `MinLeverage..MaxLeverage`.
+    /// Filters / Base: the leverage the account holds on the market (else its ceiling,
+    /// [`Market::filter_leverage`]) is outside `MinLeverage..MaxLeverage`.
     Leverage { leverage: i32 },
     /// `GlobalFilterPenalty` after a failed BTC / market filter, until `until`.
     FilterPenalty { until: i64 },
@@ -3379,7 +3380,8 @@ pub enum Metric {
     /// Signed % of the price at the start of a `minutes` window
     /// (`Windows::delta`).
     Delta(i64),
-    /// The market's highest leverage ([`Market::max_leverage`]).
+    /// The leverage the account holds on the market, else its ceiling
+    /// ([`Market::filter_leverage`]).
     Leverage,
     /// The hourly delta of `BTCUSDT`, in %.
     BtcDelta,
@@ -3455,7 +3457,7 @@ impl Check {
             Metric::Leverage => Some(
                 cx.model
                     .at(idx)
-                    .map_or(0.0, |m| f64::from(m.max_leverage())),
+                    .map_or(0.0, |m| f64::from(m.filter_leverage())),
             ),
             Metric::Delta(minutes) => cx
                 .win
@@ -3585,11 +3587,11 @@ impl DeltaFilters {
         // Filters / Base: the market's leverage. `MinLeverage` 1 is MoonBot's
         // default and means every market (a leverage is never under 1), and
         // `MaxLeverage` 0 is «not limited», so neither default makes a check.
-        // The figure is the account's own highest leverage once the brackets
-        // have been read, the instrument's ceiling before (and without an
-        // account), which is what the terminal shows for the market too — so a
-        // market can change sides when the brackets land, and, as for every
-        // filter, a standing entry is not withdrawn for it (`Gate::withdraws`).
+        // The figure is the leverage the account holds on the market
+        // (`Market::filter_leverage`), the one an order goes in at; without an
+        // account figure, the market's ceiling. A market changes sides when the
+        // account's leverage changes, and, as for every filter, a standing entry
+        // is not withdrawn for it (`Gate::withdraws`).
         if !flag("IgnoreBase") {
             let (lo, hi) = (num("MinLeverage"), num("MaxLeverage"));
             if lo.is_finite() && hi.is_finite() && (lo > 1.0 || hi > 0.0) {
@@ -7957,6 +7959,34 @@ mod tests {
         );
         assert!(checks(&[("MinLeverage", Int32(20)), ("IgnoreBase", Bool(true))]).is_none());
         assert!(checks(&[("MinLeverage", Int32(20)), ("IgnoreFilters", Bool(true))]).is_none());
+    }
+
+    /// The corridor judges the leverage the account holds, not the brackets' highest: a 5x
+    /// table held at 3x is under a floor of 4 (06.10), and the table's figure comes back for a
+    /// market the account read does not state.
+    #[test]
+    fn leverage_corridor_judges_the_accounts_leverage_over_the_table() {
+        use FieldValue::Int32;
+        let mut model = model();
+        model.at_mut(1).unwrap().bracket_leverage = Some(5);
+        let held: std::collections::BTreeMap<String, i32> =
+            [(model.at(1).unwrap().symbol.clone(), 3)].into();
+        model.set_account_leverage(&held);
+        let st = strategies(&[("MinLeverage", Int32(4))], true);
+        let min4 = Params::from_snapshot(&st.list()[0], st.schema())
+            .deltas
+            .expect("a floor is a check");
+        let win = Windows::default();
+        {
+            let cx = Ctx::new(&model, &win, 9_000_000_000, None);
+            assert!(matches!(
+                min4.refused(1, &cx),
+                Some((Gate::Leverage { leverage: 3 }, _, _))
+            ));
+        }
+        model.set_account_leverage(&std::collections::BTreeMap::new());
+        let cx = Ctx::new(&model, &win, 9_000_000_000, None);
+        assert!(min4.refused(1, &cx).is_none(), "the table's 5x clears 4");
     }
 
     #[test]

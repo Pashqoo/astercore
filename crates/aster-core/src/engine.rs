@@ -520,6 +520,7 @@ impl CoreHandler {
             self.tg(crate::telegram::Kind::Alarm, format!("⛔ {text}"));
         }
         self.account = Some(account);
+        self.sync_account_leverage();
         self
     }
 
@@ -1023,6 +1024,7 @@ impl CoreHandler {
                             .insert(symbol, (*leverage, now_ms()));
                         if self.account.is_some() {
                             self.hold_confirmed_leverage(now_ms());
+                            self.sync_account_leverage();
                             let payload = self.balance_payload(rand_uid());
                             for s in sessions.iter_mut() {
                                 s.send_encrypted(BALANCE, &payload, true);
@@ -1064,6 +1066,25 @@ impl CoreHandler {
                 let fx = self.orders.reconcile(&Self::held(&a), &self.catalog, now);
                 self.effects(fx, now);
                 self.shots.set_free_balance(Some(a.free));
+                // A confirmed leverage held over an earlier read (`hold_confirmed_leverage`)
+                // gives way to what the exchange states once its hold is over: an unchanged
+                // account sends no `Account` that would bring it, and the leverage filter and
+                // the terminal would keep the held figure.
+                let held = self
+                    .account
+                    .as_ref()
+                    .is_some_and(|acc| acc.leverage != a.leverage);
+                if held {
+                    if let Some(acc) = &mut self.account {
+                        acc.leverage = a.leverage;
+                    }
+                    self.hold_confirmed_leverage(now);
+                    self.sync_account_leverage();
+                    let payload = self.balance_payload(rand_uid());
+                    for s in sessions.iter_mut() {
+                        s.send_encrypted(BALANCE, &payload, true);
+                    }
+                }
             }
             FeedEvent::Account(account) => {
                 // Positions that left the account outside the core close
@@ -1081,6 +1102,7 @@ impl CoreHandler {
                     .set_free_balance(account.as_ref().map(|a| a.free));
                 self.account = account;
                 self.hold_confirmed_leverage(now_ms());
+                self.sync_account_leverage();
                 let payload = self.balance_payload(rand_uid());
                 for s in sessions.iter_mut() {
                     s.send_encrypted(BALANCE, &payload, true);
@@ -3423,6 +3445,16 @@ impl CoreHandler {
             for (symbol, (leverage, _)) in &self.leverage_confirmed {
                 a.leverage.insert(symbol.clone(), *leverage);
             }
+        }
+    }
+
+    /// Hands the account's leverage per market to the catalog, where the strategies' leverage
+    /// filter reads it (`Market::filter_leverage`). An account withdrawn after failed reads
+    /// leaves the last figures standing until the next good read: clearing them would put every
+    /// market on its bracket ceiling for the outage.
+    fn sync_account_leverage(&mut self) {
+        if let Some(a) = &self.account {
+            self.catalog.set_account_leverage(&a.leverage);
         }
     }
 
