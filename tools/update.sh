@@ -109,9 +109,11 @@ state building "$sha" "$build"
 	cd "$SRC"
 	export ASTER_CORE_BUILD=$build ASTER_CORE_COMMIT=$sha
 	started=$SECONDS
-	timeout 1500 cargo build --release -p aster-core || exit 10
+	# --locked: root builds exactly the Cargo.lock of the commit; one out of step with Cargo.toml
+	# is a failed build, never a fresh resolve against crates.io.
+	timeout 1500 cargo build --locked --release -p aster-core || exit 10
 	echo "=== built in $((SECONDS - started)) s"
-	timeout 600 cargo test --release -p aster-core --test loopback || exit 11
+	timeout 600 cargo test --locked --release -p aster-core --test loopback || exit 11
 	echo "=== built and tested in $((SECONDS - started)) s"
 ) >>"$LOG" 2>&1 || case $? in
 	10) fail "build $build failed — $LOG" ;;

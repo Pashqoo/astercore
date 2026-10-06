@@ -147,7 +147,9 @@ sudo systemctl start aster-core
 
 Как это работает: ядро само ничего не собирает. Оно пишет заявку `data/update-request`, а
 служба `aster-core-update` от root (её запускает path-юнит) делает `git fetch`, собирает с
-пониженным приоритетом, прогоняет контрактный тест и кладёт бинарь рядом как `aster-core.next`.
+пониженным приоритетом строго по `Cargo.lock` коммита (`--locked`: лок, разошедшийся с
+`Cargo.toml`, — проваленная сборка, а не новое разрешение зависимостей с crates.io), прогоняет
+контрактный тест и кладёт бинарь рядом как `aster-core.next`.
 Ядро подменяет им себя, как только у него нет позиций (ждёт до 10 минут, потом отменяет), и
 перезапускается (код 70). Старый бинарь остаётся как `aster-core.prev`. Если новое ядро не
 поднялось за 300 с, служба возвращает старый бинарь и перезапускает ядро. Каждый шаг пишется в
@@ -165,7 +167,7 @@ systemctl enable --now aster-core-update.path
 mkdir -p -m 755 /var/lib/aster-core-update
 git clone git@github.com:Pashqoo/astercore.git /var/lib/aster-core-update/src
 cd /var/lib/aster-core-update/src && CARGO_TARGET_DIR=/var/lib/aster-core-update/target \
-  nice -n 15 cargo build --release -p aster-core
+  nice -n 15 cargo build --locked --release -p aster-core
 ```
 
 Журнал обновления — `journalctl -u aster-core-update`, вывод сборки —
