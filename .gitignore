@@ -23,3 +23,6 @@ _doc/STRATEGY_FORMULAS/
 
 # Real host, key id and other local facts behind the placeholders in AGENTS.md
 CLAUDE.local.md
+
+# Working plan: state, measurements and decisions, kept local
+/PLAN.md
