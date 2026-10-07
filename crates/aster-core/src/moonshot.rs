@@ -799,7 +799,8 @@ pub struct MoonShot {
     /// first session, and between sessions): a fill would go unseen, so no
     /// entries anywhere but the emulator's.
     fills_unseen: bool,
-    /// Markets the exchange takes no new positions on (`set_closed_markets`).
+    /// Markets the exchange takes no new positions or no more notional on
+    /// (`set_closed_markets`).
     closed: HashSet<String>,
     /// The core-wide emulator mode (`emu_mode`): every strategy trades in
     /// the emulator, as one with `EmulatorMode` does.
@@ -1101,8 +1102,10 @@ impl MoonShot {
         self.funds.emulator = on;
     }
 
-    /// Markets the exchange refused new positions on (`-4140`/`-4141`), as the engine learned
-    /// them: a real entry is not started there again, instead of failing once a minute.
+    /// Markets the exchange refused new positions on (`-4140`/`-4141`) or more notional at the
+    /// account's leverage (`-5018`, until it is lowered), as the engine learned them: a real
+    /// entry is not started there again, instead of failing once a minute, and a resting one
+    /// is withdrawn (`Gate::NotTrading`) rather than moved into the same refusal every 30 s.
     pub fn set_closed_markets(&mut self, closed: &HashSet<String>) {
         self.closed.clone_from(closed);
     }

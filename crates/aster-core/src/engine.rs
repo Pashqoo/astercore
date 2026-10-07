@@ -97,6 +97,9 @@ const OPEN_ORDERS_RETRY_MS: i64 = 10_000;
 /// How long a market the exchange refused new positions on (`-4140`/`-4141`) stays closed to
 /// the core's own entries.
 const CLOSED_MARKET_MS: i64 = 60 * 60_000;
+/// How long a market the exchange refused for its notional limit (`-5018`) stays paused to the
+/// core's entries when the account's leverage there does not drop below the refused one first.
+const CAPPED_MARKET_MS: i64 = 60 * 60_000;
 /// How often stops, trailing, pending triggers and panic exits are judged
 /// (`Orders::watch`), as TInvestCore did.
 const WATCH_EVERY_MS: i64 = 1_000;
@@ -338,6 +341,10 @@ pub struct CoreHandler {
     /// Markets the exchange takes no new positions on (`-4140`/`-4141` on an
     /// entry), for this run: an entry there is refused by the core.
     closed_markets: HashMap<String, i64>,
+    /// Markets an entry was refused on for the notional limit (`-5018`): when, and the account's
+    /// leverage there at the time (`None`: unknown). Paused to entries until the account holds a
+    /// lower leverage or `CAPPED_MARKET_MS` is over (`market_capped`).
+    capped_markets: HashMap<String, (i64, Option<i32>)>,
     /// The strategy engine, its tick windows and the start of its last pass (monotonic: a stepped
     /// wall clock must not hold the timer); `shots_due` wakes the next one ([`pass_due`]).
     shots: MoonShot,
@@ -452,6 +459,7 @@ impl CoreHandler {
             shutdown_requested: false,
             updater: None,
             closed_markets: HashMap::new(),
+            capped_markets: HashMap::new(),
             shots: MoonShot::default(),
             windows: Windows::default(),
             shots_began: Instant::now(),
@@ -2077,6 +2085,14 @@ impl CoreHandler {
             );
             return self.orders.fail_start(req_uid, s, &reason, now);
         }
+        if !emulated && self.capped_markets.contains_key(&s.market) {
+            let reason = format!(
+                "{}: the exchange refused an entry for its notional limit (-5018): entries wait \
+                 until its leverage is lowered (up to an hour)",
+                s.market
+            );
+            return self.orders.fail_start(req_uid, s, &reason, now);
+        }
         // The strategies judge this themselves (`opposite`); a hand entry against an open
         // position would net it on the exchange (one-way mode) and leave two orders for one.
         if is_manual && self.orders.holds_against(&s.market, s.is_short, emulated) {
@@ -2479,9 +2495,14 @@ impl CoreHandler {
         fx
     }
 
-    /// The markets closed to entries, as the strategies see them.
+    /// The markets closed or paused to entries, as the strategies see them.
     fn sync_closed_markets(&mut self) {
-        let closed: HashSet<String> = self.closed_markets.keys().cloned().collect();
+        let closed: HashSet<String> = self
+            .closed_markets
+            .keys()
+            .chain(self.capped_markets.keys())
+            .cloned()
+            .collect();
         self.shots.set_closed_markets(&closed);
     }
 
@@ -2491,15 +2512,96 @@ impl CoreHandler {
         let before = self.closed_markets.len();
         self.closed_markets
             .retain(|_, at| now - *at < CLOSED_MARKET_MS);
-        if self.closed_markets.len() != before {
+        let capped = self.capped_markets.len();
+        self.capped_markets
+            .retain(|_, (at, _)| now - *at < CAPPED_MARKET_MS);
+        if self.closed_markets.len() != before || self.capped_markets.len() != capped {
             self.sync_closed_markets();
+        }
+    }
+
+    /// `-5018` on an entry: the open interest the exchange allows at the account's leverage on
+    /// the symbol is spent, and every entry there is refused until the leverage is lowered —
+    /// once a minute for hours on WLFIUSDT (07.10), the leverage management unable to lower it
+    /// past the strategies' resting orders. The market is paused to the core's entries until
+    /// the account holds it below the refused leverage (`lift_capped_markets`), and the leverage
+    /// management is asked to lower it now (MoonBot's «Auto Leverage»). Exits and moves of what
+    /// is already open are not touched. A second refusal while paused asks nothing again.
+    fn market_capped(&mut self, action: &Action, msg: &str) -> Effects {
+        let entry = matches!(
+            action,
+            Action::Post { leg: Leg::Buy, .. } | Action::Replace { leg: Leg::Buy, .. }
+        );
+        if !entry || !crate::aster::rest::msg_has_code(msg, crate::setup::CODE_NOTIONAL_LIMIT) {
+            return Effects::default();
+        }
+        let Some(symbol) = self.orders.get(action.order()).map(|o| o.uid.clone()) else {
+            return Effects::default();
+        };
+        if self.capped_markets.contains_key(&symbol) {
+            return Effects::default();
+        }
+        let leverage = self.catalog.get(&symbol).and_then(|m| m.account_leverage);
+        self.capped_markets
+            .insert(symbol.clone(), (now_ms(), leverage));
+        self.sync_closed_markets();
+        let asked = match &self.levman {
+            Some(tx) => tx
+                .send(levman::Msg::Capped {
+                    symbol: symbol.clone(),
+                    leverage,
+                })
+                .is_ok(),
+            None => false,
+        };
+        let at = leverage.map_or_else(|| "its leverage".to_string(), |l| format!("{l}x"));
+        let lowering = if asked {
+            "handed to the leverage management to lower"
+        } else {
+            "no leverage management to lower it"
+        };
+        Effects {
+            logs: vec![format!(
+                "{symbol}: the exchange's notional limit at {at} is reached (-5018) — entries \
+                 paused until its leverage is lowered (up to an hour), {lowering}"
+            )],
+            ..Effects::default()
+        }
+    }
+
+    /// Markets paused by `market_capped` that the account now holds below the refused leverage:
+    /// open to entries again, which the strategies' leverage filter judges from here.
+    fn lift_capped_markets(&mut self) {
+        let catalog = &self.catalog;
+        let mut lifted = Vec::new();
+        self.capped_markets.retain(|symbol, (_, refused)| {
+            let now = catalog.get(symbol).and_then(|m| m.account_leverage);
+            // Refused before the account was read: its first figure is the refused leverage.
+            if refused.is_none() {
+                *refused = now;
+            }
+            let lower = matches!((now, *refused), (Some(n), Some(r)) if n < r);
+            if lower {
+                lifted.push((symbol.clone(), now.unwrap_or_default()));
+            }
+            !lower
+        });
+        if lifted.is_empty() {
+            return;
+        }
+        self.sync_closed_markets();
+        for (symbol, leverage) in lifted {
+            let line = format!("{symbol}: the account holds it at {leverage}x — entries resumed");
+            log::info!("{line}");
+            self.outbox.push((LOG, log_msg(now_ms(), &line)));
         }
     }
 
     /// `-4140` (the symbol is closed) / `-4141` (no new positions on it) on an
     /// entry: the market takes no new entry for an hour (`CLOSED_MARKET_MS`) — the core refuses
-    /// the next one instead of the exchange. Exits, closes and moves of what
-    /// is already open are not touched: a position there still needs them.
+    /// the next one instead of the exchange. Exits and closes of what is already open are not
+    /// touched: a position there still needs them. The strategies withdraw their resting
+    /// entries there (`MoonShot::set_closed_markets`): a moved one is refused the same way.
     fn market_closed(&mut self, action: &Action, msg: &str) -> Effects {
         let entry = matches!(
             action,
@@ -2681,6 +2783,7 @@ impl CoreHandler {
                 }
                 let mut fx = self.orders.failed(&action, definitive, &msg, now);
                 fx.extend(self.market_closed(&action, &msg));
+                fx.extend(self.market_capped(&action, &msg));
                 if !fx.logs.is_empty() || !fx.changed.is_empty() {
                     self.shots.on_failed(order, &msg, now);
                 } else if let Some(halt) = moonshot::rate_halt_ms(&msg) {
@@ -3456,6 +3559,7 @@ impl CoreHandler {
         if let Some(a) = &self.account {
             self.catalog.set_account_leverage(&a.leverage);
         }
+        self.lift_capped_markets();
     }
 
     /// `TBalanceFull` of the last account read: free, locked and equity in

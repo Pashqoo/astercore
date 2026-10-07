@@ -397,6 +397,13 @@ impl FedCore {
     /// The core with an account: the order worker is the returned receiver,
     /// and the order store a fresh file of its own.
     fn trading() -> (Self, Receiver<TradeCommand>) {
+        Self::trading_with(|h| h)
+    }
+
+    /// [`Self::trading`] with more set up on the handler.
+    fn trading_with(
+        more: impl FnOnce(CoreHandler) -> CoreHandler,
+    ) -> (Self, Receiver<TradeCommand>) {
         let (tx, rx) = mpsc::channel();
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -405,7 +412,7 @@ impl FedCore {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let (store, saved) = OrderStore::open(dir.join("orders.json"));
-        let core = Self::start_with(move |h| h.with_orders(store, saved).with_trading(tx));
+        let core = Self::start_with(move |h| more(h.with_orders(store, saved).with_trading(tx)));
         (core, rx)
     }
 
@@ -1721,6 +1728,89 @@ fn an_entry_refused_for_a_closed_market_closes_it_to_entries() {
         post.is_none(),
         "an entry on a closed market reached the worker"
     );
+    let _ = client.disconnect();
+}
+
+/// The exchange's refusal of an entry for the symbol's notional limit at its leverage.
+fn notional_limit_refusal(action: Action) -> FeedEvent {
+    FeedEvent::Trading(TradingEvent::Failed {
+        action,
+        definitive: true,
+        msg: aster_core::aster::rest::Error::Api {
+            status: 400,
+            code: -5018,
+            msg: "You’ve reached the maximum notional value limit for this symbol.".into(),
+        }
+        .to_string(),
+    })
+}
+
+fn account_at(leverage: i32) -> FeedEvent {
+    FeedEvent::Account(Some(Account {
+        free: 1000.0,
+        equity: 1000.0,
+        positions: Vec::new(),
+        leverage: [("BTCUSDT".to_string(), leverage)].into(),
+        isolated: Default::default(),
+    }))
+}
+
+fn posted(orders: &Receiver<TradeCommand>) -> bool {
+    std::iter::from_fn(|| orders.try_recv().ok()).any(|c| {
+        matches!(
+            c,
+            TradeCommand::Exchange {
+                action: Action::Post { .. },
+                ..
+            }
+        )
+    })
+}
+
+/// `-5018` on an entry (WLFIUSDT, 07.10: refused once a minute for hours at 5x): the market
+/// takes no entry of the core's until the account holds it below the leverage refused.
+#[test]
+fn an_entry_refused_for_the_notional_limit_pauses_the_market_until_the_leverage_drops() {
+    let (lev_tx, lev_rx) = mpsc::channel();
+    let lev_file = std::env::temp_dir().join(format!("astercore-lev-{}", std::process::id()));
+    let (core, orders) =
+        FedCore::trading_with(move |h| h.with_levman(lev_file, None, Some(lev_tx)));
+    let client = core.connect();
+    core.ev_tx.send(account_at(5)).unwrap();
+    let entry = || {
+        client
+            .trade()
+            .new_order(moonproto::NewOrderParams::new(
+                "BTCUSDT",
+                moonproto::OrderSide::Long,
+                83_000.0,
+                100.0,
+            ))
+            .expect("sent");
+    };
+    entry();
+    let post = next_action(&orders);
+    core.ev_tx.send(notional_limit_refusal(post)).unwrap();
+    assert!(log_line(&client, "notional limit at 5x"));
+    match lev_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(aster_core::levman::Msg::Capped { symbol, leverage }) => {
+            assert_eq!((symbol.as_str(), leverage), ("BTCUSDT", Some(5)));
+        }
+        _ => panic!("the leverage management was not asked to lower the market"),
+    }
+    entry();
+    assert!(log_line(&client, "until its leverage is lowered"));
+    assert!(
+        !posted(&orders),
+        "an entry on a capped market reached the worker"
+    );
+    // A second refusal while paused asks nothing again.
+    assert!(lev_rx.try_recv().is_err());
+    // The account now holds the market lower: entries go to the exchange again.
+    core.ev_tx.send(account_at(3)).unwrap();
+    assert!(log_line(&client, "entries resumed"));
+    entry();
+    assert!(matches!(next_action(&orders), Action::Post { .. }));
     let _ = client.disconnect();
 }
 

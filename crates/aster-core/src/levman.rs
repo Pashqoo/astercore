@@ -19,6 +19,13 @@
 //! a resting order is never touched (`setup::plan_for`): the exchange refuses a margin change
 //! there, and a leverage change would move the liquidation of a live position.
 //!
+//! An entry the exchange refuses for the symbol's notional limit (`-5018`, `Msg::Capped`) is
+//! MoonBot's «Auto Leverage»: that market is lowered at once, below the leverage refused, past
+//! the strategies' resting orders (the exchange refuses a margin change there, not a leverage
+//! one: `-4047` is the margin type's), and no pass raises it back to the refused leverage for
+//! [`CAP_HOLD`] — the site's figures put WLFIUSDT back on 5x two hours after it was lowered off
+//! it (07.10), and the strategies were refused there again.
+//!
 //! Every pass reads the account itself (positions, orders, brackets, the market list: a
 //! market listed since the last pass is seen), on a thread of its own with its own client, and
 //! sends one call at a time (`setup::apply`).
@@ -50,6 +57,15 @@ const PERIOD: Duration = Duration::from_secs(3600);
 /// [`OI_TTL`], so the figures the short pass did read are not asked for again. It doubles with
 /// each short pass in a row, up to [`PERIOD`]: a ban or an outage is not probed every 5 min.
 const RETRY: Duration = Duration::from_secs(300);
+
+/// How long a market refused for its notional limit (`Msg::Capped`) is kept below the leverage
+/// refused.
+const CAP_HOLD: Duration = Duration::from_secs(24 * 3600);
+
+/// How soon a `-5018` pass that could not read the account, or was stopped by a rate limit, is
+/// made again: doubled while they keep falling short, up to [`PERIOD`] — a ban or an outage is
+/// not read into once a minute.
+const CAPPED_RETRY: Duration = Duration::from_secs(60);
 
 /// One position-limit rule of the Config line: a limit for the markets its token names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +351,13 @@ pub type Shared = Arc<Mutex<Last>>;
 pub enum Msg {
     /// The terminal (or the page's Leverage tab) applied these settings: act at once.
     Config(Config),
+    /// The exchange refused an entry on `symbol` for its notional limit (`-5018`) at `leverage`
+    /// (the account's figure the engine held; `None`: the worker reads it): lower it now, and
+    /// keep it below that for [`CAP_HOLD`].
+    Capped {
+        symbol: String,
+        leverage: Option<i32>,
+    },
 }
 
 /// Markets handled between two reads of the account: a position or an order that appears during
@@ -367,20 +390,33 @@ pub fn start(rest: Rest, signer: Signer, initial: Option<Config>, status: Shared
         oi_cache: HashMap::new(),
         short_passes: 0,
         clock_at: None,
+        caps: HashMap::new(),
+        capped: Vec::new(),
+        capped_retry_at: None,
+        capped_fails: 0,
     };
     thread::Builder::new()
         .name("aster-levman".into())
         .spawn(move || {
-            let mut why = "start";
+            let mut why = Some("start");
+            let mut due = Instant::now();
             loop {
-                if worker.config.is_some() {
+                if worker.capped_due() {
+                    let run = panic::catch_unwind(AssertUnwindSafe(|| worker.capped_pass()));
+                    if run.is_err() {
+                        worker.capped.clear();
+                        worker.capped_retry_at = None;
+                        log::error!("leverage: a -5018 pass panicked");
+                    }
+                }
+                if let Some(reason) = why.take().filter(|_| worker.config.is_some()) {
                     // A pass that panics is lost, not the thread: the next hour tries again.
-                    let run = panic::catch_unwind(AssertUnwindSafe(|| worker.pass(why, &rx)));
+                    let run = panic::catch_unwind(AssertUnwindSafe(|| worker.pass(reason, &rx)));
                     match run {
                         // New settings came in during the pass: it was dropped, they go first.
                         Ok(Some(newer)) => {
                             worker.config = Some(newer);
-                            why = "applied";
+                            why = Some("applied");
                             continue;
                         }
                         Ok(None) => {}
@@ -394,14 +430,31 @@ pub fn start(rest: Rest, signer: Signer, initial: Option<Config>, status: Shared
                             last.stopped = Some("the pass panicked".into());
                         }
                     }
+                    due = Instant::now() + next_pass(worker.short_passes).0;
                 }
-                let (wait, next) = next_pass(worker.short_passes);
-                match rx.recv_timeout(wait) {
-                    Ok(Msg::Config(c)) => {
-                        worker.config = Some(newest(&rx, c));
-                        why = "applied";
+                // A `-5018` that came during the pass is acted on now.
+                if worker.capped_due() {
+                    continue;
+                }
+                // A `-5018` pass in between does not move the next pass nobody asked for; one
+                // to be made again wakes the worker sooner.
+                let wake = match worker.capped_retry_at.filter(|_| !worker.capped.is_empty()) {
+                    Some(retry) => retry.min(due),
+                    None => due,
+                };
+                match rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
+                    Ok(msg) => {
+                        if let Some(c) = take(&mut worker.capped, msg) {
+                            worker.config = Some(newest(&rx, c, &mut worker.capped));
+                            why = Some("applied");
+                        }
                     }
-                    Err(RecvTimeoutError::Timeout) => why = next,
+                    Err(RecvTimeoutError::Timeout) if Instant::now() >= due => {
+                        why = Some(next_pass(worker.short_passes).1);
+                        due = Instant::now() + next_pass(worker.short_passes).0;
+                    }
+                    // The `-5018` retry is due, not the pass.
+                    Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
@@ -422,14 +475,6 @@ fn next_pass(short: u32) -> (Duration, &'static str) {
     }
 }
 
-/// Only the last of several queued settings counts.
-fn newest(rx: &Receiver<Msg>, mut config: Config) -> Config {
-    while let Ok(Msg::Config(newer)) = rx.try_recv() {
-        config = newer;
-    }
-    config
-}
-
 struct Worker {
     rest: Rest,
     signer: Signer,
@@ -448,9 +493,157 @@ struct Worker {
     /// When the clock was last measured: it is measured again only past
     /// [`CLOCK_EVERY`](crate::account::CLOCK_EVERY), as every other thread does.
     clock_at: Option<Instant>,
+    /// Markets refused for their notional limit: since when, and the leverage refused, which no
+    /// pass sets them at or above for [`CAP_HOLD`] ([`capped_want`]).
+    caps: HashMap<String, (Instant, i32)>,
+    /// `Msg::Capped` not acted on yet: the next [`Self::capped_pass`] lowers them.
+    capped: Vec<(String, Option<i32>)>,
+    /// When a `-5018` pass that fell short is made again ([`CAPPED_RETRY`]).
+    capped_retry_at: Option<Instant>,
+    /// `-5018` passes in a row that fell short.
+    capped_fails: u32,
+}
+
+/// Settings returned for the caller to take; a `-5018` is queued in `capped` for
+/// [`Worker::capped_pass`].
+fn take(capped: &mut Vec<(String, Option<i32>)>, msg: Msg) -> Option<Config> {
+    match msg {
+        Msg::Config(c) => Some(c),
+        Msg::Capped { symbol, leverage } => {
+            capped.push((symbol, leverage));
+            None
+        }
+    }
+}
+
+/// The last of the settings that arrived since the last look, if any; a `-5018` among them is
+/// queued, not dropped.
+fn arrived(rx: &Receiver<Msg>, capped: &mut Vec<(String, Option<i32>)>) -> Option<Config> {
+    let mut newer = None;
+    while let Ok(msg) = rx.try_recv() {
+        if let Some(c) = take(capped, msg) {
+            newer = Some(c);
+        }
+    }
+    newer
+}
+
+/// Only the last of several queued settings counts.
+fn newest(rx: &Receiver<Msg>, config: Config, capped: &mut Vec<(String, Option<i32>)>) -> Config {
+    arrived(rx, capped).unwrap_or(config)
 }
 
 impl Worker {
+    /// A `-5018` is waiting and not held back by a retry still to come.
+    fn capped_due(&self) -> bool {
+        !self.capped.is_empty() && self.capped_retry_at.is_none_or(|at| Instant::now() >= at)
+    }
+
+    /// The refused leverage of every `-5018` waiting, held at once — a pass running now does
+    /// not raise those markets back before [`Self::capped_pass`] lowers them. The lower figure
+    /// stands: the engine's can be older than a lowering made since.
+    fn note_caps(&mut self) {
+        let now = Instant::now();
+        for (symbol, leverage) in &self.capped {
+            let Some(l) = *leverage else { continue };
+            self.caps
+                .entry(symbol.clone())
+                .and_modify(|(at, held)| {
+                    *at = now;
+                    *held = (*held).min(l);
+                })
+                .or_insert((now, l));
+        }
+    }
+
+    /// The markets of `Msg::Capped`, lowered below the leverage refused at once, their resting
+    /// orders notwithstanding; an open position still holds a market as it is. With the
+    /// leverage management off nothing is changed: MoonBot's «Auto Leverage» is its own box, and
+    /// the core has none.
+    fn capped_pass(&mut self) {
+        self.capped_retry_at = None;
+        // With the leverage management off nothing is held either: turned on later, it would
+        // keep a market below a figure this pass said it left alone.
+        if self.config.as_ref().is_some_and(Config::is_active) {
+            self.note_caps();
+        }
+        let mut asked = std::mem::take(&mut self.capped);
+        let mut seen = HashSet::new();
+        asked.retain(|(s, _)| seen.insert(s.clone()));
+        let names = asked
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let Some(config) = self.config.clone().filter(Config::is_active) else {
+            log::info!(
+                "leverage: -5018 on {names}: the leverage management is off, the leverage is left \
+                 as it is"
+            );
+            return;
+        };
+        // The room the site showed at the refused leverage is what just ran out. A refused
+        // leverage the engine did not know is read from the account (`plans`).
+        for (symbol, _) in &asked {
+            self.oi_cache.remove(symbol);
+        }
+        let limits = (config.auto_max_order && !config.limits.is_empty()).then_some(&config.limits);
+        let (markets, brackets) = match self.markets_and_brackets(limits) {
+            Ok(read) => read,
+            Err(e) => {
+                log::warn!("leverage: -5018 on {names}: not lowered, made again later: {e}");
+                self.retry_capped(asked);
+                return;
+            }
+        };
+        let chunk: Vec<(String, String)> = markets
+            .into_iter()
+            .filter(|(s, _)| seen.contains(s))
+            .collect();
+        let plans = match self.plans(&config, &chunk, &brackets, true) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("leverage: -5018 on {names}: not lowered, made again later: {e}");
+                self.retry_capped(asked);
+                return;
+            }
+        };
+        let report = setup::apply(&mut self.rest, &mut self.signer, &plans);
+        let untouched = plans.iter().filter(|p| p.is_noop()).count();
+        log::info!(
+            "leverage: -5018 on {names}: leverage set {}, nothing lower to set {untouched}, left \
+             alone {}, failed {}{}",
+            report.leverage_set,
+            report.skipped.len(),
+            report.failed.len(),
+            report
+                .aborted
+                .as_ref()
+                .map_or(String::new(), |a| format!(", stopped: {a}")),
+        );
+        for (symbol, reason) in report.skipped.iter().chain(&report.failed) {
+            log::info!("leverage: {symbol}: {reason}");
+        }
+        // A rate limit stopped it: what was not sent is sent later.
+        if report.aborted.is_some() {
+            self.retry_capped(asked);
+        } else {
+            self.capped_fails = 0;
+        }
+    }
+
+    /// `asked` queued again, [`CAPPED_RETRY`] (doubled per short pass in a row) from now, ahead
+    /// of what came meanwhile.
+    fn retry_capped(&mut self, mut asked: Vec<(String, Option<i32>)>) {
+        asked.append(&mut self.capped);
+        self.capped = asked;
+        self.capped_fails += 1;
+        let wait = CAPPED_RETRY
+            .saturating_mul(1 << (self.capped_fails - 1).min(8))
+            .min(PERIOD);
+        self.capped_retry_at = Some(Instant::now() + wait);
+    }
+
     /// One pass over every trading market. The brackets and the market list are read once, the
     /// positions and orders before each chunk of [`CHUNK`] markets, whose plan is made from that
     /// read and sent at once. Settings that arrive meanwhile end the pass and are returned.
@@ -496,8 +689,13 @@ impl Worker {
             .count();
         let mut total = setup::Report::default();
         let mut stopped = None;
+        let now = Instant::now();
+        self.caps
+            .retain(|_, (at, _)| now.duration_since(*at) < CAP_HOLD);
         for chunk in markets.chunks(CHUNK) {
-            if let Ok(Msg::Config(c)) = rx.try_recv() {
+            let newer = arrived(rx, &mut self.capped);
+            self.note_caps();
+            if let Some(c) = newer {
                 log::info!(
                     "leverage: {why}: new settings arrived, the pass is dropped after {} markets \
                      (margin set {}, leverage set {}, failed {})",
@@ -510,9 +708,9 @@ impl Worker {
                 last.stopped = Some("dropped: new settings arrived".into());
                 Self::fill(&mut last, &total);
                 self.publish(last);
-                return Some(newest(rx, c));
+                return Some(newest(rx, c, &mut self.capped));
             }
-            let plans = match self.plans(&config, chunk, &brackets) {
+            let plans = match self.plans(&config, chunk, &brackets, false) {
                 Ok(p) => p,
                 Err(e) => {
                     log::warn!("leverage: {why}: stopped after {} markets: {e}", last.read);
@@ -710,12 +908,14 @@ impl Worker {
         Ok((markets, brackets))
     }
 
-    /// The plan of one chunk of markets, from the account as it is read now.
+    /// The plan of one chunk of markets, from the account as it is read now. `capped`: the
+    /// markets of a `-5018` ([`Self::capped_pass`]), only lowered, resting orders or not.
     fn plans(
         &mut self,
         config: &Config,
         chunk: &[(String, String)],
         brackets: &HashMap<String, SymbolBrackets>,
+        capped: bool,
     ) -> Result<Vec<setup::Plan>, String> {
         let err = |what: &'static str| move |e| format!("{what}: {e}");
         // A pass is minutes of writes: the clock is looked at again for every chunk, and
@@ -788,15 +988,36 @@ impl Worker {
             .map(|(symbol, base)| {
                 let site = oi.get(symbol.as_str()).map(Vec::as_slice);
                 let wanted = managed(symbol, base) && feed;
-                let want = config.want(
+                let mut want = config.want(
                     symbol,
                     base,
                     brackets.get(symbol),
                     wanted.then(|| site.unwrap_or(&[])),
                 );
                 let row = by_symbol.get(symbol.as_str()).copied();
-                let mut plan =
-                    setup::plan_for(symbol, row, &want, ordered.contains(symbol.as_str()));
+                // A `-5018` whose leverage the engine did not know: the account's is the one
+                // refused.
+                if capped && !self.caps.contains_key(symbol.as_str()) {
+                    if let Some(l) = row.and_then(|r| r.leverage) {
+                        self.caps.insert(symbol.clone(), (Instant::now(), l));
+                    }
+                }
+                let cap = self.caps.get(symbol.as_str()).map(|&(_, l)| l);
+                if let Some(refused) = cap {
+                    want = capped_want(want, brackets.get(symbol), refused);
+                }
+                // Only lowered, and so past a resting order: the exchange refuses the margin
+                // type there, not the leverage. A market whose refused leverage is unknown is
+                // left alone.
+                if capped {
+                    want.margin = None;
+                    want.raise = false;
+                    if cap.is_none() {
+                        want.leverage = None;
+                    }
+                }
+                let resting = ordered.contains(symbol.as_str()) && !capped;
+                let mut plan = setup::plan_for(symbol, row, &want, resting);
                 // The table can promise more than the exchange gives (-5018): a raise has the
                 // lower brackets to fall back on, never below the leverage the market has.
                 // A row that does not state its leverage gets no ladder: there is no floor to keep.
@@ -811,6 +1032,20 @@ impl Worker {
             })
             .collect())
     }
+}
+
+/// `want` kept below the leverage the exchange refused an entry at (`-5018`): at most the
+/// highest bracket leverage under it, which a market without its own target is lowered to. With
+/// no bracket under it there is nothing lower to set, and nothing at or above it is.
+fn capped_want(want: Want, brackets: Option<&SymbolBrackets>, refused: i32) -> Want {
+    let ceiling = brackets.and_then(|b| b.leverages_between(None, refused).first().copied());
+    let leverage = match (want.leverage, ceiling) {
+        (Some(l), Some(c)) => Some(l.min(c)),
+        (None, Some(c)) => Some(c),
+        (Some(l), None) => (l < refused).then_some(l),
+        (None, None) => None,
+    };
+    Want { leverage, ..want }
 }
 
 #[cfg(test)]
@@ -931,6 +1166,49 @@ mod tests {
         assert_eq!(b.leverages_between(Some(15), 75), vec![50, 25]);
         assert_eq!(b.leverages_between(None, 50), vec![25, 15]);
         assert!(b.leverages_between(Some(50), 75).is_empty());
+    }
+
+    /// `-5018` at 5x on a 5/4/3 table: no pass sets 5x again, a target above the next bracket
+    /// down is held to it, and a market without a target of its own is lowered to it.
+    #[test]
+    fn a_market_refused_for_its_notional_limit_is_kept_below_the_refused_leverage() {
+        let b = brackets(&[(5, 5_000.0), (4, 10_000.0), (3, 50_000.0)]);
+        let want = |leverage| Want {
+            leverage,
+            raise: true,
+            ..Want::default()
+        };
+        assert_eq!(capped_want(want(Some(5)), Some(&b), 5).leverage, Some(4));
+        assert_eq!(capped_want(want(Some(3)), Some(&b), 5).leverage, Some(3));
+        assert_eq!(capped_want(want(None), Some(&b), 5).leverage, Some(4));
+        assert!(
+            capped_want(want(None), Some(&b), 5).raise,
+            "the rest of the wish stands"
+        );
+        // The table's lowest refused: nothing lower to set, nothing at it either.
+        assert_eq!(capped_want(want(Some(3)), Some(&b), 3).leverage, None);
+        assert_eq!(capped_want(want(None), None, 5).leverage, None);
+    }
+
+    /// A `-5018` that comes in with or behind new settings is queued, not swallowed by the
+    /// reads that look for the settings.
+    #[test]
+    fn a_notional_refusal_among_new_settings_is_kept() {
+        let (tx, rx) = mpsc::channel();
+        let capped_msg = |s: &str| Msg::Capped {
+            symbol: s.into(),
+            leverage: Some(5),
+        };
+        tx.send(capped_msg("WLFIUSDT")).unwrap();
+        tx.send(Msg::Config(cfg("5000 def"))).unwrap();
+        tx.send(capped_msg("NEARUSDT")).unwrap();
+        let mut capped = Vec::new();
+        assert!(arrived(&rx, &mut capped).is_some());
+        let names: Vec<&str> = capped.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(names, ["WLFIUSDT", "NEARUSDT"]);
+        tx.send(capped_msg("ORCAUSDT")).unwrap();
+        newest(&rx, cfg("0 def"), &mut capped);
+        assert_eq!(capped.len(), 3);
     }
 
     #[test]
