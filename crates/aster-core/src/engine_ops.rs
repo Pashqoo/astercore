@@ -394,7 +394,7 @@ impl CoreHandler {
                 log::warn!("{why}");
                 self.tg(telegram::Kind::Lifecycle, format!("⚠️ {why}"));
                 let text = format!("{} {why}", update::REFUSED);
-                self.outbox.push((LOG, log_msg(now, &text)));
+                self.signals.push(log_msg(now, &text));
             }
             update::Step::Restart(text) => {
                 log::info!("{text}");

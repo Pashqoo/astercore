@@ -108,6 +108,9 @@ const UI: u8 = Command::UI.to_byte();
 const ORDER: u8 = Command::Order.to_byte();
 const BALANCE: u8 = Command::Balance.to_byte();
 const LOG: u8 = Command::LogMsg.to_byte();
+/// `TLogSubscribeCommand`, UI cmd 49: one byte, the client's server log on or off. Read here and
+/// not in the vendored codec, which is not edited for it.
+const CMD_LOG_SUBSCRIBE: u8 = 49;
 const TRADES: u8 = Command::TradesStream.to_byte();
 const TRADES_RESEND: u8 = Command::TradesResendResponse.to_byte();
 const ORDER_BOOK: u8 = Command::OrderBook.to_byte();
@@ -278,6 +281,10 @@ pub struct CoreHandler {
     /// The core-wide tape packetizer, broadcast to `trade_subs`.
     trades: TradesStream,
     trade_subs: HashSet<u64>,
+    /// Clients that asked for no server log (BaseCheck's log flag, `TLogSubscribeCommand`). The
+    /// log is on by default; it goes on again when the client asks or its session closes. The
+    /// replies to the client's own command are not journal and reach it either way.
+    logs_off: HashSet<u64>,
     /// Books each client shows, and their union as last sent to the feed.
     book_subs: HashMap<u64, BTreeSet<u16>>,
     feed_books: BTreeSet<u16>,
@@ -323,8 +330,13 @@ pub struct CoreHandler {
     /// Exchange work of the last effects, sent by `pump` after one snapshot
     /// of the whole batch (`flush_actions`), with the market it is on.
     pending_actions: Vec<(Action, String)>,
-    /// Messages for every session (order images, log lines), sent by `pump`.
+    /// Messages for every session (order images, log lines), sent by `pump`. A log line here is
+    /// journal: it skips the sessions in [`Self::logs_off`].
     outbox: Vec<(u8, Vec<u8>)>,
+    /// Log lines the terminal reads as a signal and not as journal — the update's outcome
+    /// (`update::REFUSED`). Sent by `pump` to every session, whatever its log choice: a terminal
+    /// that turned the log off still has to learn that the build it asked for is not coming.
+    signals: Vec<Vec<u8>>,
     /// When `Orders::watch` last ran.
     watch_at: i64,
     /// When to read the account's open orders (`TradeCommand::OpenOrders`).
@@ -427,6 +439,7 @@ impl CoreHandler {
             feed: None,
             trades: TradesStream::new(now_ms),
             trade_subs: HashSet::new(),
+            logs_off: HashSet::new(),
             book_subs: HashMap::new(),
             feed_books: BTreeSet::new(),
             books: HashMap::new(),
@@ -452,6 +465,7 @@ impl CoreHandler {
             orders_lost: None,
             pending_actions: Vec::new(),
             outbox: Vec::new(),
+            signals: Vec::new(),
             watch_at: 0,
             open_orders_due: None,
             manual: ui::ManualDefaults::default(),
@@ -821,8 +835,16 @@ impl CoreHandler {
             self.outbox.push((ORDER, snapshot));
         }
         for (channel, payload) in std::mem::take(&mut self.outbox) {
-            for s in sessions.iter_mut() {
+            for s in sessions
+                .iter_mut()
+                .filter(|s| channel != LOG || !self.logs_off.contains(&s.client_id()))
+            {
                 s.send_encrypted(channel, &payload, true);
+            }
+        }
+        for payload in std::mem::take(&mut self.signals) {
+            for s in sessions.iter_mut() {
+                s.send_encrypted(LOG, &payload, true);
             }
         }
         if let Some(packet) = self.trades.poll(Instant::now()) {
@@ -1242,8 +1264,23 @@ impl CoreHandler {
         }
     }
 
+    /// Turn the server log on or off for one client.
+    fn set_logs(&mut self, client: u64, on: bool) {
+        let changed = if on {
+            self.logs_off.remove(&client)
+        } else {
+            self.logs_off.insert(client)
+        };
+        if changed {
+            log::info!(
+                "client {client:#x}: server log {}",
+                if on { "on" } else { "off" }
+            );
+        }
+    }
+
     fn server_info(&self) -> Vec<u8> {
-        engine::write_server_info(&ServerInfo {
+        let mut out = engine::write_server_info(&ServerInfo {
             bot_id: self.bot_id,
             server_name: SERVER_NAME,
             exchange_code: EXCHANGE_CODE,
@@ -1253,7 +1290,13 @@ impl CoreHandler {
             base_currency_code: QUOTE_CODE,
             server_version: SERVER_VERSION,
             moonproto_version: i32::from(moonproto::server::codec::PROTO_CMD_VER),
-        })
+        });
+        // 11. `version_suffix`, empty: a release build. The terminal tells a new build from the
+        // old one by it when the version number stays; ours grows with every commit
+        // (`update::BUILD`), so there is no letter to report. Written here and not by the
+        // vendored writer, which stops at field 10 and is not edited (u16 length, no bytes).
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
     }
 
     fn on_api(&mut self, session: &mut Session, payload: &[u8]) {
@@ -1401,7 +1444,12 @@ impl CoreHandler {
                 }
                 return;
             }
-            EngineMethod::BaseCheck => self.server_info(),
+            EngineMethod::BaseCheck => {
+                if let Some(on) = base_check_logs(&req.params) {
+                    self.set_logs(client, on);
+                }
+                self.server_info()
+            }
             EngineMethod::AuthCheck => engine::write_auth_check(&self.account_id, MAX_PAYLOAD),
             EngineMethod::GetMarketsList => engine::write_markets_list(&self.catalog.specs()),
             // With funding: the catalog row carried it once per session, and
@@ -1528,7 +1576,13 @@ impl CoreHandler {
                     Ok(text) => {
                         log::info!("{text}");
                         self.tg(crate::telegram::Kind::Lifecycle, format!("🔄 {text}"));
-                        self.outbox.push((LOG, log_msg(now, &text)));
+                        let line = log_msg(now, &text);
+                        // Journal for the other terminals, and the answer to this one's own
+                        // command: it hears it with its log off, as it would the refusal.
+                        if self.logs_off.contains(&session.client_id()) {
+                            session.send_encrypted(LOG, &line, true);
+                        }
+                        self.outbox.push((LOG, line));
                     }
                     Err(why) => {
                         let text = format!("{} update refused: {why}", update::REFUSED);
@@ -1599,6 +1653,10 @@ impl CoreHandler {
                     true,
                 );
             }
+            CMD_LOG_SUBSCRIBE => match payload.get(BASE_HEADER_SIZE) {
+                Some(&on) => self.set_logs(session.client_id(), on != 0),
+                None => log::debug!("UI cmd {CMD_LOG_SUBSCRIBE}: no flag"),
+            },
             other => log::debug!("UI cmd {other} ignored"),
         }
     }
@@ -2343,7 +2401,7 @@ impl CoreHandler {
 
     /// Nothing waits in the outbox for the sessions.
     pub fn outbox_empty(&self) -> bool {
-        self.outbox.is_empty()
+        self.outbox.is_empty() && self.signals.is_empty()
     }
 
     /// The last thing the core does: the orders on disk for the next start.
@@ -3653,11 +3711,23 @@ impl Handler for CoreHandler {
         // Its subscriptions go with it: a book nobody shows is a session the
         // feed keeps open for nothing.
         self.trade_subs.remove(&client_id);
+        self.logs_off.remove(&client_id);
         self.book_subs.remove(&client_id);
         self.candle_subs.remove(&client_id);
         self.candles_pending.remove(&client_id);
         self.sync_feed_subscriptions();
     }
+}
+
+/// The server log choice a BaseCheck carries: its params start with a `u32` presence mask, and
+/// bit 0 is followed by one boolean. No mask, the bit unset or the flag missing leave the
+/// client's log as it is — what an older client sends.
+fn base_check_logs(params: &[u8]) -> Option<bool> {
+    let mask = u32::from_le_bytes(params.get(..4)?.try_into().ok()?);
+    if mask & 1 == 0 {
+        return None;
+    }
+    params.get(4).map(|&on| on != 0)
 }
 
 /// Unix milliseconds, UTC — the core's one clock.
@@ -3735,6 +3805,27 @@ fn action_leg(a: &Action) -> Leg {
         | Action::Replace { leg, .. }
         | Action::Query { leg, .. }
         | Action::QueryRequest { leg, .. } => *leg,
+    }
+}
+
+#[cfg(test)]
+mod base_check_logs_tests {
+    use super::*;
+
+    #[test]
+    fn the_log_flag_is_read_only_where_the_mask_says_it_is() {
+        // What the client sends: mask 1 and the flag (`engine_request::base_check`).
+        assert_eq!(base_check_logs(&[1, 0, 0, 0, 1]), Some(true));
+        assert_eq!(base_check_logs(&[1, 0, 0, 0, 0]), Some(false));
+        // An identity refresh after a core restart sends the mask alone, an older client nothing.
+        assert_eq!(base_check_logs(&[0, 0, 0, 0]), None);
+        assert_eq!(base_check_logs(&[]), None);
+        // A flag the mask does not announce is not read, nor a missing or cut one.
+        assert_eq!(base_check_logs(&[0, 0, 0, 0, 1]), None);
+        assert_eq!(base_check_logs(&[1, 0, 0, 0]), None);
+        assert_eq!(base_check_logs(&[1, 0]), None);
+        // Later fields ride above bit 0 and are no business of the log flag.
+        assert_eq!(base_check_logs(&[3, 0, 0, 0, 1, 9, 9]), Some(true));
     }
 }
 

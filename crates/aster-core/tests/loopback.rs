@@ -148,12 +148,18 @@ impl Core {
 
 /// The terminal's own client, walked to `Ready` against the core behind `key`.
 fn connect(key: &ServerKey) -> MoonClient {
+    connect_logs(key, true)
+}
+
+/// [`connect`] with the server log on or off from Init (BaseCheck's log flag).
+fn connect_logs(key: &ServerKey, subscribe_logs: bool) -> MoonClient {
     let cfg = ClientConfig::new("127.0.0.1", key.port, key.master_key, key.mac_key)
         .with_transport_mode(key.transport_mode);
     let init = InitConfig {
         // The terminal arrives with its own strategy list; an empty one is
         // the first-run case and the one M0 has to survive.
         initial_strategies: Some(InitialStrategies::new(0, Vec::new())),
+        subscribe_logs,
         ..Default::default()
     };
     MoonClient::connect_blocking(
@@ -1047,6 +1053,80 @@ fn a_start_without_an_account_comes_back_as_buy_fail_with_its_reason() {
     );
 
     let _ = client.disconnect();
+}
+
+/// The server log is the client's to turn off (BaseCheck's flag at Init, `TLogSubscribeCommand`
+/// after): a journal line skips the client that turned it off and reaches the one that did not,
+/// and it reaches the first again once it turns the log back on. BaseCheck reports the build as a
+/// release (`version_suffix` empty), and Ping gives the client the core's clock, which is UTC.
+#[test]
+fn the_server_log_is_off_for_the_client_that_asked_and_on_again_when_it_asks() {
+    let core = FedCore::start();
+    let loud = core.connect();
+    let quiet = connect_logs(&core.key, false);
+    let needle = "trading is off";
+    let start = |client: &MoonClient| {
+        client
+            .trade()
+            .new_order(moonproto::NewOrderParams::new(
+                "BTCUSDT",
+                moonproto::OrderSide::Long,
+                80_000.0,
+                50.0,
+            ))
+            .expect("the order request itself is sent");
+    };
+    let lines = |client: &MoonClient| {
+        client
+            .drain_events()
+            .into_iter()
+            .filter(|e| matches!(e, Event::ServerLog(l) if l.msg.contains(needle)))
+            .count()
+    };
+
+    assert_eq!(
+        quiet
+            .server_info()
+            .and_then(|i| i.version_suffix)
+            .as_deref(),
+        Some(""),
+        "a release build, not an unknown one"
+    );
+    assert!(!quiet.active_subscriptions().server_logs);
+
+    // The refused Start is journal, sent from `pump` to every session at once.
+    start(&loud);
+    assert!(
+        log_line(&loud, needle),
+        "the client with the log on hears it"
+    );
+    // The same fan-out carried both; give the quiet one the loud one's whole wait again.
+    let mut heard = 0;
+    wait_until(Duration::from_secs(1), || {
+        heard += lines(&quiet);
+        false
+    });
+    assert_eq!(
+        heard, 0,
+        "the client that turned the log off at Init does not"
+    );
+
+    quiet.settings().set_logs_subscription(true).unwrap();
+    let back = wait_until(Duration::from_secs(10), || {
+        start(&loud);
+        wait_until(Duration::from_millis(500), || lines(&quiet) > 0)
+    });
+    assert!(back, "the log comes back once the client asks for it");
+
+    let clock = quiet.server_clock().expect("a Ping has arrived by now");
+    assert!(
+        clock.server_time_delta_ms().abs() < 2_000,
+        "the core's clock is UTC: {} ms",
+        clock.server_time_delta_ms()
+    );
+
+    let _ = quiet.disconnect();
+    let _ = loud.disconnect();
 }
 
 /// The next order call the core hands its worker.
