@@ -23,6 +23,25 @@ use moonproto::{
 const STREAM_DURATION_SECS: u64 = 15;
 
 #[test]
+fn report_clock_is_public_without_diagnostics_and_waits_for_ping() {
+    let client = MoonClient::connect(
+        ClientConfig::new("127.0.0.1", 9, [0; 16], [0; 16]).without_ntp(),
+        ConnectConfig::new(InitConfig { subscribe_logs: false, ..InitConfig::default() }),
+    ).unwrap();
+    assert_eq!(client.server_time_delta_ms(), None);
+    let clock: Option<moonproto::ServerClock> = client.server_clock();
+    assert_eq!(clock, None);
+    // Type-check the public conversion surface in a normal downstream build.
+    if let Some(clock) = clock {
+        let _: Option<moonproto::MoonTime> = clock.report_millis_to_utc(1);
+        let _: Option<moonproto::MoonTime> = clock.report_seconds_to_utc(1);
+    }
+    client.disconnect().unwrap();
+    client.wait_finished().unwrap();
+    assert_eq!(client.server_clock(), None);
+}
+
+#[test]
 fn exchange_code_stable_id_is_public_without_diagnostics() {
     assert_eq!(ExchangeCode::Binance.stable_id(), 3);
     assert_eq!(ExchangeCode::FBinance.stable_id(), 4);
@@ -77,6 +96,7 @@ fn runtime_smoke_full_happy_path() {
 
     let cfg = ClientConfig::new(&ip, port, info.keys.master_key, info.keys.mac_key);
     let init = InitConfig {
+        subscribe_logs: true,
         initial_strategies: Some(InitialStrategies::new(0, Vec::new())),
         subscribe_trades: Some(TradesStreamMode::TradesOnly),
         subscribe_orderbooks: vec!["BTCUSDT".to_string()],
