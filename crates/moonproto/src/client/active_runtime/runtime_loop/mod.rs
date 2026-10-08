@@ -44,9 +44,13 @@ pub(super) fn runtime_loop(
         startup.as_ref().map(RuntimeInitMachine::startup_status),
         true,
     );
+    #[cfg(any(test, feature = "diagnostics"))]
+    let profile_metrics = Arc::clone(&client.metrics.protocol_metrics);
     loop {
         #[cfg(any(test, feature = "diagnostics"))]
-        let command_drain_start = Instant::now();
+        let turn_profile = crate::client::thread_cpu::ProfileTimer::start();
+        #[cfg(any(test, feature = "diagnostics"))]
+        let command_drain_start = crate::client::thread_cpu::ProfileTimer::start();
         let (stop, changed) = if startup.is_some() {
             drain_commands_during_startup(rx, deferred_commands)
         } else {
@@ -80,9 +84,11 @@ pub(super) fn runtime_loop(
             break;
         }
 
+        #[cfg(any(test, feature = "diagnostics"))]
+        let tail_profile = crate::client::thread_cpu::ProfileTimer::start();
         let state_changed = if let Some(startup_machine) = startup.as_mut() {
             #[cfg(any(test, feature = "diagnostics"))]
-            let init_poll_start = Instant::now();
+            let init_poll_start = crate::client::thread_cpu::ProfileTimer::start();
             #[cfg(any(test, feature = "diagnostics"))]
             let (init_cmd, init_api_method) = startup_machine.profile_source();
             let init_poll = startup_machine.poll(&mut client, &mut dispatcher);
@@ -139,9 +145,10 @@ pub(super) fn runtime_loop(
             }
         } else {
             #[cfg(any(test, feature = "diagnostics"))]
-            let pending_start = Instant::now();
+            let pending_start = crate::client::thread_cpu::ProfileTimer::start();
+            let server_info_changed = poll_server_info(&mut client, &mut pending, &mut dispatcher);
             #[cfg(any(test, feature = "diagnostics"))]
-            let auto_candles_start = Instant::now();
+            let auto_candles_start = crate::client::thread_cpu::ProfileTimer::start();
             let candles_changed = poll_auto_candles(&mut client, &mut pending, &mut dispatcher);
             #[cfg(any(test, feature = "diagnostics"))]
             client
@@ -160,7 +167,7 @@ pub(super) fn runtime_loop(
             let market_history_changed =
                 poll_market_history(&mut client, &mut pending, &mut dispatcher);
             #[cfg(any(test, feature = "diagnostics"))]
-            let coin_card_start = Instant::now();
+            let coin_card_start = crate::client::thread_cpu::ProfileTimer::start();
             let coin_card_changed = poll_coin_card_candles(
                 &mut pending.coin_card_candles,
                 &mut dispatcher,
@@ -178,7 +185,7 @@ pub(super) fn runtime_loop(
                     pending.coin_card_candles.len(),
                 );
             #[cfg(any(test, feature = "diagnostics"))]
-            let transfer_assets_start = Instant::now();
+            let transfer_assets_start = crate::client::thread_cpu::ProfileTimer::start();
             let transfer_assets_changed =
                 poll_transfer_assets(&mut pending, &mut dispatcher, &api_pending);
             #[cfg(any(test, feature = "diagnostics"))]
@@ -193,7 +200,7 @@ pub(super) fn runtime_loop(
                     pending.transfer_assets.len() + pending.transfer_assets_batches.len(),
                 );
             #[cfg(any(test, feature = "diagnostics"))]
-            let account_start = Instant::now();
+            let account_start = crate::client::thread_cpu::ProfileTimer::start();
             let account_changed = poll_account_refreshes(
                 &mut pending.account_refreshes,
                 &mut dispatcher,
@@ -211,7 +218,7 @@ pub(super) fn runtime_loop(
                     pending.account_refreshes.len(),
                 );
             #[cfg(any(test, feature = "diagnostics"))]
-            let engine_actions_start = Instant::now();
+            let engine_actions_start = crate::client::thread_cpu::ProfileTimer::start();
             poll_engine_actions(&mut pending.engine_actions, &mut dispatcher, &api_pending);
             #[cfg(any(test, feature = "diagnostics"))]
             client
@@ -245,7 +252,8 @@ pub(super) fn runtime_loop(
             let now = Instant::now();
             let strategy_edits_changed = dispatcher.tick_strategy_edit_timeouts(now);
             dispatcher.tick_report_trace_timeouts(now);
-            candles_changed
+            server_info_changed
+                || candles_changed
                 || market_history_changed
                 || coin_card_changed
                 || transfer_assets_changed
@@ -264,6 +272,8 @@ pub(super) fn runtime_loop(
             publish_snapshot_profiled(&client, &dispatcher, &snapshot);
         }
 
+        #[cfg(any(test, feature = "diagnostics"))]
+        let events_profile = crate::client::thread_cpu::ProfileTimer::start();
         if startup.is_none() {
             let events =
                 take_queued_events_and_publish_snapshot(&client, &mut dispatcher, &snapshot);
@@ -275,7 +285,11 @@ pub(super) fn runtime_loop(
         }
 
         #[cfg(any(test, feature = "diagnostics"))]
-        let command_drain_start = Instant::now();
+        profile_metrics.record_profile_phase_labeled(
+            ProfilePhase::RuntimeEvents, events_profile.elapsed(), u8::MAX, u8::MAX, 0,
+        );
+        #[cfg(any(test, feature = "diagnostics"))]
+        let command_drain_start = crate::client::thread_cpu::ProfileTimer::start();
         let (stop, changed) = if startup.is_some() {
             drain_commands_during_startup(rx, deferred_commands)
         } else {
@@ -304,6 +318,14 @@ pub(super) fn runtime_loop(
         if stop {
             break;
         }
+        #[cfg(any(test, feature = "diagnostics"))]
+        profile_metrics.record_profile_phase_labeled(
+            ProfilePhase::RuntimeTail, tail_profile.elapsed(), u8::MAX, u8::MAX, 0,
+        );
+        #[cfg(any(test, feature = "diagnostics"))]
+        profile_metrics.record_profile_phase_labeled(
+            ProfilePhase::RuntimeTurn, turn_profile.elapsed(), u8::MAX, u8::MAX, 0,
+        );
     }
     if client.shutdown_requested() {
         startup_publisher.mark_disconnected();
@@ -728,7 +750,7 @@ fn publish_snapshot_profiled(
     #[cfg(not(any(test, feature = "diagnostics")))]
     let _ = client;
     #[cfg(any(test, feature = "diagnostics"))]
-    let snapshot_start = Instant::now();
+    let snapshot_start = crate::client::thread_cpu::ProfileTimer::start();
     publish_snapshot(dispatcher, snapshot);
     #[cfg(any(test, feature = "diagnostics"))]
     client
@@ -803,6 +825,184 @@ mod tests {
             ..Default::default()
         });
         client
+    }
+
+    fn identity_client() -> Client {
+        let mut client = ready_client();
+        client.authorized = true;
+        client.peer_app_token = 1;
+        client.set_server_info(ServerInfo {
+            server_version: Some(771),
+            version_suffix: Some("R1".into()),
+            ..Default::default()
+        });
+        client
+    }
+
+    fn identity_response(uid: u64, success: bool) -> crate::commands::engine_api::EngineResponse {
+        use crate::commands::registry::write_string;
+        let mut data = 42_i64.to_le_bytes().to_vec();
+        write_string(&mut data, "Test");
+        data.push(ExchangeCode::FBinance.to_byte());
+        write_string(&mut data, "Binance Futures");
+        data.push(2); // Futures
+        write_string(&mut data, "");
+        write_string(&mut data, "USDT");
+        data.push(BaseCurrency::USDT.to_byte());
+        data.extend_from_slice(&771_i32.to_le_bytes());
+        data.extend_from_slice(&3_i32.to_le_bytes());
+        write_string(&mut data, "R2");
+        crate::commands::engine_api::EngineResponse {
+            ver: crate::commands::registry::CURRENT_PROTO_CMD_VER,
+            request_uid: uid,
+            method: crate::commands::engine_api::EngineMethod::BaseCheck,
+            success,
+            error_code: 0,
+            error_msg: String::new(),
+            data,
+        }
+    }
+
+    #[test]
+    fn logs_subscription_defers_until_ready_and_restores_latest_choice() {
+        let mut client = identity_client();
+        assert!(client.subscriptions.subscription_registry.lock().active_subscriptions().server_logs);
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        let (tx, rx) = mpsc::channel();
+        let mut deferred = VecDeque::new();
+        tx.send(RuntimeCommand::Ui(UiRuntimeCommand::LogsSubscribe(false))).unwrap();
+        assert_eq!(drain_commands_during_startup(&rx, &mut deferred), (false, false));
+        assert!(client.subscriptions.subscription_registry.lock().active_subscriptions().server_logs);
+        drain_deferred_and_live_commands(&mut client, &mut dispatcher, &rx, &mut pending, &mut deferred);
+        assert!(!client.subscriptions.subscription_registry.lock().active_subscriptions().server_logs);
+        let (_, high, _) = client.take_send_queues_for_test();
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0].data[0], 49);
+        assert_eq!(high[0].data[11], 0);
+        assert!(high[0].encrypted);
+        assert_eq!(high[0].u_key.kind, crate::commands::registry::UK_LOG_SUBSCRIPTION);
+        assert_eq!(high[0].u_key.uid, 1);
+
+        for subscribe in [false, true] {
+            handle_command(
+                &mut client, &mut dispatcher,
+                RuntimeCommand::Ui(UiRuntimeCommand::LogsSubscribe(subscribe)), &mut pending,
+            );
+            client.take_send_queues_for_test();
+            // Same core process, new hard session: no metadata BaseCheck.
+            client.server_token += 1;
+            client.restore_domain_after_reconnect();
+            let (_, high, _) = client.take_send_queues_for_test();
+            let logs: Vec<_> = high.iter()
+                .filter(|item| item.cmd == Command::UI.to_byte() && item.data[0] == 49)
+                .collect();
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].data[11], u8::from(subscribe));
+            let subscriptions = client.subscriptions.subscription_registry.lock().active_subscriptions();
+            assert_eq!(subscriptions.server_logs, subscribe);
+        }
+    }
+
+    #[test]
+    fn server_info_refresh_skips_same_process_reconnect() {
+        let mut client = identity_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        assert!(!poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        client.authorized = false;
+        client.peer_app_token = 0;
+        assert!(!poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        client.server_token = 99;
+        client.peer_app_token = 1;
+        client.authorized = true;
+        assert!(!poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        assert!(pending.server_info.is_none());
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(sliced.is_empty() && high.is_empty() && low.is_empty());
+    }
+
+    #[test]
+    fn server_info_refresh_after_restart_publishes_without_repeating_init() {
+        let mut client = identity_client();
+        client.subscriptions.subscription_registry.lock().logs_sub = Some(false);
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        dispatcher.set_session_identity(client.server_info().clone(), None);
+        let mut pending = RuntimePending::default();
+        let snapshot = RwLock::new(None);
+        publish_snapshot(&dispatcher, &snapshot);
+        let old = snapshot.read().clone().unwrap();
+        client.peer_app_token = 2;
+        client.authorized = false;
+        assert!(!poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        assert!(pending.server_info.is_none());
+        client.authorized = true;
+        assert!(!poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        let uid = pending.server_info.as_ref().unwrap().request_uid;
+        assert!(!poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        let sent: Vec<_> = sliced.into_iter().chain(high).chain(low).collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].cmd, Command::API.to_byte());
+        assert_eq!(engine_request_uid(&sent[0].data), Some(uid));
+        assert_eq!(engine_request_method(&sent[0].data), Some(crate::commands::engine_api::EngineMethod::BaseCheck));
+        assert_eq!(&sent[0].data[18..], &[4, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(!client.subscriptions.subscription_registry.lock().active_subscriptions().server_logs);
+
+        assert!(client.pending_api.api_pending.dispatch(identity_response(uid, true)).is_none());
+        assert!(poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        publish_snapshot(&dispatcher, &snapshot);
+        assert_eq!(snapshot.read().as_ref().unwrap().server_info(), client.server_info());
+        assert_eq!(client.server_info().version_suffix.as_deref(), Some("R2"));
+        assert_eq!(old.server_info().version_suffix.as_deref(), Some("R1"));
+        assert_eq!(client.identity.server_info_peer_app_token, 2);
+        assert!(pending.server_info.is_none());
+        assert!(!poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        let (sliced, high, low) = client.take_send_queues_for_test();
+        assert!(sliced.is_empty() && high.is_empty() && low.is_empty());
+    }
+
+    #[test]
+    fn server_info_refresh_discards_previous_process_response_and_retries_failures() {
+        let mut client = identity_client();
+        let mut dispatcher = crate::events::EventDispatcher::new();
+        let mut pending = RuntimePending::default();
+        client.peer_app_token = 2;
+        poll_server_info(&mut client, &mut pending, &mut dispatcher);
+        let old_uid = pending.server_info.as_ref().unwrap().request_uid;
+        // The old response was decoded, but a new Hello arrived before the runtime applied it.
+        client.pending_api.api_pending.dispatch(identity_response(old_uid, true));
+        client.peer_app_token = 3;
+        assert!(!poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        assert_eq!(client.server_info().version_suffix.as_deref(), Some("R1"));
+        let failed_uid = pending.server_info.as_ref().unwrap().request_uid;
+        assert_ne!(old_uid, failed_uid);
+        assert!(!client.pending_api.api_pending.contains(old_uid));
+        client.pending_api.api_pending.dispatch(identity_response(failed_uid, false));
+        for _ in 0..3 {
+            assert!(!poll_server_info(&mut client, &mut pending, &mut dispatcher));
+            assert_eq!(pending.server_info.as_ref().unwrap().request_uid, failed_uid);
+        }
+        pending.server_info.as_mut().unwrap().deadline = Instant::now();
+        assert!(!poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        let lost_uid = pending.server_info.as_ref().unwrap().request_uid;
+        assert_ne!(lost_uid, failed_uid);
+        assert!(client.pending_api.api_pending.contains(lost_uid));
+        pending.server_info.as_mut().unwrap().deadline = Instant::now();
+        assert!(!poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        assert!(!client.pending_api.api_pending.contains(lost_uid));
+        let uid = pending.server_info.as_ref().unwrap().request_uid;
+        assert_ne!(uid, lost_uid);
+        assert!(client.pending_api.api_pending.dispatch(identity_response(lost_uid, true)).is_some());
+
+        // Downgrading to a core without the tail must clear the old suffix, not retain R1.
+        let mut response = identity_response(uid, true);
+        response.data.truncate(response.data.len() - 4);
+        client.pending_api.api_pending.dispatch(response);
+        assert!(poll_server_info(&mut client, &mut pending, &mut dispatcher));
+        assert_eq!(client.server_info().server_version, Some(771));
+        assert_eq!(client.server_info().version_suffix, None);
+        assert_eq!(client.identity.server_info_peer_app_token, 3);
     }
 
     fn seed_runtime_order(
