@@ -47,8 +47,11 @@ Toolchain — **1.98.0** на обеих машинах (`rustup default 1.98.0`
 
 ### Вендорный rev — всегда последний
 
-Решение трейдера 01.10 (`PLAN.md`, «Открытые решения» п. 7). `MOONPROTO_REV` = `9fd0490…`
-(28.09, upstream HEAD; терминал на main пинит `87c1725`, разница — только docs). TInvestCore
+Решение трейдера 01.10 (`PLAN.md`, «Открытые решения» п. 7). `MOONPROTO_REV` = `288c933…`
+(08.10, upstream HEAD; терминал собран на снимке 27.09). С этого rev `polling` — вендорная копия с
+патчем ожидания (`crates/moonproto/vendor/polling`, `MOONPROTO_PATCH.md`), она же член workspace;
+синк меняет `Cargo.lock` — после `subtree pull` нужен `cargo update --workspace`, иначе сборка
+с `--locked` (служба обновления) падает. TInvestCore
 остался на `2e67562f`: `src/server/` больше не на общем rev, и перенос починки кодека между ядрами
 диффом теперь проверяется сборкой, а не предполагается.
 
